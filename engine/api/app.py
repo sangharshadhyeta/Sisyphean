@@ -99,7 +99,7 @@ def create_app(config: Config) -> FastAPI:
         _app.state.injector = injector
         _app.state.extractor = extractor
         _app.state.translation_loop = translation_loop
-        _app.state.soul_text = soul_text
+        _app.state.soul_text = policy_text
         _app.state.graph = graph          # exposed for soul remember action
         logger.info("Sisyphean engine started")
         yield

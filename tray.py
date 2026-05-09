@@ -31,15 +31,42 @@ LOG_FILE   = _LOG_DIR / "engine_out.txt"
 
 CREATE_NO_WINDOW = 0x08000000  # Windows flag — no console popup
 
+# ── Singleton guard ────────────────────────────────────────────────────────────
+# On Windows use a named mutex so a second tray invocation exits immediately.
+_singleton_mutex = None
+if sys.platform == "win32":
+    import ctypes
+    _singleton_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\SisypheanTray")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        # Another tray is already running — silently exit
+        sys.exit(0)
+
 _proc: subprocess.Popen | None = None
 _lock = threading.Lock()
+
+
+def _engine_port() -> int:
+    """Return the configured engine port (parse ENGINE_URL, default 47291)."""
+    try:
+        return int(ENGINE_URL.split(":")[-1].split("/")[0])
+    except Exception:
+        return 47291
+
+
+def _port_listening() -> bool:
+    """Return True if the engine is already accepting connections on its port."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", _engine_port())) == 0
 
 
 # ── Engine lifecycle ───────────────────────────────────────────────────────────
 
 def _running() -> bool:
     with _lock:
-        return _proc is not None and _proc.poll() is None
+        proc_alive = _proc is not None and _proc.poll() is None
+    return proc_alive or _port_listening()
 
 
 def start_engine():
@@ -47,6 +74,10 @@ def start_engine():
     with _lock:
         if _proc and _proc.poll() is None:
             return
+    # Don't start a second engine if one is already listening (e.g. started externally)
+    if _port_listening():
+        return
+    with _lock:
         log = open(LOG_FILE, "a", encoding="utf-8")
         _proc = subprocess.Popen(
             [str(PYTHON), str(MAIN_PY)],

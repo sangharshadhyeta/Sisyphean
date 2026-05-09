@@ -388,24 +388,71 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
 
 # ── Launch subcommand ─────────────────────────────────────────────────────────
 
+def _ensure_sisyphean_running(config) -> None:
+    """Start Sisyphean in the background if it is not already listening."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        already_up = s.connect_ex(("127.0.0.1", config.api.port)) == 0
+    if already_up:
+        print(f"  Sisyphean already running on port {config.api.port}.")
+        return
+    print(f"  Sisyphean not detected on port {config.api.port} — starting it…")
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NEW_CONSOLE
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "serve"],
+        cwd=str(Path(__file__).parent),
+        creationflags=flags,
+    )
+    # Brief wait so it can bind before callers try to connect
+    import time as _t
+    _t.sleep(2)
+
+
+def _open_in_new_terminal(cmd: list[str], cwd: str) -> None:
+    """Open a command in a new terminal window (Windows) or foreground (other)."""
+    if sys.platform == "win32":
+        subprocess.Popen(
+            ["cmd", "/c", "start", "cmd", "/k"] + cmd,
+            cwd=cwd,
+            shell=False,
+        )
+    else:
+        subprocess.Popen(cmd, cwd=cwd)
+
+
 def _launch(target: str) -> None:
-    """Open another tool from Sisyphean's launcher."""
-    import webbrowser
+    """Ensure Sisyphean is running, then open the requested tool."""
+    config_path = os.environ.get("SISYPHEAN_CONFIG", "config.yaml")
+    config = load_config(config_path)
+    _ensure_sisyphean_running(config)
+
+    here = Path(__file__).parent
 
     if target == "birdclaw":
-        url = "http://127.0.0.1:47293"
-        print(f"Opening BirdClaw at {url}")
-        webbrowser.open(url)
+        # Prefer sibling BirdClaw directory; fall back to PATH
+        bc_main = here.parent / "BirdClaw" / "main.py"
+        if bc_main.exists():
+            print(f"  Launching BirdClaw TUI from {bc_main.parent}")
+            _open_in_new_terminal([sys.executable, str(bc_main), "tui"], str(bc_main.parent))
+        else:
+            # BirdClaw not found as sibling — just open the web UI
+            import webbrowser
+            url = f"http://127.0.0.1:47293"
+            print(f"  BirdClaw not found at {bc_main} — opening web UI at {url}")
+            webbrowser.open(url)
 
     elif target == "claude":
         import shutil
         cli = shutil.which("claude") or shutil.which("claude.cmd")
         if not cli:
-            print("Claude Code not found on PATH.")
-            print("Install it: npm install -g @anthropic-ai/claude-code")
+            print("  Claude Code not found on PATH.")
+            print("  Install it: npm install -g @anthropic-ai/claude-code")
             sys.exit(1)
-        print("Launching Claude Code CLI…")
-        os.execv(cli, [cli])   # replace process — no subprocess overhead
+        print(f"  Launching Claude Code from {cli}")
+        _open_in_new_terminal([cli], str(here))
 
     else:
         print(f"Unknown launch target: {target!r}")

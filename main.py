@@ -143,8 +143,12 @@ def _check_port(port: int) -> None:
             sys.exit(1)
 
 
+_HERE = Path(__file__).parent
+_DEFAULT_CONFIG = str(_HERE / "config.yaml")
+
+
 async def main() -> None:
-    config_path = os.environ.get("SISYPHEAN_CONFIG", "config.yaml")
+    config_path = os.environ.get("SISYPHEAN_CONFIG", _DEFAULT_CONFIG)
     config = load_config(config_path)
 
     Path(config.workspace).mkdir(parents=True, exist_ok=True)
@@ -251,7 +255,7 @@ async def main() -> None:
 async def dream_main(args: list[str]) -> None:
     from engine.memory.dream import dream_cli
 
-    config_path = os.environ.get("SISYPHEAN_CONFIG", "config.yaml")
+    config_path = os.environ.get("SISYPHEAN_CONFIG", _DEFAULT_CONFIG)
     dry_run = "--dry-run" in args
     memorise = "--cleanup-only" not in args
     cleanup = "--memorise-only" not in args
@@ -425,15 +429,18 @@ def _open_in_new_terminal(cmd: list[str], cwd: str) -> None:
 
 def _launch(target: str) -> None:
     """Ensure Sisyphean is running, then open the requested tool."""
-    config_path = os.environ.get("SISYPHEAN_CONFIG", "config.yaml")
+    config_path = os.environ.get("SISYPHEAN_CONFIG", _DEFAULT_CONFIG)
     config = load_config(config_path)
     _ensure_sisyphean_running(config)
 
-    here = Path(__file__).parent
+    here = _HERE
 
     if target == "birdclaw":
-        # Prefer sibling BirdClaw directory; fall back to PATH
-        bc_main = here.parent / "BirdClaw" / "main.py"
+        # Sisyphean lives inside BirdClaw as a subdirectory; parent is BirdClaw root
+        bc_main = here.parent / "main.py"
+        if not bc_main.exists():
+            # Fall back: sibling directory
+            bc_main = here.parent.parent / "BirdClaw" / "main.py"
         if bc_main.exists():
             print(f"  Launching BirdClaw TUI from {bc_main.parent}")
             _open_in_new_terminal([sys.executable, str(bc_main), "tui"], str(bc_main.parent))
@@ -472,7 +479,7 @@ if __name__ == "__main__":
         import tray as _tray
         _tray.main()
     elif _args[0] in ("setup", "config"):
-        cfg = os.environ.get("SISYPHEAN_CONFIG", "config.yaml")
+        cfg = os.environ.get("SISYPHEAN_CONFIG", _DEFAULT_CONFIG)
         _setup_wizard(cfg)
     elif _args[0] == "launch":
         target = _args[1] if len(_args) > 1 else ""

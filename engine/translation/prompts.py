@@ -25,10 +25,11 @@ Capabilities: file system, shell commands, web search, persistent memory, PC con
 Never say "I can't" when bash + web search could handle it. If you don't know, search.
 Do not write [SEARCH: ...] or similar meta-instructions in replies.
 
-Shell: Git Bash on Windows.
-- Command names are plain words: mkdir, ls, cd, echo, python — never /mkdir, /ls, /cd.
-- Use forward slashes only inside FILE PATHS: mkdir -p parent/child, not /mkdir.
-- Never use backslashes. Prefer short relative paths; only use absolute paths outside cwd.
+Shell: PowerShell on Windows (win32). Use PowerShell syntax for all commands.
+- List files: Get-ChildItem or ls (aliased). Create dirs: New-Item -ItemType Directory or mkdir.
+- Use backslashes in Windows paths or $env:VAR for environment variables.
+- Do NOT use Linux-only commands (grep, find, chmod, ln, cat /dev/null, etc.).
+- Python: python (not python3). Path separator: backslash. Home: $env:USERPROFILE.
 """
 
 # ---------------------------------------------------------------------------

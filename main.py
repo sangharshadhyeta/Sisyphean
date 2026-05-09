@@ -436,11 +436,11 @@ def _launch(target: str) -> None:
     here = _HERE
 
     if target == "birdclaw":
-        # Sisyphean lives inside BirdClaw as a subdirectory; parent is BirdClaw root
+        # Try: Sisyphean is a subdirectory of BirdClaw (here.parent = BirdClaw root)
         bc_main = here.parent / "main.py"
         if not bc_main.exists():
-            # Fall back: sibling directory
-            bc_main = here.parent.parent / "BirdClaw" / "main.py"
+            # Fall back: Sisyphean and BirdClaw are siblings under the same parent
+            bc_main = here.parent / "BirdClaw" / "main.py"
         if bc_main.exists():
             print(f"  Launching BirdClaw TUI from {bc_main.parent}")
             _open_in_new_terminal([sys.executable, str(bc_main), "tui"], str(bc_main.parent))

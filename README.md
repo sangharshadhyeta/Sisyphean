@@ -1,8 +1,8 @@
 # Sisyphean
 
-A local AI agent that runs as a background service and integrates with Claude Code as a custom model provider. Built on small local models (currently qwen3:0.6b via Ollama, targeting gemma4 e4b via llama.cpp).
+A local AI agent engine that runs as a background service. It exposes both the Anthropic Messages API (`/v1/messages`) and OpenAI Chat Completions (`/v1/chat/completions`), making it a drop-in model provider for Claude Code, BirdClaw, and any OpenAI-compatible client.
 
-Exposes both Anthropic Messages API (`/v1/messages`) and OpenAI Chat Completions (`/v1/chat/completions`) so it works as a drop-in model for Claude Code and any OpenAI-compatible client.
+Sisyphean is the **engine** — stateless, reasoning-focused, no personality. Pair it with [BirdClaw](https://github.com/sangharshadhyeta/BirdClaw) for a full autonomous agent with soul, dreaming, and a persistent web UI.
 
 ---
 
@@ -12,47 +12,42 @@ Exposes both Anthropic Messages API (`/v1/messages`) and OpenAI Chat Completions
 # Install dependencies
 pip install -r requirements.txt
 
-# Start the engine (Ollama must be running with your model pulled)
+# First-time setup (LLM backend, port, workspace)
+python main.py setup
+
+# Start the engine
 python main.py
 
-# Or launch with the system tray manager
+# Or start with the system tray icon (recommended on Windows)
 python main.py tray
-
-# Run offline memory consolidation
-python main.py dream
 ```
 
-Engine runs at `http://127.0.0.1:8000` by default.
+Engine runs at `http://127.0.0.1:47291` by default.
 
 ---
 
 ## Configuration
 
-Edit `config.yaml`:
+Edit `config.yaml` (created by `python main.py setup`):
 
 ```yaml
 llm:
-  local_model: "qwen3:0.6b"    # Ollama model name
+  local_model: "qwen3:0.6b"    # Ollama model name (if using Ollama)
   server:
     port: 11434                  # Ollama port
 
+  external_api:                  # Use OpenRouter, LM Studio, llama.cpp, etc.
+    enabled: true
+    base_url: "http://192.168.1.x:8081/v1"
+    api_key: "local"
+    model: "gemma-4-E4B-it-Q8_0.gguf"
+
 api:
   host: 127.0.0.1
-  port: 8000
+  port: 47291
 
-mock: false                      # true = no model needed (for testing)
-workspace: ./workspace           # where the agent writes files
-```
-
-To use an external API instead of a local model:
-
-```yaml
-llm:
-  external_api:
-    enabled: true
-    base_url: "https://openrouter.ai/api/v1"
-    api_key: "sk-..."
-    model: "google/gemma-3-4b-it:free"
+mock: false                      # true = no model needed (for UI/API testing)
+workspace: ./workspace           # sandboxed directory; agent writes only here
 ```
 
 ---
@@ -63,89 +58,95 @@ Add Sisyphean as a custom model in Claude Code's settings:
 
 ```json
 {
-  "customApiUrl": "http://127.0.0.1:8000",
+  "customApiUrl": "http://127.0.0.1:47291",
   "customApiKey": "local"
 }
 ```
 
-Claude Code sends requests to `/v1/messages` (Anthropic format). Sisyphean translates them through its translation loop and returns tool_use / end_turn responses.
+Claude Code sends requests to `/v1/messages` (Anthropic format). Sisyphean routes them through its agent loop and returns `tool_use` / `end_turn` responses.
+
+---
+
+## BirdClaw Integration
+
+BirdClaw (the harness) routes every task to Sisyphean via `BC_ENGINE_URL`. Set this in `~/.birdclaw/.env`:
+
+```bash
+BC_ENGINE_URL=http://127.0.0.1:47291
+```
+
+Or run `install.bat` in BirdClaw — it configures this automatically.
 
 ---
 
 ## Architecture
 
 ```
-main.py            Entry point — starts uvicorn + manages llama-server subprocess
-tray.py            System tray manager — watchdog, start/stop/restart from taskbar
+main.py                  Entry point — uvicorn + optional llama-server subprocess
+tray.py                  Windows system tray watchdog (start/stop/restart/update)
 
 engine/
-  api/app.py       FastAPI app — mounts all routes
+  api/app.py             FastAPI app factory — all routes
+  config.py              Config dataclasses + YAML loader
+  permissions.py         Permission guard — enforces workspace boundary
+
   compat/
-    anthropic.py   POST /v1/messages  — Anthropic Messages API handler
-    openai_compat.py  POST /v1/chat/completions — OpenAI compat passthrough
+    anthropic.py         POST /v1/messages (Anthropic Messages API)
+    openai_compat.py     POST /v1/chat/completions (OpenAI compat passthrough)
+
   llm/
-    client.py      LlamaClient — async HTTP client for Ollama / llama.cpp / external API
-    context.py     ContextManager — token-aware sliding window
-  translation/
-    loop.py        TranslationLoop — the main agent loop (MicroState, _micro_loop)
-    executor.py    decide() — single-step LLM decision (plan/execute/answer)
-    decomposer.py  decompose() — breaks task into typed stage steps
-    manifest.py    TaskManifest / Instruction — stage queue dataclasses
-    prompts.py     SYSTEM prompt, soul sections, stage action prompts
-    web_search.py  DuckDuckGo search + HTML fetch + condenser
-    subtask/
-      planner.py   plan() — breaks write goal into named items (functions/sections)
-      manifest.py  SubtaskManifest / SubtaskItem — per-item status tracking
-      verifier.py  run() — parses written file, scores each item (pure regex)
-      writer.py    run_write_step() — item-by-item write with verify + retry
+    client.py            LlamaClient — async HTTP client (Ollama / llama.cpp / external)
+    context.py           ContextManager — token-aware sliding window
+
+  translation/           Core agent loop
+    loop.py              TranslationLoop — process() → _micro_loop() (up to 12 steps)
+    executor.py          decide() — single LLM call, unified action menu
+    decomposer.py        decompose() — breaks task into typed stage steps
+    manifest.py          TaskManifest / Instruction dataclasses
+    prompts.py           SYSTEM prompt, engine policy sections, per-stage action menus
+    web_search.py        DuckDuckGo search + HTML fetch + condenser
+    subtask/             Activated for write_code / write_doc plan steps
+      planner.py         LLM call → named items (function names / section headings)
+      manifest.py        SubtaskManifest / SubtaskItem status tracking
+      writer.py          Item-by-item write with MAX_ITEM_RETRIES=2
+      verifier.py        Pure-regex scoring (complete/partial/missing/regressed)
+
   memory/
-    graph.py       GraphStore — NetworkX knowledge graph (facts, concepts, entities)
-    store.py       Artifact store — JSONL artifact log
-    session_log.py Session log — per-session conversation history
-    injector.py    MemoryInjector — injects graph context into requests
-    extractor.py   MemoryExtractor — extracts facts from responses
-    dream.py       Dream cycle — graph merge + reflection + cleanup
-    cleanup.py     Retention policy — prunes old sessions and artifacts
-  permissions.py   Permission guard — protects workspace boundaries
-  config.py        Config dataclasses + YAML loader
+    graph.py             NetworkX knowledge graph → memory/graph.json
+    store.py             JSONL artifact store → memory/artifacts.jsonl
+    session_log.py       Per-session conversation log (used by semantic history)
+    injector.py          Injects graph context into LLM requests
+    extractor.py         Extracts facts from LLM responses
+    cleanup.py           Retention policy — prunes old sessions/artifacts
+
+  core/
+    pipeline.py          Task execution pipeline
+    recall.py            Memory recall / retrieval
+
+  activity.py            Recent events tracking
+  task_tracker.py        Active task management
+
+engine_policy.md         Reasoning discipline injected into every LLM call
+workspace/               Default sandboxed directory; agent may only write here
 ```
 
 ---
 
 ## Agent Loop
 
-Every request goes through `TranslationLoop.process()`:
+Every `/v1/messages` request enters `TranslationLoop.process()`:
 
-1. **Continuation check** — if the last user message has `tool_result` blocks, extract `MicroState` from the preceding thinking block and resume
-2. **`_micro_loop()`** — runs up to `MAX_STEPS=12` inner steps:
-   - **Write stage dispatch** — if a `write_code`/`write_doc` step is queued from the plan, runs the subtask pipeline instead of `decide()`
-   - **`decide()`** — one LLM call that returns an action (plan, bash, search, answer, etc.)
-   - Internal tools (plan_task, search_knowledge, search_history, save_memory, web_search, list_workspace, read_file) are handled inside the loop
-   - Outer tools (Bash) are returned to Claude Code as `tool_use` blocks; state is encoded in a `SISYPHEAN_STATE` thinking block
-3. **Forced answer** — if MAX_STEPS exceeded, a final synthesis call produces an answer
+1. **Continuation check** — if the previous message has `tool_result` blocks, decode `SISYPHEAN_STATE:<base64-json>` from a thinking block and resume `MicroState` (step count, internal messages, summary, pending write steps).
+2. **`_micro_loop()`** — up to 12 inner steps:
+   - If a `write_code`/`write_doc` step is queued in `pending_write_steps`, dispatch to the subtask pipeline (planner → writer → verifier).
+   - Otherwise call `decide()` — one LLM call returns an action.
+   - **Internal tools** handled inside the loop: `plan_task`, `search_knowledge`, `search_history`, `save_memory`, `web_search`, `list_workspace`, `read_file`.
+   - **Outer tools** (e.g., `bash`) returned as `tool_use` blocks to the caller; current state encoded in a thinking block for the next turn.
+3. **Forced answer** — if MAX_STEPS exceeded, a final synthesis call produces the answer.
 
-**Stage detection** — `_detect_stage()` reads `internal_messages` to determine:
-- `plan` — first step, no plan yet → offers plan_task + answer
-- `execute` — plan exists → offers all tools
-- `answer` — budget almost exhausted → forces answer only
+No stage gating — the model decides freely at every step. All actions always available: think, search_memory, search_history, web_search, list_workspace, read_file, save_memory, bash, answer.
 
-**Semantic history** — rather than sending raw conversation history, one LLM call per outer turn summarises relevant past exchanges (Jaccard similarity ≥ 0.15 threshold). Injected as `[Relevant prior work]` block.
-
-**Stall guard** — duplicate internal tool calls (same tool + same input) are blocked after first hit; model gets a nudge toward answering.
-
----
-
-## Subtask Pipeline (write_code / write_doc)
-
-When the decomposer produces a `write_code` or `write_doc` step:
-
-1. **Planner** (`subtask/planner.py`) — one LLM call → list of named items (function names for code, heading names for docs). Vague output triggers an automatic retry with a stricter prompt.
-2. **Writer** (`subtask/writer.py`) — iterates items one at a time:
-   - Builds a focused write prompt: goal + completed items + file tail + what to write next
-   - LLM outputs raw text; written/appended to file
-   - Verifier scores the result
-   - Up to 2 retries per item with gap analysis as context
-3. **Verifier** (`subtask/verifier.py`) — pure regex; parses `def`/`class` blocks (code) or `##` headings (docs), scores each manifest item as complete/partial/missing/regressed
+Stall guard blocks duplicate (tool, input) calls. Semantic history uses Jaccard similarity ≥ 0.15 over session logs with one LLM summary call per outer turn.
 
 ---
 
@@ -155,7 +156,7 @@ When the decomposer produces a `write_code` or `write_doc` step:
 |------|-------------|
 | `plan_task` | Complex multi-step tasks — produces typed stage list |
 | `list_workspace` | Before mkdir or file writes — shows what exists |
-| `read_file` | Before modifying a file — reads relevant portion (query-scoped) |
+| `read_file` | Before modifying a file — reads relevant portion |
 | `search_memory` | Domain knowledge or past research from the graph |
 | `search_history` | What was done in previous sessions |
 | `save_memory` | Persist a fact or preference to the knowledge graph |
@@ -165,10 +166,11 @@ When the decomposer produces a `write_code` or `write_doc` step:
 
 ## Memory
 
-- **Knowledge graph** (`memory/graph.py`) — NetworkX graph of facts, concepts, and entities. Persisted as `memory/graph.json`.
-- **Artifact store** (`memory/store.py`) — JSONL log of significant outputs. Persisted as `memory/artifacts.jsonl`.
-- **Session log** (`memory/session_log.py`) — per-session JSONL conversation log. Used by semantic history.
-- **Dream cycle** (`python main.py dream`) — consolidates session logs into the graph, runs reflection, and prunes stale entries.
+- **Knowledge graph** (`memory/graph.json`) — NetworkX graph of facts, concepts, and entities extracted during task execution.
+- **Artifact store** (`memory/artifacts.jsonl`) — JSONL log of significant outputs.
+- **Session log** — per-session JSONL conversation log used by semantic history.
+
+> Memory consolidation (dreaming) lives in **BirdClaw**, not in Sisyphean. Sisyphean's graph is populated automatically during task execution by `MemoryExtractor`.
 
 ---
 
@@ -178,7 +180,7 @@ When the decomposer produces a `write_code` or `write_doc` step:
 python main.py tray
 ```
 
-Launches the engine in the background and shows a tray icon in the Windows notification area. Right-click for Start / Stop / Restart / View Logs / Update.
+Launches the engine in the background and shows a tray icon in the Windows notification area. Right-click for Start / Stop / Restart / View Logs / Update (git pull + restart).
 
 > **If the icon doesn't appear:** Windows hides new tray icons in the overflow area. Click the `^` arrow in the taskbar notification area and drag the Sisyphean icon to the visible bar, or go to **Settings → Personalisation → Taskbar → Other system tray icons** and enable it.
 
@@ -186,30 +188,31 @@ The tray includes a watchdog that automatically restarts the engine if it crashe
 
 ---
 
+## Dashboard
+
+Browse to `http://127.0.0.1:47291/dashboard` for a live status page showing uptime, graph nodes, artifact count, active tasks, and recent events.
+
+---
+
 ## Development
 
 ```bash
-# Run tests (requires engine running on :8000)
-python test_api.py
-
-# Mock mode — no model needed
+# Mock mode — no model needed, useful for testing API shape
 # Set mock: true in config.yaml, then:
 python main.py
-```
 
-Disable the semantic history LLM call during testing to speed things up:
+# Re-run setup wizard to change settings
+python main.py setup
 
-```python
-# In loop.py, _semantic_history_summary returns "" immediately
+# Open BirdClaw web UI in browser
+python main.py launch birdclaw
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] Switch to llama.cpp + gemma4 e4b (4B model for better reasoning)
+- [ ] Switch to llama.cpp + gemma4 e4b (better reasoning on consumer GPU)
 - [ ] Telegram / Discord channel adapters
-- [ ] React web frontend (replace direct API calls)
-- [ ] PC control (screenshot, mouse/keyboard)
+- [ ] PC control (screenshot, mouse/keyboard) via BirdClaw tool bridge
 - [ ] Self-modification (agent edits own source, runs tests, commits)
-- [ ] Dream cycle improvements — auto-ingest research stage findings

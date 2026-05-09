@@ -1,0 +1,62 @@
+# Sisyphean configuration
+# Set mock: true to run without llama-server (useful when no GPU is available)
+
+llm:
+  model_path: ""                       # not needed when using Ollama
+  model_name: sisyphean-gemma4          # name exposed via /v1/models
+  local_model: "qwen3:0.6b"             # Ollama model name (sent in every request)
+  server:
+    host: 127.0.0.1
+    port: 11434                        # Ollama default port
+    context_size: 8192
+    threads: 8                         # Ryzen 7 7735U has 8 cores
+    gpu_layers: 0                      # integrated GPU — keep on CPU
+    extra_args: []
+
+  # ── Optional: external OpenAI-compatible API ──────────────────────────────
+  # Set enabled: true + paste your key to use a cloud model instead of
+  # llama-server.  mock: true is ignored when external_api.enabled is true.
+  #
+  # Free tiers that work out of the box:
+  #   OpenRouter  https://openrouter.ai      google/gemma-3-4b-it:free  (no credits)
+  #   Groq        https://console.groq.com   gemma2-9b-it
+  #   Google AI   https://aistudio.google.com gemini-2.0-flash-lite
+  external_api:
+    enabled: true
+    base_url: "http://192.168.29.37:8081/v1"
+    api_key: "local"
+    model: "gemma-4-E4B-it-Q8_0.gguf"
+
+embedding:
+  enabled: false                       # set true once you have an embedding model
+  model_path: models/embed.gguf        # e.g. nomic-embed-text-v1.5.Q4_K_M.gguf
+  model_name: sisyphean-embed
+  server:
+    host: 127.0.0.1
+    port: 8081
+    context_size: 2048
+    threads: 4
+    gpu_layers: 0
+    extra_args: []
+
+api:
+  host: 127.0.0.1
+  port: 47291                          # exotic port — avoids conflict with common dev servers
+  cors_origins:
+    - "http://localhost:5173"          # Vite dev server (React)
+    - "http://localhost:3000"
+    - "http://localhost:47293"         # BirdClaw web UI
+
+# Set to true to skip llama-server entirely and return mock responses.
+# Use this on machines without a model file / GPU for testing the API layer.
+memory:
+  path: ./memory                     # where graph.json and artifacts.jsonl live
+  soul_file: ./soul.md               # personality — edit this to shape behaviour
+  injection_budget: 1500             # max tokens injected into every request
+  top_n_nodes: 5                     # graph nodes retrieved per query
+  top_n_artifacts: 3                 # artifact store results per query
+  embedding_model: null              # keyword search only — no HuggingFace download
+
+mock: false
+
+workspace: ./workspace

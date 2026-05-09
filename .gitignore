@@ -1,0 +1,54 @@
+# Models (large binary files)
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Workspace (agent's working directory - add files you want tracked manually)
+workspace/
+
+# Env / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and runtime output (all written to ~/.sisyphean/logs/ now)
+*.log
+*.txt
+logs/
+engine_live.txt
+engine_out.txt
+engine_err.txt
+server_err.log
+last_request.json
+
+# Memory (user data, not source)
+memory/
+
+# BirdClaw is its own repo
+birdclaw/
+
+# Old soul file (renamed to engine_policy.md)
+soul.md
+
+# Claude Code local settings
+.claude/

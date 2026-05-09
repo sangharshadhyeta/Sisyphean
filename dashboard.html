@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sisyphean Engine</title>
+  <link rel="icon" type="image/x-icon" href="/assets/favicon.ico" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'Fira Code', 'monospace'] } } }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    body { background: #0f1117; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; }
+    .dot-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .card { background: #1a1d2e; border: 1px solid #2d3148; }
+    .stat-val { font-size: 2rem; font-weight: 600; line-height: 1; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:.7rem; font-weight:600; }
+    /* Status dots */
+    .status-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; display:inline-block; }
+    .dot-pending  { background:#4b5563; }
+    .dot-running  { background:#22c55e; animation:pulse 1.2s ease-in-out infinite; }
+    .dot-done     { background:#3b82f6; }
+    .dot-failed   { background:#ef4444; }
+    /* Tree */
+    .tree-node { border-radius:7px; border:1.5px solid #2d3148; background:#12152a;
+                 padding:8px 11px; cursor:pointer; transition:border-color .18s; }
+    .tree-node:hover { border-color:#6366f1; }
+    .tree-node.selected { border-color:#6366f1; }
+    .tree-node.status-running { border-color:#22c55e55; }
+    .tree-node.status-done    { border-color:#3b82f655; }
+    .tree-node.status-failed  { border-color:#ef444455; }
+    .tree-indent { margin-left:18px; border-left:1px solid #2d3148; padding-left:10px; }
+    .detail-panel { background:#0d0f1c; border:1px solid #6366f1; border-radius:7px;
+                    padding:10px 12px; font-size:.7rem; font-family:monospace;
+                    color:#cbd5e1; white-space:pre-wrap; word-break:break-word; }
+    .type-badge { font-size:.6rem; padding:1px 5px; border-radius:3px; background:#1e2235; color:#94a3b8; }
+    .chevron { transition:transform .15s; display:inline-block; color:#64748b; margin-right:4px; }
+    .chevron.open { transform:rotate(90deg); }
+  </style>
+</head>
+<body class="min-h-screen p-6">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+function formatUptime(s) {
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return `${h}h ${m}m`;
+}
+
+function timeAgo(ts) {
+  const d = Math.round(Date.now()/1000 - ts);
+  if (d < 5) return 'just now';
+  if (d < 60) return `${d}s ago`;
+  if (d < 3600) return `${Math.floor(d/60)}m ago`;
+  return `${Math.floor(d/3600)}h ago`;
+}
+
+function StatCard({ label, value, sub, color = 'text-emerald-400' }) {
+  return (
+    <div className="card rounded-xl p-5 flex flex-col gap-1">
+      <span className="text-slate-400 text-xs uppercase tracking-widest">{label}</span>
+      <span className={`stat-val ${color}`}>{value}</span>
+      {sub && <span className="text-slate-500 text-xs">{sub}</span>}
+    </div>
+  );
+}
+
+function StatusBadge({ running, mock, llmReady }) {
+  if (!running) return (
+    <span className="tag bg-red-900 text-red-300">Offline</span>
+  );
+  if (mock) return (
+    <span className="tag bg-yellow-900 text-yellow-300">Mock mode</span>
+  );
+  if (!llmReady) return (
+    <span className="tag bg-yellow-900 text-yellow-300 flex items-center gap-1">
+      <span className="w-2 h-2 rounded-full bg-yellow-400 dot-pulse inline-block"></span>
+      LLM connecting…
+    </span>
+  );
+  return (
+    <span className="tag bg-emerald-900 text-emerald-300 flex items-center gap-1">
+      <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse inline-block"></span>
+      Running
+    </span>
+  );
+}
+
+const KIND_STYLE = {
+  tool:   { dot: 'bg-indigo-400',  text: 'text-indigo-300',  label: 'Tool'    },
+  bash:   { dot: 'bg-yellow-400',  text: 'text-yellow-300',  label: 'Bash'    },
+  answer: { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'Answer'  },
+  write:  { dot: 'bg-violet-400',  text: 'text-violet-300',  label: 'Write'   },
+  error:  { dot: 'bg-red-400',     text: 'text-red-300',     label: 'Error'   },
+  stage:  { dot: 'bg-sky-400',     text: 'text-sky-300',     label: 'Stage'   },
+  llm:    { dot: 'bg-amber-400',   text: 'text-amber-300',   label: 'LLM'     },
+  plan:   { dot: 'bg-purple-400',  text: 'text-purple-300',  label: 'Plan'    },
+};
+
+const STAGE_COLORS = {
+  extractor:    'text-sky-400',
+  split:        'text-cyan-400',
+  plan:         'text-blue-400',
+  synthesize:   'text-teal-400',
+  execute:      'text-green-400',
+};
+
+// ── Pipeline tree ─────────────────────────────────────────────────────────────
+
+const TOOL_COLORS = {
+  web_search:       '#06b6d4',
+  search_soul:      '#8b5cf6',
+  search_memory:    '#0ea5e9',
+  search_knowledge: '#0ea5e9',
+  save_memory:      '#ec4899',
+  remember:         '#ec4899',
+  answer:           '#a855f7',
+  bash:             '#eab308',
+  default:          '#64748b',
+};
+function toolColor(t) { return TOOL_COLORS[t] || TOOL_COLORS.default; }
+
+function Dot({ status }) {
+  const cls = { pending:'dot-pending', running:'dot-running', done:'dot-done', failed:'dot-failed' }[status] || 'dot-pending';
+  return <span className={`status-dot ${cls}`} />;
+}
+
+function DetailPanel({ node, onClose }) {
+  if (!node) return null;
+  return (
+    <div className="detail-panel mt-2">
+      <div className="flex justify-between items-center mb-2">
+        <span style={{ color: toolColor(node.type || node.id) }}>{node.label || node.type || node.id}</span>
+        <button onClick={onClose} className="text-slate-600 hover:text-slate-300">✕</button>
+      </div>
+      {node.input  && <div className="mb-1"><span className="text-slate-500">▶ in  </span>{node.input}</div>}
+      {node.output && <div><span className="text-slate-500">◀ out </span>{node.output}</div>}
+      {!node.input && !node.output && <span className="text-slate-600 italic">no data yet</span>}
+    </div>
+  );
+}
+
+// A leaf step row inside a sub-task
+function StepRow({ step, selected, onSelect }) {
+  return (
+    <div className={`tree-node mt-1 flex flex-col ${selected ? 'selected' : ''} status-${step.status}`}
+         onClick={e => { e.stopPropagation(); onSelect(); }}>
+      <div className="flex items-center gap-1.5">
+        <Dot status={step.status} />
+        <span className="type-badge" style={{ color: toolColor(step.type) }}>{step.type}</span>
+        {step.input && <span className="text-slate-500 text-xs truncate" style={{ maxWidth:'200px' }}>{step.input}</span>}
+      </div>
+      {selected && <DetailPanel node={{ ...step, label: step.type }} onClose={onSelect} />}
+    </div>
+  );
+}
+
+// A sub-task node — collapsible, shows its steps as full stage cards
+function SubTaskNode({ sub, taskIdx, selectedKey, onSelect }) {
+  const [open, setOpen] = useState(sub.status === 'running' || sub.status === 'pending');
+
+  React.useEffect(() => {
+    if (sub.status === 'running') setOpen(true);
+  }, [sub.status]);
+
+  return (
+    <div className="mt-1">
+      <div className={`tree-node flex items-center gap-1.5 status-${sub.status}`}
+           onClick={e => { e.stopPropagation(); setOpen(o => !o); }}>
+        <span className={`chevron ${open ? 'open' : ''}`}>›</span>
+        <Dot status={sub.status} />
+        <span className="text-slate-300 text-xs truncate flex-1">{sub.text}</span>
+        <span className="text-slate-600 text-xs ml-1">
+          {sub.steps ? sub.steps.length : 0} step{sub.steps && sub.steps.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+      {open && (
+        <div className="tree-indent">
+          {sub.steps && sub.steps.length > 0
+            ? sub.steps.map((step, si) => {
+                const sk = `step-${taskIdx}-${si}`;
+                return (
+                  <SectionNode key={sk} id={sk}
+                    label={step.type}
+                    status={step.status}
+                    input={step.input}
+                    output={step.output}
+                    accentColor={toolColor(step.type)}
+                    selectedKey={selectedKey}
+                    onSelect={onSelect} />
+                );
+              })
+            : sub.status === 'pending' && (
+                <span className="text-slate-600 text-xs italic">waiting…</span>
+              )
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Top-level section node (Extractor, Planner, Synthesizer) and reused for sub-task steps
+function SectionNode({ id, label, status, input, output, children, selectedKey, onSelect, defaultOpen = false, accentColor }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const myKey = id;
+  const selected = selectedKey === myKey;
+  const hasChildren = children && React.Children.count(children) > 0;
+
+  React.useEffect(() => {
+    if (status === 'running') setOpen(true);
+  }, [status]);
+
+  const labelStyle = accentColor ? { color: accentColor } : {};
+
+  return (
+    <div className="mb-1">
+      <div className={`tree-node flex flex-col ${selected ? 'selected' : ''} status-${status}`}>
+        <div className="flex items-center gap-1.5"
+             onClick={() => {
+               if (hasChildren) setOpen(o => !o);
+               onSelect(selected && !hasChildren ? null : myKey, { id, label, input, output, type: id });
+             }}>
+          {hasChildren
+            ? <span className={`chevron ${open ? 'open' : ''}`}>›</span>
+            : <span style={{width:'14px'}} />}
+          <Dot status={status} />
+          <span className="text-xs font-semibold" style={{ color: accentColor || '#cbd5e1', ...labelStyle }}>{label}</span>
+          {output && !open && (
+            <span className="text-slate-500 text-xs ml-2 truncate flex-1" style={{ maxWidth:'280px' }}>
+              {output}
+            </span>
+          )}
+          {!output && input && !open && (
+            <span className="text-slate-600 text-xs ml-2 truncate flex-1" style={{ maxWidth:'280px' }}>
+              {input}
+            </span>
+          )}
+        </div>
+        {selected && !hasChildren && (
+          <DetailPanel node={{ label, input, output, type: id }} onClose={() => onSelect(null, null)} />
+        )}
+      </div>
+      {open && hasChildren && (
+        <div className="tree-indent">{children}</div>
+      )}
+    </div>
+  );
+}
+
+function PipelineTree({ task }) {
+  const [selectedKey, setSelectedKey] = useState(null);
+  const [selectedNode, setSelectedNode] = useState(null);
+
+  const tree      = task.tree || {};
+  const extractor = tree.extractor  || { status: 'pending', input: '', output: '' };
+  const planner   = tree.planner    || { status: 'pending', output: '', sub_tasks: [] };
+  const consol    = tree.synthesizer|| { status: 'pending', input: '', output: '' };
+
+  const elapsed = task.finished_at
+    ? `${task.finished_at - task.started_at}s`
+    : `${Math.round(Date.now()/1000) - task.started_at}s`;
+
+  function handleSelect(key, node) {
+    setSelectedKey(key);
+    setSelectedNode(node);
+  }
+
+  return (
+    <div className="card rounded-xl p-4 mb-4">
+      {/* Task header */}
+      <div className="flex items-center justify-between mb-3 gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          {task.status === 'running' && (
+            <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse flex-shrink-0"></span>
+          )}
+          <span className="text-slate-200 text-sm font-semibold truncate">{task.user_message}</span>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className={`text-xs ${task.status === 'running' ? 'text-emerald-400' : task.status === 'failed' ? 'text-red-400' : 'text-slate-400'}`}>
+            {task.status}
+          </span>
+          <span className="text-slate-600 text-xs">{elapsed}</span>
+          {task.session && <span className="text-slate-700 text-xs font-mono">{task.session}</span>}
+        </div>
+      </div>
+
+      {/* Tree body */}
+      <div>
+        {/* Extractor */}
+        <SectionNode id="extractor" label="Extractor" status={extractor.status}
+          input={extractor.input} output={extractor.output}
+          accentColor="#38bdf8"
+          selectedKey={selectedKey} onSelect={handleSelect} />
+
+        {/* Planner + sub-tasks */}
+        <SectionNode id="planner" label="Planner" status={planner.status}
+          input="" output={planner.output}
+          selectedKey={selectedKey} onSelect={handleSelect}
+          defaultOpen={planner.sub_tasks && planner.sub_tasks.length > 0}>
+          {(planner.sub_tasks || []).map((sub, ti) => (
+            <SubTaskNode key={ti} sub={sub} taskIdx={ti}
+              selectedKey={selectedKey} onSelect={handleSelect} />
+          ))}
+        </SectionNode>
+
+        {/* Synthesizer */}
+        <SectionNode id="synthesizer" label="Synthesizer" status={consol.status}
+          input={consol.input} output={consol.output}
+          selectedKey={selectedKey} onSelect={handleSelect} />
+      </div>
+
+      {/* Detail panel for selected section node */}
+      {selectedKey && selectedNode && !['planner'].includes(selectedKey) &&
+        !selectedKey.startsWith('sub-') && !selectedKey.startsWith('step-') && (
+        <DetailPanel node={selectedNode} onClose={() => { setSelectedKey(null); setSelectedNode(null); }} />
+      )}
+    </div>
+  );
+}
+
+function TaskPanel() {
+  const [tasks, setTasks] = useState([]);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const r = await fetch('/api/tasks');
+        if (r.ok) {
+          const d = await r.json();
+          setTasks(d.tasks || []);
+        }
+      } catch (_) {}
+    };
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (tasks.length === 0) return null;
+
+  const running   = tasks.find(t => t.status === 'running');
+  const completed = tasks.find(t => t.status !== 'running');
+
+  return (
+    <div className="mb-6 flex flex-col gap-4">
+      {running && (
+        <div>
+          <h2 className="text-slate-400 text-xs uppercase tracking-widest mb-3">Running task</h2>
+          <PipelineTree task={running} />
+        </div>
+      )}
+      {completed && (
+        <div>
+          <h2 className="text-slate-400 text-xs uppercase tracking-widest mb-3">Last completed</h2>
+          <PipelineTree task={completed} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ElapsedBadge({ ms }) {
+  if (!ms) return null;
+  const txt = ms >= 1000 ? `${(ms/1000).toFixed(1)}s` : `${ms}ms`;
+  return <span className="text-slate-600 text-xs ml-2">{txt}</span>;
+}
+
+function StepList({ steps }) {
+  if (!steps || steps.length === 0) return null;
+  return (
+    <div className="mt-2 ml-4 border-l border-slate-700 pl-3 space-y-0.5">
+      {steps.map((s, i) => (
+        <div key={i} className="flex items-center gap-2 text-xs">
+          <span className="text-slate-600">{i+1}.</span>
+          <span className="text-indigo-400 font-mono">[{s.type || s.tool}]</span>
+          <span className="text-slate-400 truncate">{s.text || s.input || ''}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EventRow({ r }) {
+  const [open, setOpen] = useState(false);
+  const s = KIND_STYLE[r.kind] || KIND_STYLE.tool;
+  const d = r.data || {};
+
+  // ── Stage event ────────────────────────────────────────────────────────────
+  if (r.kind === 'stage') {
+    const stageKey = d.stage || r.label;
+    const stageColor = STAGE_COLORS[stageKey] || 'text-slate-300';
+    return (
+      <div className="flex items-center gap-3 py-1.5 border-b border-slate-800/50 text-xs">
+        <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
+        <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
+        <span className={`font-mono font-semibold ${stageColor}`}>▶ {r.label}</span>
+        {d.step && <span className="text-slate-600">step {d.step}/{d.budget}</span>}
+        {d.soul && <span className="text-slate-500 ml-1">[{d.soul}]</span>}
+      </div>
+    );
+  }
+
+  // ── LLM decision event ─────────────────────────────────────────────────────
+  if (r.kind === 'llm') {
+    const actionColor = d.action === 'bash' ? 'text-yellow-300'
+      : d.action === 'answer' || d.action === 'synthesize' ? 'text-emerald-300'
+      : d.action === 'plan' ? 'text-purple-300'
+      : 'text-amber-300';
+    const hasDetail = d.result || d.answer_preview || d.steps;
+    return (
+      <div className="py-1.5 border-b border-slate-800 text-xs">
+        <div className="flex items-center gap-3 cursor-pointer" onClick={() => hasDetail && setOpen(o => !o)}>
+          <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
+          <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
+          <span className={`font-mono font-semibold ${actionColor}`}>{d.action || r.label}</span>
+          {d.tool && d.tool !== d.action && <span className="text-slate-500">→ {d.tool}</span>}
+          {d.input && <span className="text-slate-400 truncate max-w-xs">{d.input}</span>}
+          <ElapsedBadge ms={d.elapsed_ms} />
+          {hasDetail && <span className="text-slate-600 ml-auto">{open ? '▲' : '▼'}</span>}
+        </div>
+        {open && (d.result || d.answer_preview) && (
+          <div className="mt-1.5 ml-[76px] bg-slate-900 rounded p-2 text-slate-300 font-mono whitespace-pre-wrap text-xs max-h-40 overflow-y-auto">
+            {d.result || d.answer_preview}
+          </div>
+        )}
+        {open && d.steps && <div className="ml-[76px]"><StepList steps={d.steps} /></div>}
+      </div>
+    );
+  }
+
+  // ── Plan event ─────────────────────────────────────────────────────────────
+  if (r.kind === 'plan') {
+    return (
+      <div className="py-1.5 border-b border-slate-800 text-xs">
+        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setOpen(o => !o)}>
+          <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
+          <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
+          <span className="font-mono font-semibold text-purple-300">{r.label}</span>
+          {d.step_count && <span className="text-slate-500">{d.step_count} steps</span>}
+          {d.steps && <span className="text-slate-600 ml-auto">{open ? '▲' : '▼'}</span>}
+        </div>
+        {open && d.steps && <div className="ml-[76px] mt-1"><StepList steps={d.steps} /></div>}
+      </div>
+    );
+  }
+
+  // ── Default ────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex items-start gap-3 py-2 border-b border-slate-800 text-sm">
+      <span className="text-slate-500 w-16 shrink-0 pt-0.5">{timeAgo(r.ts)}</span>
+      <span className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${s.dot}`}></span>
+      <div className="flex-1 min-w-0">
+        <span className={`font-mono font-semibold ${s.text}`}>{r.label}</span>
+        {r.detail && <span className="text-slate-400 ml-2 truncate block text-xs">{r.detail}</span>}
+      </div>
+      {r.session && <span className="text-slate-600 text-xs shrink-0">{r.session}</span>}
+    </div>
+  );
+}
+
+const ALL_KINDS = ['stage', 'llm', 'plan', 'tool', 'bash', 'write', 'answer', 'error'];
+
+function ActivityPanel({ events }) {
+  const [filter, setFilter] = useState(null); // null = all
+
+  if (!events || events.length === 0) return (
+    <div className="card rounded-xl p-5 text-slate-500 text-sm text-center">
+      No activity yet — send a message through Claude Code to see agent steps here.
+    </div>
+  );
+
+  const visible = filter ? events.filter(e => e.kind === filter) : events;
+
+  // Group by session, preserving insertion order
+  const groups = [];
+  const seen = {};
+  for (const r of visible) {
+    const key = r.session || '—';
+    if (!seen[key]) { seen[key] = []; groups.push({ key, events: seen[key] }); }
+    seen[key].push(r);
+  }
+
+  // Count per kind for filter badges
+  const counts = {};
+  for (const e of events) counts[e.kind] = (counts[e.kind] || 0) + 1;
+
+  return (
+    <div className="card rounded-xl p-5">
+      {/* Header + filter bar */}
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h2 className="text-slate-400 text-xs uppercase tracking-widest">Agent activity</h2>
+        <div className="flex items-center gap-1 flex-wrap">
+          <button
+            onClick={() => setFilter(null)}
+            className={`px-2 py-0.5 rounded text-xs font-mono border transition-colors ${
+              filter === null
+                ? 'bg-slate-600 border-slate-500 text-slate-100'
+                : 'border-slate-700 text-slate-500 hover:text-slate-300'
+            }`}
+          >all</button>
+          {ALL_KINDS.filter(k => counts[k]).map(k => {
+            const s = KIND_STYLE[k] || KIND_STYLE.tool;
+            return (
+              <button key={k}
+                onClick={() => setFilter(filter === k ? null : k)}
+                className={`px-2 py-0.5 rounded text-xs font-mono border transition-colors ${
+                  filter === k
+                    ? 'bg-slate-700 border-slate-500 text-slate-100'
+                    : 'border-slate-700 text-slate-600 hover:text-slate-300'
+                }`}
+              >
+                <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${s.dot}`}></span>
+                {k} <span className="text-slate-600">({counts[k]})</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Event groups */}
+      {groups.length === 0 && (
+        <div className="text-slate-600 text-xs text-center py-4">No {filter} events yet.</div>
+      )}
+      {groups.map(g => (
+        <div key={g.key} className="mb-4 last:mb-0">
+          <div className="text-slate-700 text-xs font-mono mb-1 border-b border-slate-800 pb-1">
+            session {g.key}
+          </div>
+          {g.events.map((r, i) => <EventRow key={i} r={r} />)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function App() {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState(null);
+  const [lastFetch, setLastFetch] = useState(null);
+
+  const fetch_status = useCallback(async () => {
+    try {
+      const r = await fetch('/api/status');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      setStatus(d);
+      setError(null);
+      setLastFetch(Date.now());
+    } catch (e) {
+      setError(e.message);
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetch_status();
+    const id = setInterval(fetch_status, 5000);
+    return () => clearInterval(id);
+  }, [fetch_status]);
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-8">
+        <div className="flex items-center gap-3">
+          <img src="/assets/sisyphean-transparent.png" alt="Sisyphean" className="w-10 h-10 object-contain" />
+          <h1 className="text-xl font-semibold text-slate-100">Sisyphean Engine</h1>
+        </div>
+        <div className="flex items-center gap-3">
+          {status && <StatusBadge running={true} mock={status.mock} llmReady={status.llm_ready} />}
+          {error && <StatusBadge running={false} />}
+          {lastFetch && (
+            <span className="text-slate-600 text-xs">
+              updated {new Date(lastFetch).toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="card rounded-xl p-4 mb-6 border-red-800 text-red-400 text-sm">
+          Engine unreachable — {error}. Retrying every 5s.
+        </div>
+      )}
+
+      {status && (
+        <>
+          {/* Stat grid */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <StatCard label="Uptime" value={formatUptime(status.uptime_seconds)} />
+            <StatCard label="Requests" value={status.requests_total} color="text-indigo-400" />
+            <StatCard label="Graph nodes" value={status.graph_nodes} color="text-violet-400" />
+            <StatCard label="Artifacts" value={status.artifacts} color="text-sky-400" />
+          </div>
+
+          {/* Model + workspace */}
+          <div className="card rounded-xl p-5 mb-6 grid md:grid-cols-2 gap-4">
+            <div>
+              <span className="text-slate-400 text-xs uppercase tracking-widest">Model</span>
+              <p className="text-slate-200 mt-1 text-sm font-mono">{status.model}</p>
+            </div>
+            <div>
+              <span className="text-slate-400 text-xs uppercase tracking-widest">Workspace</span>
+              <p className="text-slate-200 mt-1 text-sm font-mono truncate">{status.workspace}</p>
+            </div>
+          </div>
+
+          {/* Latest task flowchart */}
+          <TaskPanel />
+
+          {/* Agent activity */}
+          <ActivityPanel events={status.recent || []} />
+        </>
+      )}
+
+      {!status && !error && (
+        <div className="text-slate-500 text-sm text-center py-20">Loading…</div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

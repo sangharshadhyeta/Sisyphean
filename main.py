@@ -123,44 +123,24 @@ def _stop_all(_sig=None, _frame=None) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def _free_port(port: int) -> None:
-    """Kill any process already listening on *port* so we can bind cleanly.
+def _check_port(port: int) -> None:
+    """Exit with an error if another process is already listening on *port*.
 
-    Prevents 'Only one usage of each socket address' errors when restarting.
-    Works on Windows (netstat + taskkill) and Linux/macOS (lsof/fuser).
+    Prevents silently killing a running Sisyphean instance when a second one
+    is accidentally started. The caller (tray watchdog, installer) should
+    check the return code and surface the error to the user.
     """
     import socket
-    # Quick check — if nothing is listening, skip the OS-specific logic
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
-        if s.connect_ex(("127.0.0.1", port)) != 0:
-            return  # port is free
-
-    try:
-        if sys.platform == "win32":
-            import subprocess as _sp
-            out = _sp.check_output(
-                ["netstat", "-ano"], text=True, stderr=_sp.DEVNULL
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            logger.error(
+                "Port %d is already in use — Sisyphean may already be running.\n"
+                "  Stop the existing instance before starting a new one,\n"
+                "  or use  python main.py tray  which manages restarts automatically.",
+                port,
             )
-            for line in out.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = int(line.split()[-1])
-                    if pid and pid != os.getpid():
-                        logger.info("Freeing port %d — killing PID %d", port, pid)
-                        _sp.call(["taskkill", "/F", "/PID", str(pid)],
-                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        else:
-            import subprocess as _sp
-            out = _sp.check_output(
-                ["lsof", "-ti", f"tcp:{port}"], text=True, stderr=_sp.DEVNULL
-            )
-            for pid_str in out.split():
-                pid = int(pid_str)
-                if pid != os.getpid():
-                    logger.info("Freeing port %d — killing PID %d", port, pid)
-                    os.kill(pid, signal.SIGKILL)
-    except Exception as exc:
-        logger.debug("_free_port: %s", exc)
+            sys.exit(1)
 
 
 async def main() -> None:
@@ -217,7 +197,7 @@ async def main() -> None:
         logger.info("  ⚠  MOCK MODE — no real model loaded")
     logger.info("━" * 52)
 
-    _free_port(config.api.port)
+    _check_port(config.api.port)
 
     server = uvicorn.Server(
         uvicorn.Config(

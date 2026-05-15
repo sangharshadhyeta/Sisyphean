@@ -85,7 +85,7 @@ async def synthesize(
         elif q == "weak":
             weak.append(f"- (weak) {body[:500]}")
         else:
-            good.append(f"- {body[:3000]}")
+            good.append(f"- {body[:800]}")
 
     # When there are no inner results (write-only tasks), summarise what was done
     # so the synthesizer can confirm completion rather than hallucinating reasoning.
@@ -109,13 +109,19 @@ async def synthesize(
     has_results = bool(good or weak)
     system = _SYSTEM_WITH_RESULTS if has_results else _SYSTEM_NO_RESULTS
 
+    # Token budget: generous enough for real answers, tight enough to avoid
+    # the model rambling for 60s on a 4B model.
+    # - No results (greeting, ack, pure conversation): short reply, 200 tokens
+    # - Results present: full synthesis, 600 tokens (enough for ~400 word answer)
+    max_tokens = 200 if not has_results else 600
+
     try:
         result = await client.generate(
             [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=1500,
+            max_tokens=max_tokens,
             temperature=0.3,
             stream=False,
             thinking=False,

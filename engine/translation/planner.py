@@ -1033,12 +1033,18 @@ async def _dispatch_intent(intent: dict, task: str, client) -> list[dict]:
 
     # ── write_code ────────────────────────────────────────────────────────────
     # Returns a write_plan meta-step — pipeline handles item-by-item writing.
+    # When run_after is requested, append an explicit bash run step so it
+    # appears in the plan (PIPELINE_STATE) and is executed as a separate step.
     if kind == "write_code":
         if not fname:
             fname = "script.py"
         desc = intent.get("description") or intent.get("task_description") or task
-        return [{"tool": "write_plan", "input": desc, "file_path": fname,
-                 "file_type": "code", "run_after": bool(intent.get("run"))}]
+        run_after = bool(intent.get("run"))
+        steps = [{"tool": "write_plan", "input": desc, "file_path": fname,
+                  "file_type": "code"}]
+        if run_after:
+            steps.append({"tool": "bash", "input": f"python {fname}"})
+        return steps
 
     # ── write_doc ─────────────────────────────────────────────────────────────
     if kind == "write_doc":
@@ -1220,9 +1226,12 @@ async def plan_task(
 
     if sig_action == "write_code":
         fname = signals.get("filename", "") or "script.py"
-        logger.debug("plan_task: regex→write_plan code  file=%s", fname)
-        return [{"tool": "write_plan", "input": task, "file_path": fname,
-                 "file_type": "code", "run_after": bool(signals.get("run_after"))}]
+        run_after = bool(signals.get("run_after"))
+        logger.debug("plan_task: regex→write_plan code  file=%s run_after=%s", fname, run_after)
+        steps = [{"tool": "write_plan", "input": task, "file_path": fname, "file_type": "code"}]
+        if run_after:
+            steps.append({"tool": "bash", "input": f"python {fname}"})
+        return steps
 
     if sig_action == "write_doc":
         fname = signals.get("filename", "")

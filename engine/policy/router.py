@@ -171,13 +171,31 @@ def load_user_prefs(prefs_path: Path) -> str:
 
 
 def save_user_pref(note: str, prefs_path: Path) -> None:
-    """Append a new preference to user_prefs.md."""
+    """Append a new preference to user_prefs.md (with deduplication).
+
+    Skips the write if a very similar preference already exists — substring
+    match in either direction catches both exact duplicates and minor variations
+    like "I prefer vim" vs "the user prefers vim".
+    """
+    note_clean = note.strip()
+    if not note_clean:
+        return
+
     existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else "# User Preferences\n"
+
+    # Deduplicate: normalise whitespace, check both directions
+    note_norm = re.sub(r"\s+", " ", note_clean.lower())
+    for line in existing.splitlines():
+        line_norm = re.sub(r"\s+", " ", line.strip().lower()).lstrip("- ")
+        if line_norm and (note_norm in line_norm or line_norm in note_norm):
+            logger.debug("save_user_pref: already known — %r", note_clean[:60])
+            return
+
     with prefs_path.open("a", encoding="utf-8") as f:
         if not existing.endswith("\n"):
             f.write("\n")
-        f.write(f"{note.strip()}\n")
-    logger.info("saved user pref: %s", note[:80])
+        f.write(f"{note_clean}\n")
+    logger.info("saved user pref: %s", note_clean[:80])
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

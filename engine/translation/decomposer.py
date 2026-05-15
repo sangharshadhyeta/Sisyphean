@@ -66,26 +66,21 @@ Rules for each step:
 2. Set needs_prev=true ONLY when this step must use the actual output of the previous step.
 3. Keep steps atomic: one action per step (one search, one file write, one bash run).
 4. Maximum 5 steps. Fewer is better. Simple tasks need only 1 step.
-5. Step types:
-   - research  — answer questions, look up information, web searches, external facts
-   - write_code — write Python / shell scripts
-   - write_doc  — write markdown, reports, documentation
-   - verify    — run a command, create a folder/file, test or confirm something on disk
-   - reflect   — review, analyse, summarise existing data
 
-   Step text keyword rules:
-   - If the task says "search memory" or "check memory" or "user history" or "user preferences" → step text starts with "Search memory for ..."
-   - If the task says "search the web" or "look up online" or "find current" → step text starts with "Search the web for ..."
-   - If the task says "greet" or is a greeting → ONE step only, text: "Search memory for user context and give a direct greeting as Sisyphean"
-   - If the task says "run" or "bash" or "create file" or "mkdir" → use verify type
-   Use "verify" for: any task that requires running a shell command or touching the filesystem.
-   CRITICAL: "search memory" and "search the web" are DIFFERENT actions. Never confuse them.
+Step text keyword rules:
+- If the task says "search memory" or "check memory" or "user history" → step text starts with "Search memory for ..."
+- If the task says "search the web" or "look up online" or "find current" → step text starts with "Search the web for ..."
+- If the task says "greet" or is a greeting → ONE step only, text: "Search memory for user context and give a direct greeting as Sisyphean"
+- If the task says "edit" or "update" or "modify" an existing file → step text starts with "Edit <filename> to ..." (never "write a new ...")
+- If the task says "convert" a file to another format → step text starts with "Convert <filename> to <format> by running ..."
+- CRITICAL: "search memory" and "search the web" are DIFFERENT actions. Never confuse them.
+- CRITICAL: "edit an existing file" uses Edit tool — do NOT plan a "write new file" step for it.
 
-Return ONLY a JSON object:
+Return ONLY a JSON object (no type field needed — it is determined automatically):
 {{
   "goal": "<one sentence: what the user wants to achieve>",
   "steps": [
-    {{"type": "<type>", "text": "<self-contained instruction>", "needs_prev": false}},
+    {{"text": "<self-contained instruction>", "needs_prev": false}},
     ...
   ]
 }}"""
@@ -157,11 +152,49 @@ async def decompose(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Keywords used to derive step type from step text without asking the LLM.
+# Checked in priority order: verify > edit(direct) > write_code > write_doc > reflect > research.
+_VERIFY_KW    = ("run ", "bash", "execute", "mkdir", "create file", "create folder",
+                 "touch ", "test ", "confirm ", "check if", "verify ", "chmod",
+                 "install ", "pip ", "npm ", "git ", "convert ")
+_CODE_KW      = (".py", ".js", ".ts", ".sh", ".rb", ".go", ".java", ".rs",
+                 "function ", "def ", "class ", "implement", "script",
+                 "module", "write code", "write a function", "write a class")
+_DOC_KW       = (".md", ".txt", ".rst", ".html", "document", "report",
+                 "readme", "write a ", "draft ", "write the ")
+_REFLECT_KW   = ("analys", "summaris", "summariz", "review", "compare",
+                 "synthesiz", "synthesise", "reflect", "evaluate")
+# Edit/update steps should use the executor (read + Edit tools), NOT the subtask writer.
+# Priority: checked BEFORE write_code / write_doc to avoid misclassifying "edit X.md" as write_doc.
+_EDIT_KW      = ("edit ", "update ", "modify ", "revise ", "patch ",
+                 "append to ", "add to ", "insert into ", "change ")
+
+
+def _derive_type(text: str) -> str:
+    """Derive the step type from its text using keyword rules — no LLM needed."""
+    t = text.lower()
+    if any(kw in t for kw in _VERIFY_KW):
+        return "verify"
+    # Edit/update existing content → direct (executor uses Read + Edit tools)
+    if any(kw in t for kw in _EDIT_KW):
+        return "direct"
+    if any(kw in t for kw in _CODE_KW):
+        return "write_code"
+    if any(kw in t for kw in _DOC_KW):
+        return "write_doc"
+    if any(kw in t for kw in _REFLECT_KW):
+        return "reflect"
+    return "research"
+
+
 def _build_manifest(task: str, data: dict) -> TaskManifest:
     """Build a TaskManifest from parsed LLM output.
 
     Validates and normalises each step; falls back to a single-step
     manifest if the steps list is empty or malformed.
+
+    Step type is now derived locally via _derive_type() — the LLM no longer
+    needs to output a type field, reducing JSON complexity and hallucination risk.
     """
     goal = (data.get("goal") or task[:120]).strip()
     raw_steps = data.get("steps") or []
@@ -170,7 +203,6 @@ def _build_manifest(task: str, data: dict) -> TaskManifest:
         logger.warning("decompose: empty steps — using fallback")
         return _fallback_manifest(task)
 
-    valid_types = set(STAGE_BUDGETS.keys()) | {"direct"}
     steps: list[Instruction] = []
 
     for i, s in enumerate(raw_steps[:5]):  # cap at 5 steps
@@ -179,19 +211,11 @@ def _build_manifest(task: str, data: dict) -> TaskManifest:
         text = (s.get("text") or "").strip()
         if not text:
             continue
-        stype = s.get("type", "research")
-        # "direct" no longer exists — remap to research so the executor decides
-        if stype == "direct" or stype not in valid_types:
-            stype = "research"
-        # write_doc / write_code only make sense when the step text actually
-        # references a file, extension, or code construct.  A step like
-        # "Write a response to the greeting" is just a research/reflect step.
-        if stype in ("write_doc", "write_code"):
-            _file_hints = (".py", ".md", ".txt", ".js", ".ts", ".json", ".csv",
-                           "file", "script", "function", "class", "module",
-                           "document", "report", "code", "implement")
-            if not any(kw in text.lower() for kw in _file_hints):
-                stype = "research"
+
+        # Accept legacy `type` field from old prompts/cached responses, but
+        # always re-derive locally to fix hallucinated or stale values.
+        stype = _derive_type(text)
+
         needs_prev = bool(s.get("needs_prev", False))
 
         steps.append(Instruction(
@@ -210,6 +234,7 @@ def _build_manifest(task: str, data: dict) -> TaskManifest:
     _task_write_hints = (
         "write", "create", "make", "build", "save", "generate",
         "document", "report", "script", "code", "implement", "draft",
+        "edit", "update", "modify", "convert", "revise", "patch",
     )
     task_lower = task.lower()
     if not any(kw in task_lower for kw in _task_write_hints):

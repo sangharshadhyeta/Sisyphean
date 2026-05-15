@@ -41,8 +41,8 @@ engine_err.txt
 server_err.log
 last_request.json
 
-# Memory (user data, not source)
-memory/
+# Memory (user data, not source) — only the root-level memory/ dir, not engine/memory/
+/memory/
 
 # BirdClaw is its own repo
 birdclaw/

@@ -38,72 +38,6 @@ _SYSTEM_NO_RESULTS = (
 )
 
 
-# Tools whose results benefit from LLM synthesis (combining, interpreting, shaping).
-# Everything else (bash, write, edit, save_memory) is self-describing — return directly.
-_RESEARCH_TOOLS = frozenset({
-    "web_search", "search_memory", "search_knowledge",
-    "search_policy", "websearch", "webfetch",
-})
-_WRITE_TOOLS  = frozenset({"write", "edit", "write_plan"})
-_BASH_TOOLS   = frozenset({"bash", "powershell"})
-_MEMORY_TOOLS = frozenset({"save_memory", "remember"})
-
-
-def _fast_path(results: list[dict]) -> str | None:
-    """Return a deterministic response when LLM synthesis can be skipped.
-
-    Covers four cases:
-      bash / powershell         → return stdout directly
-      write / edit              → "Done. Written to `X`."
-      save_memory               → "Saved: X"
-      AI-synthesized web search → return Jina content directly (already processed)
-
-    Returns None when raw/unprocessed research results are present — those need
-    LLM synthesis to combine and interpret.
-    """
-    valid = [r for r in results if r.get("result") is not None]
-    if not valid:
-        return None
-
-    # Split research results into AI-synthesized vs raw
-    research = [r for r in valid if r.get("tool", "").lower() in _RESEARCH_TOOLS]
-    if research:
-        raw_research = [r for r in research if not r.get("is_ai_synthesized")]
-        if raw_research:
-            return None  # has raw research results → let LLM synthesize
-        # All research results are already AI-synthesized (e.g. Jina AI tier).
-        # Return their content directly — no LLM call needed.
-        lines = []
-        for r in research:
-            body = (r.get("result") or "").strip()
-            if body and body not in ("No results.", "[No search results found]"):
-                lines.append(body[:3000])
-        if lines:
-            return "\n\n".join(lines)
-        return None
-
-    lines: list[str] = []
-    for r in valid:
-        tool = (r.get("tool") or "").lower()
-        inp  = (r.get("input") or "").strip()[:80]
-        out  = (r.get("result") or "").strip()
-
-        if tool in _BASH_TOOLS:
-            if out:
-                # Truncate very long outputs from the front, keep the tail
-                # (test runners, build tools put the important bit at the end)
-                trimmed = out if len(out) <= 800 else f"[…]\n{out[-800:]}"
-                lines.append(trimmed)
-        elif tool in _WRITE_TOOLS:
-            lines.append(f"Done. Written to `{inp}`." if inp else "Done.")
-        elif tool in _MEMORY_TOOLS:
-            lines.append(f"Saved: {inp}" if inp else "Saved.")
-        elif out:
-            lines.append(out[:300])
-
-    return "\n\n".join(lines) if lines else None
-
-
 async def synthesize(
     query: str,
     soul_section: str,
@@ -112,18 +46,7 @@ async def synthesize(
     client,
     context: str = "",
 ) -> str:
-    """Produce the final plain-text answer from all sub-task results.
-
-    Fast-path: bash/write/save_memory tasks return a deterministic template
-    without an LLM call — the output IS the answer.
-    LLM call is kept for: web search results, conversational turns, multi-source
-    synthesis, and any task whose results require interpretation or combination.
-    """
-    fast = _fast_path(results)
-    if fast:
-        logger.debug("synthesize: fast-path (%d chars)", len(fast))
-        return fast
-
+    """Produce the final plain-text answer from all sub-task results."""
     parts: list[str] = []
 
     if context:

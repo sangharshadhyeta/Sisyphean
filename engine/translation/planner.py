@@ -386,9 +386,9 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         lines.append(f"  {name} — {desc}")
     lines += [
         "",
-        "Use web_search for any question about current facts, versions, prices, events, or anything",
-        "that could have changed since training — do not guess from memory for these.",
-        "Use general knowledge only for timeless facts (capitals, math, definitions).",
+        "Use web_search for any factual question worth knowing — current or timeless.",
+        "Searching builds the knowledge graph so facts are recalled instantly next time.",
+        "Skip web_search only for: pure math/computation, greetings, memory saves, local file tasks.",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
         "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then save_memory).",

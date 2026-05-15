@@ -677,6 +677,16 @@ def _extract_signals(task: str) -> dict:
             hints["filename"] = doc_ext_m.group(1)
         # Don't set tool_hint yet — let _normalize_intent handle write_doc dispatch
 
+    # ── Machine-local state signals ───────────────────────────────────────────
+    # Queries about THIS machine's live state → bash, not web_search.
+    # Checked BEFORE web_kw so "system status" doesn't accidentally get routed
+    # to web search by matching a generic keyword.
+    # _MACHINE_LOCAL_RE is defined above; this is where it is actually applied.
+    if not hints.get("tool_hint") and not write_m:
+        if _MACHINE_LOCAL_RE.search(task):
+            hints["tool_hint"] = "bash"
+            hints["action"]    = "machine_local"
+
     # ── Web search signals ────────────────────────────────────────────────────
     # Skip if a write verb was detected — "write an essay about X" is not a web search.
     if not hints.get("tool_hint") and not write_m:
@@ -1122,6 +1132,17 @@ async def plan_task(
     if sig_hint == "policy":
         return [{"tool": "search_policy", "input": task}]
 
+    # ── Machine-local queries → fall to Stage 2 LLM with bash hint ───────────
+    # _MACHINE_LOCAL_RE matched (system, CPU, memory, disk, status, etc.).
+    # We don't hardcode the command — the LLM picks the right shell command.
+    # But we skip _normalize_intent (Stage 1) because it would classify this
+    # as "research" and produce a web_search step.  Going directly to Stage 2
+    # with a "bash" tool hint produces the correct shell command in one call.
+    if sig_action == "machine_local":
+        logger.debug("plan_task: machine_local → Stage 2 with bash hint")
+        # Fall through to Stage 2 below — sig_hint="bash" is already set so
+        # _build_plan_system will tell the LLM to use bash.
+
     # Note: the old _GENERAL_KW_RE pre-filter that hardcoded 1-step web_search for
     # "what is/explain/how does" questions has been removed. The LLM in Stage 1/2
     # now decides the appropriate steps — this allows multi-step plans for complex
@@ -1175,7 +1196,13 @@ async def plan_task(
             return steps
 
     # ── Stage 1: LLM normalize → Python dispatch ─────────────────────────────
-    intent = await _normalize_intent(task, context, client)
+    # Skip Stage 1 for machine-local queries — _normalize_intent classifies them
+    # as "research" and produces a web_search step. Go straight to Stage 2 which
+    # has the tool list and the bash hint from sig_hint.
+    if sig_action == "machine_local":
+        intent = {}
+    else:
+        intent = await _normalize_intent(task, context, client)
 
     if intent:
         kind = intent.get("intent", "")
@@ -1211,6 +1238,14 @@ async def plan_task(
         prompt += f"\nPersonality guidance:\n{soul_section[:200]}"
     if user_prefs:
         prompt += f"\nUser preferences:\n{user_prefs[:150]}"
+    # Inject machine-local hint — tells the LLM to use bash, not web_search
+    if sig_action == "machine_local":
+        prompt += (
+            "\nHint: This query asks about the LOCAL MACHINE's current state "
+            "(system resources, processes, status, hardware, network, etc.). "
+            "Use bash to get the answer — do NOT use web_search. "
+            "Write the exact shell command that retrieves this information."
+        )
 
     try:
         result = await client.generate(

@@ -373,11 +373,35 @@ class GraphStore:
 
 # ── Module-level singletons ────────────────────────────────────────────────────
 
+def _knowledge_graph_path() -> Path:
+    """Resolve the single shared graph path.
+
+    If BirdClaw is installed (its memory dir exists), use its graph so both
+    systems share one knowledge graph — no duplicate storage or LLM extraction.
+    Falls back to Sisyphean's own path when BirdClaw is not present.
+
+    Override by setting SISYPHEAN_GRAPH_PATH environment variable.
+    """
+    import os
+    override = os.environ.get("SISYPHEAN_GRAPH_PATH", "").strip()
+    if override:
+        return Path(override)
+
+    # BirdClaw's canonical graph location
+    bc_graph = Path.home() / ".birdclaw" / "memory" / "graph.json"
+    if bc_graph.parent.exists():
+        logger.info("graph: sharing BirdClaw's knowledge graph at %s", bc_graph)
+        return bc_graph
+
+    # Sisyphean standalone
+    return Path.home() / ".sisyphean" / "memory" / "knowledge_graph.json"
+
+
 # session_graph: ephemeral, in-memory only — cleared on restart
 session_graph = GraphStore()
 
-# knowledge_graph: persistent across sessions
-knowledge_graph = GraphStore(Path.home() / ".sisyphean" / "memory" / "knowledge_graph.json")
+# knowledge_graph: single shared graph (BirdClaw's if installed, own if not)
+knowledge_graph = GraphStore(_knowledge_graph_path())
 
 
 # ── Seed ─────────────────────────────────────────────────────────────────────

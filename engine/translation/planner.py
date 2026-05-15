@@ -406,6 +406,17 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 _MATH_RE   = re.compile(r'^[\d\s\+\-\*\/\%\(\)\.\^]+$')
+_GREETING_RE = re.compile(
+    r'^\s*(?:hi|hello|hey|howdy|greetings|sup|yo)'
+    r'(?:\s+(?:there|everyone|all|friend))?\s*[!?.]*\s*$',
+    re.IGNORECASE,
+)
+_SOCIAL_RE = re.compile(
+    r'^\s*(?:thanks?(?:\s+you)?|thank\s+you|thx|ty|cheers'
+    r'|ok(?:ay)?|sure|got\s+it|sounds?\s+good|great|cool|nice'
+    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)\s*[!?.]*\s*$',
+    re.IGNORECASE,
+)
 _REMEMBER_RE = re.compile(
     r'^\s*(?:remember|note that|keep in mind|don\'?t forget|save that|store that)\s+(.+)',
     re.IGNORECASE,
@@ -1167,6 +1178,11 @@ async def plan_task(
     sig_hint   = signals.get("tool_hint", "")
     sig_action = signals.get("action", "")
 
+    # ── Greeting / social — answer directly, never call any tool ─────────────
+    if _GREETING_RE.match(task) or _SOCIAL_RE.match(task):
+        logger.debug("plan_task: greeting/social → direct answer")
+        return []
+
     if sig_hint == "math":
         expr = signals.get("expr", "")
         if expr:
@@ -1332,8 +1348,13 @@ async def plan_task(
                     inp  = inp.strip()
                     if tool == "tool" and inp == "input":
                         continue
-                    if tool:
+                    # Drop fragments with no meaningful input — these are
+                    # trailing garbage the model appended (e.g. "tab: ",
+                    # "space: ") after a valid step.
+                    if tool and inp:
                         steps.append({"tool": tool, "input": inp})
+                    elif tool:
+                        logger.debug("plan_task: dropping empty-input fragment %r", tool)
                 elif part and part.lower() not in ("tool", "input"):
                     logger.debug("plan_task: skipping fragment (no colon): %r", part[:60])
             if steps:

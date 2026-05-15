@@ -86,4 +86,18 @@ async def handle_chat_completions(
             {"error": {"type": "upstream_error", "message": str(exc)}},
             status_code=status,
         )
+
+    # Plain-text rescue: if content is empty, promote answer from reasoning fields.
+    # The Anthropic path intentionally skips plain-text rescue (to avoid leaking
+    # reasoning chains), but the OAI compat endpoint is a direct passthrough —
+    # the caller just wants a string answer.
+    for choice in result.get("choices", []):
+        msg = choice.get("message")
+        if isinstance(msg, dict) and not (msg.get("content") or "").strip():
+            for field in ("reasoning", "reasoning_content", "thinking"):
+                val = (msg.get(field) or "").strip()
+                if val:
+                    msg["content"] = val
+                    break
+
     return JSONResponse(result)

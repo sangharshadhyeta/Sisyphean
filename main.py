@@ -11,11 +11,8 @@ Usage:
     python main.py launch birdclaw         # open BirdClaw web UI in browser
     python main.py launch claude           # start Claude Code CLI
 
-Dream (offline memory consolidation):
-    python main.py dream                   # memorise + cleanup
-    python main.py dream --dry-run         # report only, no writes
-    python main.py dream --memorise-only   # skip cleanup
-    python main.py dream --cleanup-only    # skip memorise
+Note: Dream cycle (memory consolidation, inner_self merging, session log processing)
+is handled by BirdClaw — run it from the BirdClaw directory.
 """
 from __future__ import annotations
 
@@ -250,23 +247,8 @@ async def main() -> None:
         _stop_all()
 
 
-# ── Dream subcommand ─────────────────────────────────────────────────────────
-
-async def dream_main(args: list[str]) -> None:
-    from engine.memory.dream import dream_cli
-
-    config_path = os.environ.get("SISYPHEAN_CONFIG", _DEFAULT_CONFIG)
-    dry_run = "--dry-run" in args
-    memorise = "--cleanup-only" not in args
-    cleanup = "--memorise-only" not in args
-
-    code = await dream_cli(
-        config_path=config_path,
-        memorise=memorise,
-        cleanup=cleanup,
-        dry_run=dry_run,
-    )
-    sys.exit(code)
+# Dream cycle is BirdClaw's responsibility — it orchestrates memory consolidation,
+# inner_self merging, session log processing, and graph enrichment.
 
 
 # ── Setup wizard ─────────────────────────────────────────────────────────────
@@ -473,7 +455,8 @@ if __name__ == "__main__":
     if not _args:
         asyncio.run(main())
     elif _args[0] == "dream":
-        asyncio.run(dream_main(_args[1:]))
+        print("Dream cycle is handled by BirdClaw — run it from the BirdClaw directory.")
+        sys.exit(0)
     elif _args[0] == "tray":
         import tray as _tray
         _tray.main()

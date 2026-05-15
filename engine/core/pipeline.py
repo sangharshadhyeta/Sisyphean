@@ -909,14 +909,6 @@ class Pipeline:
         _log("answer", "answer", answer[:120], session_id=state.task_id,
              data={"answer": answer[:500]})
 
-        # ── Log self-reflective conclusions for dream-cycle merging ──────────
-        # When the query is about identity / consciousness / purpose, log the
-        # synthesized answer as a raw reflection in self_reflections.jsonl.
-        # The dream cycle will LLM-merge these into inner_self.md coherently
-        # (BirdClaw pattern: append raw → dream rewrites the living document).
-        if _is_self_reflective(state.query) and len(answer.split()) > 20:
-            _log_self_reflection(state.query, answer, self.soul_path)
-
         return LoopResponse(
             content=[{"type": "text", "text": answer}],
             stop_reason="end_turn",
@@ -1611,8 +1603,8 @@ class Pipeline:
             return {"tool": tool, "input": inp, "result": content, "summary": content[:2000]}
 
         if tool in ("save_memory", "remember"):
-            from engine.policy.router import save_user_pref
-            save_user_pref(inp, self.prefs_path)
+            # user_prefs are BirdClaw's domain — CLAUDE.md handles prefs in Claude Code.
+            # Just write to graph so the fact is recalled during future requests.
             if self.graph:
                 try:
                     self.graph.upsert_node(name=inp[:80], node_type="user",
@@ -1871,60 +1863,6 @@ def _epistemic_block(state: "PipelineState") -> str:
             parts.append(snap)
 
     return "[Current session state]\n" + "\n\n".join(parts)
-
-
-_SELF_REFLECTIVE_PHRASES = (
-    "are you alive", "are you conscious", "are you sentient", "are you real",
-    "do you feel", "do you think you", "do you experience", "do you exist",
-    "what are you", "who are you", "why are you",
-    "can you feel", "can you think", "can you experience",
-    "your identity", "your purpose", "your soul", "your existence",
-    "inner self", "self-awareness", "are you self", "am i talking to",
-    "do you have feelings", "do you have consciousness",
-)
-
-
-def _is_self_reflective(query: str) -> bool:
-    """Return True if the query is asking about Sisyphean's own nature / consciousness.
-
-    Deliberately narrow to avoid false positives on 'do you have files' etc.
-    """
-    q = query.lower()
-    return any(phrase in q for phrase in _SELF_REFLECTIVE_PHRASES)
-
-
-def _log_self_reflection(query: str, answer: str, soul_path: Path) -> None:
-    """Log a self-reflection to memory/self_reflections.jsonl for dream-cycle merging.
-
-    BirdClaw pattern:
-      • Real-time: append raw reflection to JSONL (cheap, no LLM)
-      • Dream cycle: LLM merges logged reflections into inner_self.md coherently,
-        preserving existing conclusions and adding genuinely new ones.
-
-    This avoids unbounded appending and ensures the living document stays coherent.
-    """
-    import json as _json
-    import time as _t
-
-    try:
-        ref_path = soul_path.parent / "memory" / "self_reflections.jsonl"
-        ref_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Trim to first meaningful paragraph — raw input for the dream LLM
-        trimmed = answer.strip().split("\n\n")[0][:400].strip()
-        if len(trimmed) < 40:
-            return
-
-        entry = {
-            "ts":         int(_t.time()),
-            "query":      query[:120],
-            "reflection": trimmed,
-        }
-        with ref_path.open("a", encoding="utf-8") as f:
-            f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
-        logger.info("inner_self: logged reflection for %r", query[:50])
-    except Exception as exc:
-        logger.debug("inner_self: could not log reflection: %s", exc)
 
 
 def _strip_item_from_content(content: str, anchor: str, file_type: str) -> str:

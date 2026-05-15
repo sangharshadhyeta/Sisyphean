@@ -214,20 +214,20 @@ def load_inner_self(policy_path: Path) -> str:
 
 
 def route(query: str, policy_path: Path, prefs_path: Path) -> dict:
-    """Load engine policy and user prefs. No section routing — full policy always.
+    """Load engine policy. No section routing — full policy always.
 
-    Every call gets the complete engine_policy.md text so the model applies it
-    naturally rather than receiving a keyword-matched fragment. Section parsing
-    is kept for the search_policy internal tool.
+    user_prefs is BirdClaw's domain (CLAUDE.md handles prefs in Claude Code).
+    Soul / engine_policy.md is loaded when present — if BirdClaw is the caller
+    it will set policy_path to its own soul; standalone Sisyphean uses its own
+    engine_policy.md; if neither exists the model gets no soul guidance.
     """
     policy_text = policy_path.read_text(encoding="utf-8").strip() if policy_path.exists() else ""
-    user_prefs  = load_user_prefs(prefs_path)
     sections    = parse_policy_sections(policy_path)
 
     return {
         "policy_section_name": "policy",
         "policy_section":      policy_text,
-        "user_prefs":          user_prefs,
+        "user_prefs":          "",   # BirdClaw's domain — not Sisyphean's
         "all_sections":        sections,
     }
 
@@ -254,16 +254,12 @@ async def soul_route(message: str, client, soul_text: str = "", memory_context: 
 
 
 async def handle_remember(message: str, note: str, client, knowledge_graph=None) -> str:
-    """Store a user preference and return a brief acknowledgement."""
-    if note:
-        from engine.config import Config
-        try:
-            cfg = Config.load()
-            prefs_path = Path(cfg.memory.path) / "user_prefs.md"
-            save_user_pref(note, prefs_path)
-        except Exception as exc:
-            logger.warning("handle_remember: could not save to user_prefs.md: %s", exc)
+    """Store a user fact into the knowledge graph.
 
+    user_prefs.md is BirdClaw's domain — CLAUDE.md handles preferences in Claude Code.
+    Sisyphean writes to the graph so the fact is recalled during future requests.
+    """
+    if note:
         if knowledge_graph is not None:
             try:
                 knowledge_graph.upsert_node(

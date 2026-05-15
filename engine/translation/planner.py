@@ -170,9 +170,14 @@ _PLAN_SYSTEM = """\
 Output a JSON plan. Format exactly:
 {"outcome": "one sentence success criteria", "steps": "step1 | step2 | step3"}
 Steps are pipe-separated plain English actions.
-Use plain verbs: Run, Search, Write, Read, Summarise.
-Scale steps to complexity: 1 for simple tasks, 3-5 for complex multi-part tasks.
+Use plain verbs: Run, Search, Write, Read, Summarise, Verify.
+Scale steps to complexity:
+- 1 step: simple direct queries (time, math, single bash command, greeting)
+- 2-3 steps: research tasks (Search topic | Summarise findings), single-file edits
+- 3-5 steps: complex tasks (reports, multi-part research, code pipelines, audits)
 RULES:
+- Research, analysis, and explanation tasks MUST have at least 2 steps: gather then synthesise.
+- Complex tasks (reports, code pipelines, audits, multi-part research) MUST have at least 3 steps.
 - NEVER plan a step that asks the user for input. If info is needed, answer immediately instead.
 - Use 'Write' steps ONLY when the user explicitly asks for a file/document/report to be saved.
 - For web research: use 'Search' or 'Fetch' steps.
@@ -203,11 +208,11 @@ async def make_plan(goal: str, client, workspace: str = "") -> Plan:
                     {"role": "system", "content": _PLAN_SYSTEM},
                     {"role": "user", "content": f"{ctx}\n\nTask: {goal}{error_hint}"},
                 ],
-                max_tokens=256,
+                max_tokens=512,
                 temperature=0.2,
                 response_format={"type": "json_object"},
                 stream=False,
-                thinking=False,
+                thinking=True,
             )
             raw = result["choices"][0]["message"]["content"].strip()
             plan = _parse_plan(raw, goal)
@@ -384,9 +389,12 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         "NEVER answer factual questions from memory — always web_search.",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
+        "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then save_memory).",
+        "Complex multi-part tasks MUST use 3+ steps — use pipe-separated steps for each action.",
         "For write/create file tasks: bash input must be a SHORT description only — NEVER embed actual code.",
         'For greetings, thanks, or social messages output: {"steps": ""}',
-        'Reply: {"steps": "toolname:input"}',
+        'Single step: {"steps": "toolname:input"}',
+        'Multiple steps: {"steps": "toolname:input | toolname:input | toolname:input"}',
     ]
     return "\n".join(lines)
 
@@ -1114,20 +1122,10 @@ async def plan_task(
     if sig_hint == "policy":
         return [{"tool": "search_policy", "input": task}]
 
-    # Pre-filter: general knowledge questions always need a web search — skip LLM
-    # classify entirely and emit a web_search step directly.
-    # Exception: if the subject is about this machine's live state (hardware,
-    # processes, GPU, disk, etc.), skip the pre-filter and let the LLM plan
-    # a bash step instead — web search cannot answer live local questions.
-    if _GENERAL_KW_RE.match(task.strip()):
-        query = _GENERAL_KW_RE.sub('', task.strip(), count=1).rstrip('?').strip()
-        if not query:
-            query = task.strip().rstrip('?').strip()
-        if not _MACHINE_LOCAL_RE.search(query):
-            logger.debug("plan_task: general-knowledge pre-filter -> web_search %r", query[:60])
-            return [{"tool": "web_search", "input": query}]
-        else:
-            logger.debug("plan_task: general-knowledge pre-filter SKIPPED — machine-local subject %r", query[:60])
+    # Note: the old _GENERAL_KW_RE pre-filter that hardcoded 1-step web_search for
+    # "what is/explain/how does" questions has been removed. The LLM in Stage 1/2
+    # now decides the appropriate steps — this allows multi-step plans for complex
+    # research questions while still producing single steps for simple lookups.
 
     if sig_action == "write_code":
         fname = signals.get("filename", "") or "script.py"
@@ -1220,11 +1218,11 @@ async def plan_task(
                 {"role": "system", "content": _build_plan_system(outer_tools)},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=400,
+            max_tokens=600,
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=False,
+            thinking=True,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)

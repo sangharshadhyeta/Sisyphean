@@ -65,7 +65,9 @@ Rules for each step:
    - Do NOT say "continue from before" or "use the previous result" in the text.
 2. Set needs_prev=true ONLY when this step must use the actual output of the previous step.
 3. Keep steps atomic: one action per step (one search, one file write, one bash run).
-4. Maximum 5 steps. Fewer is better. Simple tasks need only 1 step.
+4. Scale to complexity: 1 step for simple/direct tasks; 2-3 for research tasks; 3-5 for
+   complex multi-part tasks (reports, audits, code pipelines).
+5. Research, analysis, and explanation tasks MUST have at least 2 steps.
 
 Step text keyword rules:
 - If the task says "search memory" or "check memory" or "user history" → step text starts with "Search memory for ..."
@@ -130,7 +132,7 @@ async def decompose(
     try:
         result = await client.generate(
             messages,
-            max_tokens=600,
+            max_tokens=800,
             temperature=0.2,          # low temperature for consistent structure
             response_format={"type": "json_object"},
             stream=False,
@@ -229,20 +231,7 @@ def _build_manifest(task: str, data: dict) -> TaskManifest:
         logger.warning("decompose: no valid steps parsed — using fallback")
         return _fallback_manifest(task)
 
-    # Strip write_doc/write_code steps when the original task doesn't mention file creation.
-    # "research X" / "what is X" / "look up X" should never auto-add a write step.
-    _task_write_hints = (
-        "write", "create", "make", "build", "save", "generate",
-        "document", "report", "script", "code", "implement", "draft",
-        "edit", "update", "modify", "convert", "revise", "patch",
-    )
-    task_lower = task.lower()
-    if not any(kw in task_lower for kw in _task_write_hints):
-        steps = [s for s in steps if s.type not in ("write_doc", "write_code")]
-        if not steps:
-            return _fallback_manifest(task)
-
-    # Re-index in case some steps were skipped
+    # Re-index in case some steps were filtered
     for i, s in enumerate(steps):
         s.idx = i
 

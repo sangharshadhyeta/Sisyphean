@@ -1553,39 +1553,23 @@ class Pipeline:
     # ── Research graph persistence ────────────────────────────────────────────
 
     async def _save_research_to_graph(self, query: str, result: str) -> None:
-        """Extract reusable procedural knowledge from a web result and save to graph.
+        """Save web search result summary directly to the knowledge graph.
 
-        Runs a small LLM call to separate procedure from live data:
-        - "how to install X" → saves the install command (reusable)
-        - "what is system status" → live data, saves nothing
-
-        The graph stores HOW to achieve things, not what the current state IS.
+        No LLM call — raw result is stored as-is.  The dream cycle consolidates
+        and distils reusable knowledge during off-peak hours.
         """
         if not self.graph or not result:
             return
         try:
-            r = await self.client.generate(
-                [
-                    {"role": "system", "content": _PROCEDURE_EXTRACT_SYSTEM},
-                    {"role": "user",   "content": f"Query: {query}\n\nResults:\n{result[:2000]}"},
-                ],
-                max_tokens=400,
-                temperature=0.1,
-                stream=False,
-                thinking=False,
-            )
-            procedure = r["choices"][0]["message"]["content"].strip()
-            if not procedure or procedure == "-" or len(procedure.split()) < 5:
-                logger.debug("pipeline: no reusable procedure in result for %r — not saving to graph", query[:40])
-                return
+            summary = result[:500].replace("\n", " ").strip()
             self.graph.upsert_node(
                 name=query[:80],
                 node_type="research",
-                summary=procedure,
+                summary=summary,
                 sources=["web_search"],
             )
             self.graph.save()
-            logger.debug("pipeline: saved procedure to graph for %r", query[:40])
+            logger.debug("pipeline: saved search result to graph for %r", query[:40])
         except Exception as exc:
             logger.warning("pipeline: _save_research_to_graph failed: %s", exc)
 

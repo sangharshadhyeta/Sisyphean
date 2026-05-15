@@ -1240,11 +1240,20 @@ async def plan_task(
         prompt += f"\nUser preferences:\n{user_prefs[:150]}"
     # Inject machine-local hint — tells the LLM to use bash, not web_search
     if sig_action == "machine_local":
+        import platform as _platform
+        _os = _platform.system()  # "Windows", "Linux", "Darwin"
+        if _os == "Windows":
+            _os_hint = "Windows — use PowerShell commands (systeminfo, Get-Process, Get-ComputerInfo, Get-PSDrive, tasklist, etc.)"
+        elif _os == "Darwin":
+            _os_hint = "macOS — use bash commands (top, vm_stat, df -h, ps aux, etc.)"
+        else:
+            _os_hint = "Linux — use bash commands (free -h, df -h, top -bn1, ps aux, uptime, etc.)"
         prompt += (
-            "\nHint: This query asks about the LOCAL MACHINE's current state "
-            "(system resources, processes, status, hardware, network, etc.). "
-            "Use bash to get the answer — do NOT use web_search. "
-            "Write the exact shell command that retrieves this information."
+            f"\nHint: This query asks about the LOCAL MACHINE's current state. "
+            f"OS: {_os_hint}. "
+            f"Output ONE bash step with a SINGLE command that retrieves this information. "
+            f"Do NOT use web_search. Do NOT output a multi-command pipeline with pipes — "
+            f"write one self-contained command only."
         )
 
     try:
@@ -1277,7 +1286,10 @@ async def plan_task(
                     if tool:
                         steps.append({"tool": tool, "input": inp})
                 elif part and part.lower() not in ("tool", "input"):
-                    steps.append({"tool": part.lower(), "input": task})
+                    # Fragment without tool:input colon — skip it.
+                    # This happens when bash pipe syntax (cmd | cmd) gets split
+                    # by the step separator. Never use task as a fallback input.
+                    logger.debug("plan_task: skipping fragment (no colon): %r", part[:60])
             if steps:
                 logger.debug("plan_task: LLM fallback → %d step(s)", len(steps))
                 return steps

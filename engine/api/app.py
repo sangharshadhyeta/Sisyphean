@@ -106,10 +106,14 @@ def create_app(config: Config) -> FastAPI:
         await client.close()
         logger.info("Sisyphean engine stopped")
 
+    _model_display = (
+        ext.model if (ext.enabled and ext.model)
+        else config.llm.local_model or config.llm.model_name or "unknown"
+    )
     app = FastAPI(
         title="Sisyphean",
         version="0.1.0",
-        description="Local AI agent engine — Gemma 4B with persistent memory",
+        description=f"Local AI agent engine — {_model_display} with persistent memory",
         lifespan=lifespan,
     )
 

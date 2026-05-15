@@ -24,8 +24,25 @@ ICON_PATH  = HERE / "assets" / "sisyphean.png"
 MAIN_PY    = HERE / "main.py"
 PYTHON     = Path(sys.executable)
 PYTHONW    = PYTHON.parent / "pythonw.exe"  # windowless Python
-ENGINE_URL = "http://127.0.0.1:47291/dashboard"
-_LOG_DIR   = Path.home() / ".sisyphean" / "logs"
+
+_DEFAULT_ENGINE_PORT = 47291  # fallback if config.yaml cannot be read
+
+
+def _read_engine_port() -> int:
+    """Parse api.port from config.yaml; fall back to _DEFAULT_ENGINE_PORT."""
+    try:
+        import yaml  # type: ignore[import]
+        cfg_path = HERE / "config.yaml"
+        with cfg_path.open(encoding="utf-8") as _f:
+            _data = yaml.safe_load(_f) or {}
+        return int(_data.get("api", {}).get("port", _DEFAULT_ENGINE_PORT))
+    except Exception:
+        return _DEFAULT_ENGINE_PORT
+
+
+_ENGINE_PORT = _read_engine_port()
+ENGINE_URL   = f"http://127.0.0.1:{_ENGINE_PORT}/dashboard"
+_LOG_DIR     = Path.home() / ".sisyphean" / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE   = _LOG_DIR / "engine_out.txt"
 
@@ -46,11 +63,8 @@ _lock = threading.Lock()
 
 
 def _engine_port() -> int:
-    """Return the configured engine port (parse ENGINE_URL, default 47291)."""
-    try:
-        return int(ENGINE_URL.split(":")[-1].split("/")[0])
-    except Exception:
-        return 47291
+    """Return the configured engine port."""
+    return _ENGINE_PORT
 
 
 def _port_listening() -> bool:
@@ -212,7 +226,7 @@ def build_tray() -> pystray.Icon:
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Open Dashboard (localhost:47291/dashboard)", open_dashboard, default=True),
+        pystray.MenuItem(lambda _: f"Open Dashboard (localhost:{_engine_port()}/dashboard)", open_dashboard, default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start Engine",   on_start),
         pystray.MenuItem("Restart Engine", on_restart),

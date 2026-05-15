@@ -142,6 +142,7 @@ def _check_port(port: int) -> None:
 
 _HERE = Path(__file__).parent
 _DEFAULT_CONFIG = str(_HERE / "config.yaml")
+_BC_WEB_PORT = 47293  # BirdClaw web UI port
 
 
 async def main() -> None:
@@ -292,7 +293,7 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
         api_model = ""
     else:
         current_url = (existing.get("llm", {}).get("external_api", {}).get("base_url", "") or
-                       "http://192.168.29.37:8081/v1")
+                       "http://localhost:8080/v1")
         raw_url = _ask("API base URL (host:port or full URL)", current_url)
         # Normalise: ensure it ends with /v1
         if raw_url and not raw_url.startswith("http"):
@@ -322,7 +323,7 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
     new_cfg: dict = {
         "llm": {
             "model_path": existing.get("llm", {}).get("model_path", ""),
-            "model_name": existing.get("llm", {}).get("model_name", "sisyphean-gemma4"),
+            "model_name": existing.get("llm", {}).get("model_name", "sisyphean-4b"),
             "local_model": ollama_model,
             "server": {
                 "host": "127.0.0.1",
@@ -346,7 +347,7 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
             "cors_origins": [
                 "http://localhost:5173",
                 "http://localhost:3000",
-                "http://localhost:47293",
+                f"http://localhost:{_BC_WEB_PORT}",
             ],
         },
         "memory": existing.get("memory", {
@@ -451,7 +452,7 @@ def _start_birdclaw_web(bc_dir: Path) -> bool:
     # Poll up to 15 s for BirdClaw to bind its port
     for _ in range(30):
         _t.sleep(0.5)
-        if _is_port_open(47293):
+        if _is_port_open(_BC_WEB_PORT):
             return True
     return False
 
@@ -479,7 +480,7 @@ def _launch(target: str) -> None:
     if target == "birdclaw":
         import webbrowser, urllib.parse
 
-        _BC_PORT = 47293
+        _BC_PORT = _BC_WEB_PORT
 
         if _is_port_open(_BC_PORT):
             print(f"  BirdClaw already running on port {_BC_PORT}.")

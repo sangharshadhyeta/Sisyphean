@@ -412,6 +412,16 @@ _GENERAL_KW_RE = re.compile(
     r"when did|when was|where is|where are|which is|explain|define|describe|tell me about)",
     re.IGNORECASE,
 )
+
+# Words that indicate the question is about THIS machine's live state rather than
+# world knowledge.  When any of these appear in a "what is X" question, the
+# general-knowledge pre-filter is skipped so the LLM can plan a bash step instead.
+_MACHINE_LOCAL_RE = re.compile(
+    r"\b(system|hardware|gpu|cpu|processor|memory|ram|disk|storage|drive|"
+    r"network|wifi|uptime|process(es)?|service|port|ip.address|battery|"
+    r"temperature|fan|performance|usage|load|status|running|installed)\b",
+    re.IGNORECASE,
+)
 _RESEARCH_KW = frozenset(["search online", "search for", "search the web", "look up",
                            "look it up", "find online", "browse", "fetch online", "google"])
 _EXT_LANG = {   # language/type word → glob pattern
@@ -1106,13 +1116,18 @@ async def plan_task(
 
     # Pre-filter: general knowledge questions always need a web search — skip LLM
     # classify entirely and emit a web_search step directly.
+    # Exception: if the subject is about this machine's live state (hardware,
+    # processes, GPU, disk, etc.), skip the pre-filter and let the LLM plan
+    # a bash step instead — web search cannot answer live local questions.
     if _GENERAL_KW_RE.match(task.strip()):
-        # Strip leading question words using the same regex — single source of truth
         query = _GENERAL_KW_RE.sub('', task.strip(), count=1).rstrip('?').strip()
         if not query:
             query = task.strip().rstrip('?').strip()
-        logger.debug("plan_task: general-knowledge pre-filter -> web_search %r", query[:60])
-        return [{"tool": "web_search", "input": query}]
+        if not _MACHINE_LOCAL_RE.search(query):
+            logger.debug("plan_task: general-knowledge pre-filter -> web_search %r", query[:60])
+            return [{"tool": "web_search", "input": query}]
+        else:
+            logger.debug("plan_task: general-knowledge pre-filter SKIPPED — machine-local subject %r", query[:60])
 
     if sig_action == "write_code":
         fname = signals.get("filename", "") or "script.py"

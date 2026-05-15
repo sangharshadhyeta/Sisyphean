@@ -399,6 +399,13 @@ _SOUL_KW = frozenset(["alive", "sentient", "conscious", "exist", "real", "feel",
 _WEB_KW  = frozenset(["latest", "current", "today", "tonight", "now", "recent", "news",
                        "price", "cost", "version", "release", "update", "weather",
                        "stock", "rate", "live", "2024", "2025", "2026"])
+# General knowledge question patterns — always need a web search even without time markers
+_GENERAL_KW_RE = re.compile(
+    r"^(what is|what are|what does|what was|what were|why is|why are|why does|why did|"
+    r"how does|how do|how is|how are|how did|who is|who are|who was|who were|"
+    r"when did|when was|where is|where are|which is|explain|define|describe|tell me about)",
+    re.IGNORECASE,
+)
 _RESEARCH_KW = frozenset(["search online", "search for", "search the web", "look up",
                            "look it up", "find online", "browse", "fetch online", "google"])
 _EXT_LANG = {   # language/type word → glob pattern
@@ -467,7 +474,13 @@ def _extract_signals(task: str) -> dict:
         return {"tool_hint": "remember", "content": m.group(1).strip().rstrip('?.,')}
 
     # ── Policy / identity ─────────────────────────────────────────────────────
-    if any(kw in tl for kw in _SOUL_KW):
+    # Only trigger if the task does NOT start with a write/create/make verb —
+    # "write an essay about being alive" must go through write_doc, not policy search.
+    _write_verb_start = re.match(
+        r'^\s*(write|create|make|generate|build|produce|draft|compose|give me)\b',
+        t, re.IGNORECASE,
+    )
+    if any(kw in tl for kw in _SOUL_KW) and not _write_verb_start:
         return {"tool_hint": "policy"}
 
     hints: dict = {}
@@ -490,9 +503,41 @@ def _extract_signals(task: str) -> dict:
 
     if write_m:
         ftype = hints.get("filetype", "")
+
+        # Code language inference — always runs first, takes priority over filename extension.
+        # "write a python program that saves to output.txt" → write_code (py), not write_doc.
+        _code_inferred = ""
+        if re.search(r'\b(python|\.py|py\s+script)\b', tl):
+            _code_inferred = "py"
+        elif re.search(r'\b(javascript|\.js|node\.?js)\b', tl):
+            _code_inferred = "js"
+        elif re.search(r'\b(typescript|\.ts)\b', tl):
+            _code_inferred = "ts"
+        elif re.search(r'\b(bash|shell|\.sh)\b', tl):
+            _code_inferred = "sh"
+        elif not ftype and re.search(r'\b(script|program|scraper|crawler|function|class)\b', tl):
+            _code_inferred = "py"  # only fallback when no explicit filename extension
+
+        if _code_inferred:
+            ftype = _code_inferred
+            hints["filetype"] = ftype
+            # If filename has a non-code extension it's the output file, not the code file.
+            # Clear it so dispatch generates a proper .py/.js name instead.
+            fn = hints.get("filename", "")
+            fn_ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+            _code_exts = {"py", "js", "ts", "sh", "rb", "go", "rs", "c", "cpp", "java"}
+            if fn_ext and fn_ext not in _code_exts:
+                hints["filename"] = ""
+
         if ftype in ("py", "js", "ts", "sh", "rb", "go", "rs", "c", "cpp", "java"):
             hints["tool_hint"] = "bash"
             hints["action"]    = "write_code"
+            if not hints.get("filetype"):
+                hints["filetype"] = ftype
+        elif ftype in ("md", "txt", "rst", "html", "doc", "docx"):
+            # Document file — treat as write_doc not write_text
+            hints["action"] = "write_doc"
+            # (no tool_hint set here; _normalize_intent handles write_doc dispatch)
         elif hints.get("filename"):
             hints["tool_hint"] = "bash"
             hints["action"]    = "write_text"
@@ -503,7 +548,10 @@ def _extract_signals(task: str) -> dict:
                 t, re.IGNORECASE,
             )
             if cm:
-                hints["content"] = cm.group(1).strip().strip("'\"").rstrip('?.,')  # strip surrounding quotes
+                hints["content"] = cm.group(1).strip().strip("'\"").rstrip('?.,')
+        elif re.search(r'\b(essay|report|document|readme|guide|article|doc)\b', tl):
+            # Write task with doc-like noun but no explicit filename
+            hints["action"] = "write_doc"
         elif re.search(r'\b(folder|directory|dir)\b', tl):
             hints["tool_hint"] = "bash"
             hints["action"]    = "mkdir"
@@ -511,19 +559,29 @@ def _extract_signals(task: str) -> dict:
             hints["run_after"] = True
 
     if not hints.get("tool_hint") and edit_m:
-        # Broaden: "the python file", "the file", "the script" count even without an explicit filename
+        # Broaden: "the python file", "the essay", "the script" count even without an explicit filename.
+        # (\w+\s+)? allows one modifier word — "the scraper program", "the test script", etc.
         has_file_ref = (hints.get("filename") or
                         re.search(r'\b(port|config|value|setting)\b', tl) or
-                        re.search(r'\bthe\s+(python\s+)?(?:file|script|code|program)\b', tl))
+                        re.search(r'\bthe\s+(\w+\s+)?(?:file|script|code|program|essay|document|doc|report|scraper|notebook)\b', tl) or
+                        (edit_m and run_m))  # "edit X then run it" always implies a code file
         if has_file_ref:
             hints["tool_hint"] = "bash"
             hints["action"]    = "edit_file"
             # If only a generic file reference, mark as semantic rewrite
             if not hints.get("filename"):
-                # Guess extension from context
-                if re.search(r'\bpython\b|\bpy\b', tl):
+                # Guess extension from context — doc-type keywords take priority over code.
+                # "article" excluded — too ambiguous (Wikipedia article ≠ a .md file).
+                if re.search(r'\b(essay|readme|report)\b', tl):
+                    hints["filetype"]  = "md"
+                    hints["rewrite"]   = True
+                elif re.search(r'\bpython\b|\bpy\b', tl):
                     hints["filetype"]  = "py"
-                    hints["rewrite"]   = True  # signals write_code-style regen
+                    hints["rewrite"]   = True
+                elif run_m:
+                    # "edit X then run it" implies code — default to Python
+                    hints["filetype"]  = "py"
+                    hints["rewrite"]   = True
             # Extract "from X to Y" for deterministic sed construction
             chg_m = re.search(r'\bfrom\s+["\']?(\S+?)["\']?\s+to\s+["\']?(\S+?)["\']?(?:\s|$|\.)',
                                t, re.IGNORECASE)
@@ -585,13 +643,23 @@ def _extract_signals(task: str) -> dict:
             hints["action"]    = "web_fetch"
             hints["url"]       = url_m.group(0).rstrip('.,)')
 
+    # ── Write-doc fallback: write verb present but no code extension/filename ────
+    # e.g. "write an essay", "write a report", "generate a document"
+    if write_m and not hints.get("tool_hint"):
+        hints["action"] = "write_doc"
+        # Filename: look for explicit .md/.txt mention, else default to document.md
+        doc_ext_m = re.search(r'(\w[\w-]*\.(?:md|txt|rst|html|doc|docx))\b', t, re.IGNORECASE)
+        if doc_ext_m:
+            hints["filename"] = doc_ext_m.group(1)
+        # Don't set tool_hint yet — let _normalize_intent handle write_doc dispatch
+
     # ── Web search signals ────────────────────────────────────────────────────
-    if not hints.get("tool_hint"):
-        if any(kw in tl for kw in _WEB_KW):
+    # Skip if a write verb was detected — "write an essay about X" is not a web search.
+    if not hints.get("tool_hint") and not write_m:
+        # Use word-boundary match to avoid "live" hitting "alive", "deliver", etc.
+        if any(re.search(r'\b' + re.escape(kw) + r'\b', tl) for kw in _WEB_KW):
             hints["tool_hint"] = "web"
-            q = re.sub(r'^(what is|what\'s|who is|where is|when is|how much is)\s+',
-                       '', tl, flags=re.IGNORECASE).rstrip('?').strip()
-            hints["search_q"] = q
+            hints["search_q"] = tl.rstrip('?').strip()
 
     return hints
 
@@ -651,14 +719,26 @@ async def split_deep(query: str, client, max_depth: int = 3) -> list[str]:
     return tasks
 
 
+_SPLIT_CONJUNCTIONS = re.compile(
+    r'\b(and\s+(?:also\s+)?|then\s+(?:also\s+)?|also\s+|additionally\s+|furthermore\s+|plus\s+)'
+    r'(?:search|find|look\s+up|write|create|build|run|check|download|fetch|get|list)',
+    re.IGNORECASE,
+)
+
+
 async def split(query: str, client) -> list[str]:
     """Split a query into independent sub-tasks.
 
-    Short-circuits to [query] for short/math inputs.
-    Falls back to [query] on any failure.
+    Short-circuits to [query] for short/math inputs or when no conjunction
+    keywords indicate multiple independent actions.  Falls back to [query]
+    on any failure.
     """
     words = query.strip().split()
     if len(words) <= 4 or _looks_like_math(query):
+        return [query]
+
+    # Regex pre-check: if no conjunction pattern found, skip the LLM call
+    if not _SPLIT_CONJUNCTIONS.search(query):
         return [query]
 
     try:
@@ -711,17 +791,26 @@ _CODE_START_RE = re.compile(
 )
 
 
-async def _generate_code(task: str, client) -> str | None:
+async def _generate_code(task: str, client, context: str = "") -> str | None:
     """Ask LLM to generate code for a file-write task. Returns raw code string.
 
     Post-processes the response to strip any reasoning/preamble text that the
     model emits before the actual code (common with small thinking models).
+
+    Args:
+        task:    The file-write instruction.
+        client:  LLM client.
+        context: Optional epistemic state block (files already written, etc.)
+                 prepended to the user message to improve inter-file consistency.
     """
+    user_content = f"Task: {task[:300]}"
+    if context:
+        user_content = f"{context}\n\n{user_content}"
     try:
         result = await client.generate(
             [
                 {"role": "system", "content": _CODE_GEN_SYSTEM},
-                {"role": "user",   "content": f"Task: {task[:300]}"},
+                {"role": "user",   "content": user_content},
             ],
             max_tokens=1600,
             temperature=0.1,
@@ -796,30 +885,28 @@ async def _generate_bash_cmd(task: str, client) -> str | None:
 #             (may call _generate_code or _generate_bash_cmd as sub-calls)
 # ---------------------------------------------------------------------------
 
-_NORMALIZE_SYSTEM = """\
-Classify the task. Output ONE short JSON object only — no prose, no markdown.
+_NORMALIZE_SYSTEM = """Classify the task. Output ONE short JSON object only - no prose, no markdown.
 
 "intent" must be one of:
-  write_code  write_text  edit_file  list_files  run_script
+  write_code  write_doc  write_text  edit_file  list_files  run_script
   web_search  web_fetch  grep  search_code
   direct  save_memory  math  mkdir  shell_op
 
-Use "direct" for: greetings, thanks, acknowledgements, simple social exchanges,
-or any task that needs no tool calls to answer.
+Use "direct" ONLY for: greetings, thanks, short social exchanges (hi, bye, thanks).
+Use "web_search" for: factual questions, general knowledge questions (what is X, why Y,
+  how does Z work, explain X), current events - anything needing a real factual answer.
+Use "write_doc" for: write an essay / report / readme / document / .md / .txt file.
+Use "write_code" for: write a program / script / function / class / .py / .js file.
 
 Include only relevant extra fields:
   file, run, from_val, to_val, pattern, query, expr, description, cmd
 
-CRITICAL: NEVER include actual code, file contents, or generated text in this JSON.
-For write_code: output ONLY {"intent": "write_code", "file": "filename.ext"} plus
-"run": true if the user wants to test/execute it after. Nothing else.
+CRITICAL: NEVER include actual code or file contents in this JSON.
+For write_code: {"intent": "write_code", "file": "filename.ext", "run": true/false}
+For write_doc:  {"intent": "write_doc",  "file": "filename.md", "description": "topic"}
+For web_search: "query" is a short keyword phrase (2-5 words). Strip question words.
 
-"run": true — set when the user wants to execute/test the file after writing it
-
-For web_search: "query" must be a short keyword phrase (2-5 words) targeting the FIRST
-unknown fact needed. Strip question words.
-
-Output only the JSON object — no examples, no prose."""
+Output only the JSON object - no examples, no prose."""
 
 
 async def _normalize_intent(task: str, context: str, client) -> dict:
@@ -865,19 +952,23 @@ async def _dispatch_intent(intent: dict, task: str, client) -> list[dict]:
     fname = (intent.get("file") or "").strip()
 
     # ── write_code ────────────────────────────────────────────────────────────
+    # Returns a write_plan meta-step — pipeline handles item-by-item writing.
     if kind == "write_code":
         if not fname:
             fname = "script.py"
         desc = intent.get("description") or intent.get("task_description") or task
-        code = await _generate_code(desc, client)
-        if code:
-            final_code = code if code.endswith('\n') else code + '\n'
-            # Use the Write tool — clean diff display in Claude Code UI,
-            # no shell quoting issues. Pipeline resolves file_path to absolute.
-            steps = [{"tool": "write", "input": final_code, "file_path": fname}]
-            if intent.get("run"):
-                steps.append({"tool": "bash", "input": f"python {fname}"})
-            return steps
+        return [{"tool": "write_plan", "input": desc, "file_path": fname,
+                 "file_type": "code", "run_after": bool(intent.get("run"))}]
+
+    # ── write_doc ─────────────────────────────────────────────────────────────
+    if kind == "write_doc":
+        if not fname:
+            desc = (intent.get("description") or task)[:40].lower()
+            slug = re.sub(r'[^a-z0-9]+', '_', desc).strip('_')[:30] or "document"
+            fname = f"{slug}.md"
+        content_hint = intent.get("description") or task
+        return [{"tool": "write_plan", "input": content_hint, "file_path": fname,
+                 "file_type": "doc"}]
 
     # ── write_text ────────────────────────────────────────────────────────────
     if kind == "write_text":
@@ -1007,17 +1098,27 @@ async def plan_task(
     if sig_hint == "policy":
         return [{"tool": "search_policy", "input": task}]
 
+    # Pre-filter: general knowledge questions always need a web search — skip LLM
+    # classify entirely and emit a web_search step directly.
+    if _GENERAL_KW_RE.match(task.strip()):
+        # Strip leading question words using the same regex — single source of truth
+        query = _GENERAL_KW_RE.sub('', task.strip(), count=1).rstrip('?').strip()
+        if not query:
+            query = task.strip().rstrip('?').strip()
+        logger.debug("plan_task: general-knowledge pre-filter -> web_search %r", query[:60])
+        return [{"tool": "web_search", "input": query}]
+
     if sig_action == "write_code":
-        intent_direct = {
-            "intent": "write_code",
-            "file": signals.get("filename", "script.py"),
-            "description": task,
-            "run": bool(signals.get("run_after")),
-        }
-        steps = await _dispatch_intent(intent_direct, task, client)
-        if steps:
-            logger.debug("plan_task: regex→dispatch write_code → %d step(s)", len(steps))
-            return steps
+        fname = signals.get("filename", "") or "script.py"
+        logger.debug("plan_task: regex→write_plan code  file=%s", fname)
+        return [{"tool": "write_plan", "input": task, "file_path": fname,
+                 "file_type": "code", "run_after": bool(signals.get("run_after"))}]
+
+    if sig_action == "write_doc":
+        fname = signals.get("filename", "")
+        logger.debug("plan_task: regex→write_plan doc  file=%s", fname)
+        return [{"tool": "write_plan", "input": task, "file_path": fname,
+                 "file_type": "doc"}]
 
     if sig_action in ("write_text", "edit_file", "list_files", "mkdir",
                       "run_script", "shell_op"):
@@ -1034,6 +1135,23 @@ async def plan_task(
         }
         steps = await _dispatch_intent(intent_direct, task, client)
         if steps:
+            # If the task also asks to convert a file to .doc/.docx, append a conversion step.
+            task_lower_c = task.lower()
+            if (sig_action == "edit_file" and
+                    re.search(r'\bconvert\b', task_lower_c) and
+                    re.search(r'\b\.?doc(x)?\b', task_lower_c)):
+                # Use python-docx to convert the first .md file found
+                conv_cmd = (
+                    "python -c \""
+                    "import glob, os; "
+                    "src = next(iter(glob.glob('*.md')), ''); "
+                    "out = os.path.splitext(src)[0]+'.docx' if src else 'output.docx'; "
+                    "import docx; d=docx.Document(); "
+                    "[d.add_paragraph(l.rstrip()) for l in open(src, encoding='utf-8')] if src else None; "
+                    "d.save(out); print('Saved', out)\""
+                )
+                steps.append({"tool": "bash", "input": conv_cmd})
+                logger.debug("plan_task: appended .docx conversion step")
             logger.debug("plan_task: regex→dispatch %s → %d step(s)", sig_action, len(steps))
             return steps
 

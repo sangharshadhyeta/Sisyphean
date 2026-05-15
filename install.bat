@@ -82,14 +82,14 @@ start "" pythonw "%~dp0tray.py"
 
 echo.
 echo  +===========================================+
-echo  ^|              All done!                   ^|
-echo  ^|                                           ^|
+echo  ^|              All done!                    ^|
+echo  ^|                                          ^|
 echo  ^|  Sisyphean is running in your tray.      ^|
 echo  ^|  It starts automatically on login.       ^|
-echo  ^|                                           ^|
-echo  ^|  Dashboard: localhost:8000/dashboard      ^|
-echo  ^|  Command:   sisyphean (new terminal)      ^|
-echo  ^|                                           ^|
+echo  ^|                                          ^|
+echo  ^|  Dashboard: localhost:47291/dashboard    ^|
+echo  ^|  Command:   sisyphean (new terminal)     ^|
+echo  ^|                                          ^|
 echo  ^|  Right-click tray icon for options.      ^|
 echo  +===========================================+
 echo.

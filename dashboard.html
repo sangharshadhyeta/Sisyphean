@@ -111,17 +111,19 @@ const KIND_STYLE = {
 };
 
 const STAGE_COLORS = {
-  extractor:    'text-sky-400',
-  split:        'text-cyan-400',
-  plan:         'text-blue-400',
-  synthesize:   'text-teal-400',
+  plan:         'text-indigo-400',
+  synthesize:   'text-emerald-400',
   execute:      'text-green-400',
+  retry:        'text-amber-400',
+  replan:       'text-orange-400',
 };
 
 // ── Pipeline tree ─────────────────────────────────────────────────────────────
 
 const TOOL_COLORS = {
   web_search:       '#06b6d4',
+  websearch:        '#06b6d4',
+  webfetch:         '#0891b2',
   search_soul:      '#8b5cf6',
   search_memory:    '#0ea5e9',
   search_knowledge: '#0ea5e9',
@@ -129,9 +131,15 @@ const TOOL_COLORS = {
   remember:         '#ec4899',
   answer:           '#a855f7',
   bash:             '#eab308',
+  write:            '#7c3aed',
+  write_plan:       '#6d28d9',
+  read:             '#10b981',
+  glob:             '#34d399',
+  grep:             '#6ee7b7',
+  edit:             '#f59e0b',
   default:          '#64748b',
 };
-function toolColor(t) { return TOOL_COLORS[t] || TOOL_COLORS.default; }
+function toolColor(t) { return TOOL_COLORS[(t||'').toLowerCase()] || TOOL_COLORS.default; }
 
 function Dot({ status }) {
   const cls = { pending:'dot-pending', running:'dot-running', done:'dot-done', failed:'dot-failed' }[status] || 'dot-pending';
@@ -155,13 +163,21 @@ function DetailPanel({ node, onClose }) {
 
 // A leaf step row inside a sub-task
 function StepRow({ step, selected, onSelect }) {
+  const isWrite = step.type === 'write' || step.type === 'write_plan';
   return (
     <div className={`tree-node mt-1 flex flex-col ${selected ? 'selected' : ''} status-${step.status}`}
          onClick={e => { e.stopPropagation(); onSelect(); }}>
       <div className="flex items-center gap-1.5">
         <Dot status={step.status} />
         <span className="type-badge" style={{ color: toolColor(step.type) }}>{step.type}</span>
-        {step.input && <span className="text-slate-500 text-xs truncate" style={{ maxWidth:'200px' }}>{step.input}</span>}
+        {step.input && (
+          <span className="text-slate-400 text-xs truncate" style={{ maxWidth:'220px' }}>
+            {step.input}
+          </span>
+        )}
+        {step.status === 'done' && step.output && isWrite && (
+          <span className="text-slate-600 text-xs ml-auto">{step.output.slice(0,40)}</span>
+        )}
       </div>
       {selected && <DetailPanel node={{ ...step, label: step.type }} onClose={onSelect} />}
     </div>
@@ -232,7 +248,7 @@ function SectionNode({ id, label, status, input, output, children, selectedKey, 
         <div className="flex items-center gap-1.5"
              onClick={() => {
                if (hasChildren) setOpen(o => !o);
-               onSelect(selected && !hasChildren ? null : myKey, { id, label, input, output, type: id });
+               onSelect(myKey);
              }}>
           {hasChildren
             ? <span className={`chevron ${open ? 'open' : ''}`}>›</span>
@@ -251,7 +267,7 @@ function SectionNode({ id, label, status, input, output, children, selectedKey, 
           )}
         </div>
         {selected && !hasChildren && (
-          <DetailPanel node={{ label, input, output, type: id }} onClose={() => onSelect(null, null)} />
+          <DetailPanel node={{ label, input, output, type: id }} onClose={() => onSelect(myKey)} />
         )}
       </div>
       {open && hasChildren && (
@@ -263,10 +279,8 @@ function SectionNode({ id, label, status, input, output, children, selectedKey, 
 
 function PipelineTree({ task }) {
   const [selectedKey, setSelectedKey] = useState(null);
-  const [selectedNode, setSelectedNode] = useState(null);
 
   const tree      = task.tree || {};
-  const extractor = tree.extractor  || { status: 'pending', input: '', output: '' };
   const planner   = tree.planner    || { status: 'pending', output: '', sub_tasks: [] };
   const consol    = tree.synthesizer|| { status: 'pending', input: '', output: '' };
 
@@ -274,9 +288,8 @@ function PipelineTree({ task }) {
     ? `${task.finished_at - task.started_at}s`
     : `${Math.round(Date.now()/1000) - task.started_at}s`;
 
-  function handleSelect(key, node) {
-    setSelectedKey(key);
-    setSelectedNode(node);
+  function handleSelect(key) {
+    setSelectedKey(prev => prev === key ? null : key);
   }
 
   return (
@@ -298,17 +311,12 @@ function PipelineTree({ task }) {
         </div>
       </div>
 
-      {/* Tree body */}
+      {/* Tree body — Extractor is internal; show Plan → steps → Synthesize */}
       <div>
-        {/* Extractor */}
-        <SectionNode id="extractor" label="Extractor" status={extractor.status}
-          input={extractor.input} output={extractor.output}
-          accentColor="#38bdf8"
-          selectedKey={selectedKey} onSelect={handleSelect} />
-
-        {/* Planner + sub-tasks */}
-        <SectionNode id="planner" label="Planner" status={planner.status}
+        {/* Plan + sub-tasks */}
+        <SectionNode id="planner" label="Plan" status={planner.status}
           input="" output={planner.output}
+          accentColor="#818cf8"
           selectedKey={selectedKey} onSelect={handleSelect}
           defaultOpen={planner.sub_tasks && planner.sub_tasks.length > 0}>
           {(planner.sub_tasks || []).map((sub, ti) => (
@@ -317,17 +325,13 @@ function PipelineTree({ task }) {
           ))}
         </SectionNode>
 
-        {/* Synthesizer */}
-        <SectionNode id="synthesizer" label="Synthesizer" status={consol.status}
+        {/* Synthesize */}
+        <SectionNode id="synthesizer" label="Synthesize" status={consol.status}
           input={consol.input} output={consol.output}
+          accentColor="#34d399"
           selectedKey={selectedKey} onSelect={handleSelect} />
       </div>
 
-      {/* Detail panel for selected section node */}
-      {selectedKey && selectedNode && !['planner'].includes(selectedKey) &&
-        !selectedKey.startsWith('sub-') && !selectedKey.startsWith('step-') && (
-        <DetailPanel node={selectedNode} onClose={() => { setSelectedKey(null); setSelectedNode(null); }} />
-      )}
     </div>
   );
 }

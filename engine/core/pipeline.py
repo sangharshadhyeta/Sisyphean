@@ -672,8 +672,18 @@ class Pipeline:
                         tool_input = {"command": inp}
                     elif cl == "write":
                         file_path = step.get("file_path") or inp[:120]
+                        if not file_path or not file_path.strip():
+                            # Malformed write step with no file path — skip it
+                            logger.warning("pipeline: skipping write step with empty file_path")
+                            state.current_step_idx += 1
+                            continue
                         if state.project_dir and not os.path.isabs(file_path):
                             file_path = os.path.join(state.project_dir, file_path)
+                        # Guard: if file_path resolves to a directory, skip
+                        if os.path.isdir(file_path):
+                            logger.warning("pipeline: skipping write step — path is a directory: %s", file_path)
+                            state.current_step_idx += 1
+                            continue
                         # Lazy content regeneration: if files have already been written
                         # in this session, regenerate the content with epistemic context
                         # so the new file is consistent with what already exists.

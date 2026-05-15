@@ -1,24 +1,21 @@
-"""LLM-based context extraction — selects relevant history per pipeline stage.
+"""Bigram-based context extraction — selects relevant history per pipeline stage.
 
-Each sub-task gets a focused slice of the conversation history via a quick LLM call
-rather than every stage receiving the full dump.  Gemma4 e4b has a 131k context
-window so we pass the full history and let *it* decide what's relevant.
+Each sub-task receives a focused slice of the conversation history via Jaccard
+bigram scoring — the same approach used by engine.core.recall.Recall.  No LLM
+call; runs synchronously and saves 1-3 round-trips per pipeline invocation.
 
 For tool selection a keyword scorer is used (no extra LLM call).
 """
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM = """\
-You are a context filter for an AI pipeline stage.
-Given a task and the full conversation history between the user and an AI assistant,
-copy ONLY the portions of the history that are directly relevant to completing the task.
-Preserve exact wording — do not paraphrase.
-If no part of the history is relevant, output a single dash: -
-Stay under 300 words. No commentary, no headings."""
+_MIN_SIM     = 0.04   # minimum Jaccard similarity to include a block
+_MAX_WORDS   = 300    # hard cap on returned excerpt
+_SHORT_LIMIT = 100    # histories ≤ this many words are returned as-is
 
 _STOPWORDS = frozenset({
     "a", "an", "the", "is", "to", "and", "or", "for", "with", "it",
@@ -27,44 +24,64 @@ _STOPWORDS = frozenset({
 })
 
 
-async def extract_for_task(task: str, history: str, client) -> str:
+def _bigrams(text: str) -> set[str]:
+    words = re.findall(r'\w+', text.lower())
+    return {f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+async def extract_for_task(task: str, history: str, client) -> str:  # noqa: ARG001
     """Return history excerpts relevant to the given sub-task.
 
-    Passes the full history to the LLM (Gemma4 has 131k context window).
-    Falls back to first 300 words on any failure.
-    Returns empty string if the LLM signals nothing is relevant.
+    Uses bigram Jaccard scoring to select relevant blocks — no LLM call.
+    The `client` parameter is retained for API compatibility but unused.
+    Returns empty string if nothing in history is relevant.
     """
     if not history or not task:
         return history or ""
 
-    if len(history.split()) <= 100:
-        return history  # Already short — no extraction needed
+    words = history.split()
+    if len(words) <= _SHORT_LIMIT:
+        return history  # Already short — return as-is
 
-    logger.debug("context_extractor: task=%r history=%d words", task[:50], len(history.split()))
-    try:
-        result = await client.generate(
-            [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": f"Task: {task}\n\nConversation history:\n{history}"},
-            ],
-            max_tokens=400,
-            temperature=0.1,
-            stream=False,
-            thinking=False,
-        )
-        extracted = result["choices"][0]["message"]["content"].strip()
-        if extracted and extracted != "-" and len(extracted.split()) > 5:
-            logger.debug(
-                "context_extractor: %d → %d words",
-                len(history.split()), len(extracted.split()),
-            )
-            return extracted
-        return ""  # LLM says nothing in history is relevant
-    except Exception as exc:
-        logger.warning("context_extractor: failed: %s", exc)
+    # Split into exchange blocks (role-prefixed lines or blank-line separated)
+    blocks = re.split(r'\n(?=(?:User|Assistant|Human|AI)\s*:)', history)
+    if len(blocks) <= 1:
+        # No role markers — split on blank lines
+        blocks = [b.strip() for b in re.split(r'\n{2,}', history) if b.strip()]
 
-    # Fallback — first 300 words of raw history
-    return " ".join(history.split()[:300])
+    task_bg = _bigrams(task)
+    scored: list[tuple[float, str]] = []
+    for block in blocks:
+        if not block.strip():
+            continue
+        block_bg = _bigrams(block)
+        sim = _jaccard(task_bg, block_bg)
+        if sim >= _MIN_SIM:
+            scored.append((sim, block))
+
+    if not scored:
+        logger.debug("context_extractor: nothing relevant for %r", task[:50])
+        return ""
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    relevant = [b for _, b in scored[:5]]
+    result = "\n".join(relevant)
+
+    result_words = result.split()
+    if len(result_words) <= 5:
+        return ""
+
+    logger.debug(
+        "context_extractor: %d → %d words (bigram, no LLM)",
+        len(words), min(len(result_words), _MAX_WORDS),
+    )
+    return " ".join(result_words[:_MAX_WORDS])
 
 
 def filter_tools_for_task(task: str, available_tools: list[dict]) -> list[dict]:

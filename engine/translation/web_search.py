@@ -1,20 +1,13 @@
-"""Web search and fetch tools.
+"""Web search stub for Sisyphean.
 
-Ported and adapted from BirdClaw birdclaw/tools/web.py.
+Sisyphean is a pure reasoning engine — web search is executed by the harness
+(BirdClaw) via the WebSearch tool_use block, or by Claude Code's built-in
+WebSearch tool.  This module exists only to satisfy internal loop references;
+search() always returns [] so the model falls through to using the external
+WebSearch tool instead.
 
-Changes from BirdClaw:
-- Async throughout (no sync httpx calls)
-- Uses DuckDuckGo search package (no SearXNG dependency)
-- HTML stripping via condenser.strip_html() (BeautifulSoup if available, regex fallback)
-- Two-phase content processing: fast_clean() immediately, distill() for large pages
-- No tool registry integration (tools are forwarded via Claude Code)
-
-Two public async functions:
-    search(query, max_results) → list[SearchResult]
-    fetch(url, goal, client)   → str (cleaned page content)
-
-format_results() and extract_search_queries() are used by the executor to
-inject search results into the model's context.
+fetch() still works directly (httpx only, no search-package dependency) so
+the executor can fetch URLs when given one explicitly.
 """
 from __future__ import annotations
 
@@ -41,55 +34,25 @@ class SearchResult:
 
 
 # ---------------------------------------------------------------------------
-# Search
+# Search — stub (real search handled by BirdClaw via WebSearch tool_use)
 # ---------------------------------------------------------------------------
 
 async def search(query: str, max_results: int = 5) -> list[SearchResult]:
-    """Search via DuckDuckGo. Returns [] on any failure.
+    """No-op stub — Sisyphean delegates search to the harness.
 
-    Snippets are keyword-pruned against the query before returning so the
-    most relevant parts of each result are surfaced for Gemma 4B.
+    Returns [] so the micro-loop skips internal search and the model uses
+    the external WebSearch tool_use block dispatched by BirdClaw instead.
     """
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        try:
-            from duckduckgo_search import DDGS
-        except ImportError:
-            logger.warning("ddgs not installed — web search unavailable")
-            return []
-
-    try:
-        results: list[SearchResult] = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                raw_snippet = r.get("body", "")
-                # Keyword-prune snippet against query so relevance is maximised
-                snippet = keyword_prune(raw_snippet, goal=query, max_chars=400)
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("href", ""),
-                    snippet=snippet or raw_snippet[:400],
-                ))
-        logger.debug("search '%s' → %d results", query[:50], len(results))
-        return results
-    except Exception as exc:
-        logger.warning("web search failed (%s)", exc)
-        return []
+    logger.debug("search stub called for %r — delegating to harness WebSearch tool", query[:50])
+    return []
 
 
 # ---------------------------------------------------------------------------
-# Fetch + clean
+# Fetch — still works directly (httpx only, no extra deps)
 # ---------------------------------------------------------------------------
 
 async def fetch(url: str, goal: str = "", client=None) -> str:
-    """Fetch a URL and return cleaned text.
-
-    Phase 1 (always): HTML stripped → keyword-pruned fast-path snippet
-    Phase 2 (if goal + client + page large): Gemma distillation for task focus
-
-    Returns a ready-to-inject string.
-    """
+    """Fetch a URL and return cleaned text."""
     try:
         import httpx
     except ImportError:
@@ -97,10 +60,7 @@ async def fetch(url: str, goal: str = "", client=None) -> str:
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http:
-            resp = await http.get(
-                url,
-                headers={"User-Agent": "Sisyphean/1.0"},
-            )
+            resp = await http.get(url, headers={"User-Agent": "Sisyphean/1.0"})
             resp.raise_for_status()
     except Exception as exc:
         logger.warning("web fetch failed  url=%s  error=%s", url[:80], exc)
@@ -111,8 +71,6 @@ async def fetch(url: str, goal: str = "", client=None) -> str:
         return f"(unsupported content type: {content_type})"
 
     raw_text = strip_html(resp.text)
-
-    # Keyword prune using URL slug as a goal hint if no explicit goal given
     goal_hint = goal or url.split("/")[-1].replace("-", " ").replace("_", " ")
 
     if len(raw_text) > 3000:
@@ -120,11 +78,9 @@ async def fetch(url: str, goal: str = "", client=None) -> str:
     else:
         cleaned = fast_clean(raw_text)
 
-    # Phase 2: LLM distillation for large pages when we have a goal + client
     if goal and client and len(cleaned) > 1000:
         notes = await distill(cleaned, goal=goal, client=client, source=url)
         if notes and len(notes) > 50:
-            logger.debug("fetch distilled: %d→%d chars  url=%s", len(cleaned), len(notes), url[:60])
             return notes
 
     logger.debug("fetch ok  url=%s  chars=%d", url[:60], len(cleaned))

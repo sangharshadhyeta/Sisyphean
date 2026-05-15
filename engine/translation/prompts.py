@@ -255,3 +255,66 @@ def stage_action_prompt(
 def get_soul_for_stage(stage: str) -> str:
     """Deprecated — soul is personality, not stage-specific guidance. Returns empty."""
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Epistemic block formatter — used by loop.py and pipeline.py
+# ---------------------------------------------------------------------------
+
+def format_epistemic_block(
+    files_read: list[dict] | None = None,
+    files_written: list[str] | None = None,
+    commands_run: list[dict] | None = None,
+    workspace_snapshot: str = "",
+) -> str:
+    """Format a compact epistemic-state block for injection into LLM context.
+
+    Each argument is optional; the block is only returned when there is
+    at least one piece of state worth reporting.
+
+    Args:
+        files_read:        List of {"path": str, "head": str} dicts.
+        files_written:     List of file path strings.
+        commands_run:      List of {"cmd": str, "brief": str} dicts.
+        workspace_snapshot: Pre-formatted workspace tree string (optional).
+
+    Returns:
+        Multi-line string starting with ``[Current session state]``,
+        or empty string if nothing to report.
+    """
+    files_read    = files_read    or []
+    files_written = files_written or []
+    commands_run  = commands_run  or []
+
+    parts: list[str] = []
+
+    if files_read:
+        items = []
+        for r in files_read[-8:]:
+            p = r.get("path", "?")
+            h = r.get("head", "")
+            if h:
+                items.append(f"  {p} → \"{h[:100].replace(chr(10), ' / ')}\"")
+            else:
+                items.append(f"  {p}")
+        parts.append("Files read:\n" + "\n".join(items))
+
+    if files_written:
+        parts.append("Files written:\n" + "\n".join(
+            f"  {p}" for p in files_written[-10:]
+        ))
+
+    if commands_run:
+        items = [
+            f"  {r.get('cmd', '')[:60]} → {r.get('brief', '')[:70]}"
+            for r in commands_run[-5:]
+        ]
+        parts.append("Commands run:\n" + "\n".join(items))
+
+    if not parts:
+        return ""
+
+    if workspace_snapshot:
+        parts.append(workspace_snapshot)
+
+    return "[Current session state]\n" + "\n\n".join(parts)

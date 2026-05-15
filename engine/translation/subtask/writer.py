@@ -97,6 +97,7 @@ def _build_write_prompt(
     attempt: int,
     error_hint: str = "",
     done_summary: str = "",
+    context: str = "",
 ) -> str:
     if attempt > 0:
         # Retry: show verifier gap analysis
@@ -123,7 +124,10 @@ def _build_write_prompt(
     else:
         marker_hint = f"Start with exactly: ## {item.anchor}\n"
 
-    prompt = (
+    prompt = ""
+    if context:
+        prompt += f"{context}\n\n"
+    prompt += (
         f"Goal: {manifest.stage_goal}\n"
         f"Done items: {done_str}\n"
     )
@@ -147,6 +151,7 @@ async def _write_item(
     manifest: SubtaskManifest,
     client: Any,
     done_summary: str = "",
+    context: str = "",
 ) -> bool:
     """Write one item with up to MAX_ITEM_RETRIES retries. Returns True if complete.
 
@@ -164,7 +169,10 @@ async def _write_item(
             attempt, MAX_ITEM_RETRIES, item.title[:40], manifest.file_path,
         )
 
-        prompt = _build_write_prompt(item, manifest, attempt, error_hint, done_summary)
+        prompt = _build_write_prompt(
+            item, manifest, attempt, error_hint, done_summary,
+            context=context if attempt == 0 else "",
+        )
         error_hint = ""
 
         messages = [
@@ -259,6 +267,7 @@ async def run_write_step(
     file_type: Literal["doc", "code"],
     workspace: str,
     file_path: str = "",
+    context: str = "",
 ) -> StageResult:
     """Execute a write_code or write_doc stage via the subtask pipeline.
 
@@ -306,7 +315,7 @@ async def run_write_step(
         _iteration += 1
 
         item = manifest.current_item
-        success = await _write_item(item, manifest, client, done_summary=done_summary)
+        success = await _write_item(item, manifest, client, done_summary=done_summary, context=context)
 
         status_word = "written" if success else "partial"
         content_hint = f" — {item.summary[:60]}" if item.summary else ""

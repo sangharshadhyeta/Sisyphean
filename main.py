@@ -436,20 +436,13 @@ def _launch(target: str) -> None:
     here = _HERE
 
     if target == "birdclaw":
-        # Try: Sisyphean is a subdirectory of BirdClaw (here.parent = BirdClaw root)
-        bc_main = here.parent / "main.py"
-        if not bc_main.exists():
-            # Fall back: Sisyphean and BirdClaw are siblings under the same parent
-            bc_main = here.parent / "BirdClaw" / "main.py"
-        if bc_main.exists():
-            print(f"  Launching BirdClaw TUI from {bc_main.parent}")
-            _open_in_new_terminal([sys.executable, str(bc_main), "tui"], str(bc_main.parent))
-        else:
-            # BirdClaw not found as sibling — just open the web UI
-            import webbrowser
-            url = f"http://127.0.0.1:47293"
-            print(f"  BirdClaw not found at {bc_main} — opening web UI at {url}")
-            webbrowser.open(url)
+        import webbrowser, urllib.parse
+        caller_cwd = os.getcwd()
+        cwd_param  = urllib.parse.quote(caller_cwd, safe="")
+        url = f"http://127.0.0.1:47293/?cwd={cwd_param}"
+        print(f"  Opening BirdClaw web UI for  {caller_cwd}")
+        print(f"  URL: http://127.0.0.1:47293/")
+        webbrowser.open(url)
 
     elif target == "claude":
         import shutil
@@ -458,8 +451,14 @@ def _launch(target: str) -> None:
             print("  Claude Code not found on PATH.")
             print("  Install it: npm install -g @anthropic-ai/claude-code")
             sys.exit(1)
-        print(f"  Launching Claude Code from {cli}")
-        _open_in_new_terminal([cli], str(here))
+        # Run Claude Code in the caller's working directory (not Sisyphean's dir)
+        caller_cwd = os.getcwd()
+        print(f"  Launching Claude Code in {caller_cwd}")
+        env = os.environ.copy()
+        env.setdefault("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{config.api.port}")
+        env.setdefault("ANTHROPIC_API_KEY", "sisyphean-local")
+        result = subprocess.run([cli], cwd=caller_cwd, env=env)
+        sys.exit(result.returncode)
 
     else:
         print(f"Unknown launch target: {target!r}")

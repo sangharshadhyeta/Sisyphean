@@ -26,6 +26,53 @@ Engine runs at `http://127.0.0.1:47291` by default.
 
 ---
 
+## Starting BirdClaw
+
+If you have [BirdClaw](https://github.com/sangharshadhyeta/BirdClaw) installed alongside Sisyphean,
+you can start it directly from here:
+
+```bash
+# Start Sisyphean first (if not already running)
+python main.py tray
+
+# Then in another terminal, launch BirdClaw web UI:
+python main.py launch birdclaw
+```
+
+`launch birdclaw` will:
+1. Check if BirdClaw is already running on port 47293
+2. If not, auto-detect the BirdClaw directory (`../BirdClaw` next to Sisyphean) and start it
+3. Open your browser to `http://127.0.0.1:47293/`
+
+> **Install BirdClaw** (if not already):
+> ```bash
+> git clone https://github.com/sangharshadhyeta/BirdClaw ../BirdClaw
+> cd ../BirdClaw && pip install -e .
+> ```
+
+---
+
+## Claude Code Integration
+
+Add Sisyphean as a custom model in Claude Code's settings:
+
+```json
+{
+  "customApiUrl": "http://127.0.0.1:47291",
+  "customApiKey": "local"
+}
+```
+
+Claude Code sends requests to `/v1/messages` (Anthropic format). Sisyphean routes them through its agent loop and returns `tool_use` / `end_turn` responses.
+
+Or launch Claude Code via Sisyphean (sets `ANTHROPIC_BASE_URL` automatically):
+
+```bash
+python main.py launch claude
+```
+
+---
+
 ## Configuration
 
 Edit `config.yaml` (created by `python main.py setup`):
@@ -49,33 +96,6 @@ api:
 mock: false                      # true = no model needed (for UI/API testing)
 workspace: ./workspace           # sandboxed directory; agent writes only here
 ```
-
----
-
-## Claude Code Integration
-
-Add Sisyphean as a custom model in Claude Code's settings:
-
-```json
-{
-  "customApiUrl": "http://127.0.0.1:47291",
-  "customApiKey": "local"
-}
-```
-
-Claude Code sends requests to `/v1/messages` (Anthropic format). Sisyphean routes them through its agent loop and returns `tool_use` / `end_turn` responses.
-
----
-
-## BirdClaw Integration
-
-BirdClaw (the harness) routes every task to Sisyphean via `BC_ENGINE_URL`. Set this in `~/.birdclaw/.env`:
-
-```bash
-BC_ENGINE_URL=http://127.0.0.1:47291
-```
-
-Or run `install.bat` in BirdClaw — it configures this automatically.
 
 ---
 
@@ -112,7 +132,7 @@ engine/
       verifier.py        Pure-regex scoring (complete/partial/missing/regressed)
 
   memory/
-    graph.py             NetworkX knowledge graph → memory/graph.json
+    graph.py             NetworkX knowledge graph (shared with BirdClaw)
     store.py             JSONL artifact store → memory/artifacts.jsonl
     session_log.py       Per-session conversation log (used by semantic history)
     injector.py          Injects graph context into LLM requests
@@ -166,11 +186,13 @@ Stall guard blocks duplicate (tool, input) calls. Semantic history uses Jaccard 
 
 ## Memory
 
-- **Knowledge graph** (`memory/graph.json`) — NetworkX graph of facts, concepts, and entities extracted during task execution.
+Sisyphean owns the single shared knowledge graph used by both Sisyphean and BirdClaw:
+
+- **Knowledge graph** (`~/.sisyphean/memory/knowledge_graph.json`) — NetworkX graph of facts, concepts, and entities extracted during task execution. BirdClaw reads from and writes to this same file.
 - **Artifact store** (`memory/artifacts.jsonl`) — JSONL log of significant outputs.
 - **Session log** — per-session JSONL conversation log used by semantic history.
 
-> Memory consolidation (dreaming) lives in **BirdClaw**, not in Sisyphean. Sisyphean's graph is populated automatically during task execution by `MemoryExtractor`.
+> Memory consolidation (dreaming) lives in **BirdClaw**, not in Sisyphean. Sisyphean's `MemoryExtractor` populates the graph during task execution; BirdClaw's dream cycle enriches it overnight.
 
 ---
 
@@ -194,6 +216,19 @@ Browse to `http://127.0.0.1:47291/dashboard` for a live status page showing upti
 
 ---
 
+## Commands
+
+```bash
+python main.py              # start engine
+python main.py tray         # Windows tray watchdog (recommended)
+python main.py setup        # first-time setup wizard
+python main.py config       # re-run setup to change settings
+python main.py launch birdclaw   # start BirdClaw web UI + open browser
+python main.py launch claude     # start Claude Code pointed at Sisyphean
+```
+
+---
+
 ## Development
 
 ```bash
@@ -201,11 +236,13 @@ Browse to `http://127.0.0.1:47291/dashboard` for a live status page showing upti
 # Set mock: true in config.yaml, then:
 python main.py
 
-# Re-run setup wizard to change settings
-python main.py setup
+# Run tests (engine must be running on port 47291)
+python tests/test_regimen.py
+python tests/test_api.py
+python tests/test_openclaw.py
 
-# Open BirdClaw web UI in browser
-python main.py launch birdclaw
+# Note: tests hardcode port 8000 — update BASE_URL or temporarily change
+# config.yaml api.port to 8000 before running.
 ```
 
 ---

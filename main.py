@@ -397,6 +397,65 @@ def _ensure_sisyphean_running(config) -> None:
     _t.sleep(2)
 
 
+def _find_birdclaw_dir() -> Path | None:
+    """Auto-detect the BirdClaw installation directory.
+
+    Search order:
+      1. Sibling of Sisyphean: ../BirdClaw  (most common layout)
+      2. Lowercase variant:    ../birdclaw
+      3. Home directory:       ~/BirdClaw
+    """
+    candidates = [
+        _HERE.parent / "BirdClaw",
+        _HERE.parent / "birdclaw",
+        Path.home() / "BirdClaw",
+        Path.home() / "birdclaw",
+    ]
+    for d in candidates:
+        if (d / "main.py").exists():
+            return d
+    return None
+
+
+def _is_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _start_birdclaw_web(bc_dir: Path) -> bool:
+    """Launch BirdClaw web server in a new visible console window (Windows)
+    or background process (Linux/Mac). Returns True when the port is open."""
+    import time as _t
+
+    python = sys.executable
+
+    if sys.platform == "win32":
+        # Start in a new console so BirdClaw output is visible and the process
+        # stays alive after this script exits.
+        subprocess.Popen(
+            ["cmd", "/c", "start", "BirdClaw", "cmd", "/k",
+             python, str(bc_dir / "main.py"), "web"],
+            cwd=str(bc_dir),
+            shell=False,
+        )
+    else:
+        subprocess.Popen(
+            [python, str(bc_dir / "main.py"), "web"],
+            cwd=str(bc_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    # Poll up to 15 s for BirdClaw to bind its port
+    for _ in range(30):
+        _t.sleep(0.5)
+        if _is_port_open(47293):
+            return True
+    return False
+
+
 def _open_in_new_terminal(cmd: list[str], cwd: str) -> None:
     """Open a command in a new terminal window (Windows) or foreground (other)."""
     if sys.platform == "win32":
@@ -419,11 +478,30 @@ def _launch(target: str) -> None:
 
     if target == "birdclaw":
         import webbrowser, urllib.parse
+
+        _BC_PORT = 47293
+
+        if _is_port_open(_BC_PORT):
+            print(f"  BirdClaw already running on port {_BC_PORT}.")
+        else:
+            bc_dir = _find_birdclaw_dir()
+            if bc_dir is None:
+                print("  BirdClaw not found. Install it alongside Sisyphean:")
+                print("    git clone https://github.com/sangharshadhyeta/BirdClaw ../BirdClaw")
+                print("    cd ../BirdClaw && pip install -e .")
+                print("  Then retry:  python main.py launch birdclaw")
+                sys.exit(1)
+            print(f"  Starting BirdClaw from {bc_dir} …")
+            ready = _start_birdclaw_web(bc_dir)
+            if not ready:
+                print(f"  Warning: BirdClaw did not start within 15 s. Opening browser anyway.")
+            else:
+                print(f"  BirdClaw web UI ready.")
+
         caller_cwd = os.getcwd()
         cwd_param  = urllib.parse.quote(caller_cwd, safe="")
-        url = f"http://127.0.0.1:47293/?cwd={cwd_param}"
-        print(f"  Opening BirdClaw web UI for  {caller_cwd}")
-        print(f"  URL: http://127.0.0.1:47293/")
+        url = f"http://127.0.0.1:{_BC_PORT}/?cwd={cwd_param}"
+        print(f"  Opening  http://127.0.0.1:{_BC_PORT}/")
         webbrowser.open(url)
 
     elif target == "claude":

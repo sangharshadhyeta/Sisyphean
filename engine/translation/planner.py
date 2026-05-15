@@ -176,6 +176,12 @@ RULES:
 - NEVER plan a step that asks the user for input. If info is needed, answer immediately instead.
 - Use 'Write' steps ONLY when the user explicitly asks for a file/document/report to be saved.
 - For web research: use 'Search' or 'Fetch' steps.
+- Use 'Run' steps (bash) for queries about the CURRENT state of this machine: running \
+processes, GPU/CPU/memory usage, hardware info, disk space, network status, uptime. \
+These require a shell command — never use 'Search' for live local machine data.
+- In 'Run' step text write the exact command to execute. Never prefix a command with \
+'python' unless it is a .py script (e.g. 'python myscript.py'). Standalone tools like \
+nvidia-smi, systeminfo, ipconfig run directly without any prefix.
 OPTIONAL: Add "budgets": "12 | 60 | 8" (pipe-count must match steps) ONLY when a step
 needs more than the default (research=12, write_doc=10, write_code=12, verify=8, reflect=5).
 """

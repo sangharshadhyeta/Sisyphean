@@ -95,12 +95,27 @@ class PermissionsConfig(BaseModel):
     ]
 
 
+class SearchConfig(BaseModel):
+    """Web search backend configuration.
+
+    Priority order when executing a search:
+      1. SearXNG  — fast, private, supports Google/Bing/DDG simultaneously.
+                   Requires a local SearXNG instance. Set searxng_url to enable.
+      2. DuckDuckGo package (ddgs / duckduckgo_search) — if installed.
+      3. DuckDuckGo Instant Answers API — pure httpx, no extra package, limited results.
+    """
+    searxng_url: str = ""   # e.g. "http://localhost:8888" — empty = skip SearXNG
+    max_results: int = 5
+    timeout: float = 15.0
+
+
 class Config(BaseModel):
     llm: LLMConfig
     embedding: EmbeddingConfig = EmbeddingConfig()
     api: APIConfig = APIConfig()
     memory: MemoryConfig = MemoryConfig()
     permissions: PermissionsConfig = PermissionsConfig()
+    search: SearchConfig = SearchConfig()
     mock: bool = False
     workspace: str = "./workspace"
 

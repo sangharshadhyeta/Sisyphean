@@ -26,7 +26,7 @@ from pathlib import Path
 
 INTER_TEST_PAUSE = 0  # local Ollama — no rate limiting needed
 
-SISYPHEAN_URL = "http://127.0.0.1:8000"
+SISYPHEAN_URL = "http://127.0.0.1:47291"
 OPENCLAW_DIR = Path(__file__).parent.parent / "openclaw"
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.sisyphean.json"
 

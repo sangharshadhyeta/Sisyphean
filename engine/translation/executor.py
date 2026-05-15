@@ -551,6 +551,22 @@ def _map_action_to_tool(raw: str, available_tools: list[dict]) -> "Action":
             if rest and "/" not in rest and not rest.startswith("usr") and not rest.startswith("bin"):
                 cmd = cmd[1:]
                 logger.debug("sanitized bash command: stripped leading '/'")
+
+        # Strip spurious "python" prefix from non-Python-script commands.
+        # The model sometimes outputs "python nvidia-smi" or "python systeminfo"
+        # because the SYSTEM prompt says "Python scripts: run with python script.py".
+        # Only strip if the argument is NOT a .py file.
+        _python_prefix_re = _re.compile(r'^python(?:3)?\s+', _re.IGNORECASE)
+        if _python_prefix_re.match(cmd):
+            rest_of_cmd = _python_prefix_re.sub("", cmd, count=1).strip()
+            first_token_rest = rest_of_cmd.split()[0] if rest_of_cmd.split() else ""
+            if first_token_rest and not first_token_rest.lower().endswith(".py"):
+                logger.debug(
+                    "sanitized bash command: stripped spurious 'python' prefix from %r → %r",
+                    cmd, rest_of_cmd,
+                )
+                cmd = rest_of_cmd
+
         tool_input["command"] = cmd
 
     return Action(type="tool", tool_name=canonical, tool_input=tool_input)

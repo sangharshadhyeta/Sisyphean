@@ -18,7 +18,7 @@ import sys
 import urllib.request
 import urllib.error
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = "http://127.0.0.1:47291"
 
 # ---------------------------------------------------------------------------
 # Helpers

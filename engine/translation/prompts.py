@@ -29,7 +29,12 @@ Shell: PowerShell on Windows (win32). Use PowerShell syntax for all commands.
 - List files: Get-ChildItem or ls (aliased). Create dirs: New-Item -ItemType Directory or mkdir.
 - Use backslashes in Windows paths or $env:VAR for environment variables.
 - Do NOT use Linux-only commands (grep, find, chmod, ln, cat /dev/null, etc.).
-- Python: python (not python3). Path separator: backslash. Home: $env:USERPROFILE.
+- Path separator: backslash. Home: $env:USERPROFILE.
+- Running commands: execute every shell command directly as-is. \
+Only prepend `python` when the target file ends in `.py` (e.g. `python script.py`). \
+All other executables — system tools, CLIs, diagnostics — run without any prefix.
+- Live system state (status, hardware, processes, GPU, network) comes from running shell \
+commands, not from web search.
 """
 
 # ---------------------------------------------------------------------------

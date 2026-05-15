@@ -120,19 +120,31 @@ _REFLECT_SYSTEM = (
 )
 
 _REPLAN_SYSTEM = """\
-A task is being completed. A search just returned relevant information.
-Derive ONLY the execution steps from what was found — copy commands, package names,
-and values VERBATIM from the search result. Do not guess or paraphrase.
+A task is being completed. A web search was just run.
+Your job: decide what to do next based on what was found.
+
+IF the search returned useful results:
+  Derive execution steps from what was found — copy commands, package names,
+  and values VERBATIM from the search result. Do not guess or paraphrase.
+
+IF the search returned nothing useful (empty, generic, or unrelated results):
+  Do NOT invent commands from thin air.
+  - If the task is about the current state of this machine (processes, hardware,
+    GPU, CPU, memory, disk, network, uptime) → plan a bash step that runs the
+    appropriate shell command directly.
+  - If the task genuinely requires web information → plan a better web_search
+    with a more specific query.
+  - If the task can be answered from general knowledge → reply {"steps": ""}
 
 Reply as JSON: {"steps": "toolname:exact input | toolname:exact input"}
 
 Available tools:
-  bash        — run a shell command exactly as described in the result
+  bash        — run a shell command (write the exact command; never prefix with
+                'python' unless running a .py file — other executables run directly)
   web_search  — search for more specific information if still needed
   save_memory — save a key fact that was discovered
 
-If the search result already fully answers the task and no execution is needed,
-reply: {"steps": ""}"""
+If the result already fully answers the task, reply: {"steps": ""}"""
 
 
 def _result_quality(result: dict) -> str:
@@ -633,6 +645,32 @@ class Pipeline:
                 step = steps[state.current_step_idx]
                 tool  = step.get("tool", "").strip().lower()
                 inp   = step.get("input", "").strip()
+
+                # ── Graph-first: check knowledge graph before any web search ────
+                # If the graph already has research relevant to this query,
+                # use it directly and skip the web search entirely.
+                # This applies to both the internal web_search and the outer
+                # WebSearch upgrade — the graph check happens before either.
+                if tool in ("web_search", "websearch") and self.graph:
+                    mem = _search_graph(inp, self.graph)
+                    if mem and len(mem.strip()) > 40:
+                        logger.info(
+                            "pipeline: graph-first hit for web_search %r — skipping web, using graph",
+                            inp[:50],
+                        )
+                        result = {
+                            "tool": "search_memory",
+                            "input": inp,
+                            "result": mem,
+                            "summary": f"recalled from graph: {mem[:120]}",
+                        }
+                        state.results.append(result)
+                        _tracker.tree_subtask_step(
+                            state.task_id, state.current_task_idx,
+                            "search_memory", inp, result["summary"], status="done",
+                        )
+                        state.current_step_idx += 1
+                        continue
 
                 # ── Smart upgrade: use Claude Code's WebSearch/WebFetch if available ─
                 if tool == "web_search" and "websearch" in outer_tool_names:

@@ -3,8 +3,8 @@
 
 llm:
   model_path: ""                       # not needed when using Ollama
-  model_name: sisyphean-gemma4:e2b          # name exposed via /v1/models
-  local_model: "gemma4:e2b"             # Ollama model name (sent in every request)
+  model_name: sisyphean-qwen3:0.6b          # name exposed via /v1/models
+  local_model: "qwen3:0.6b"             # Ollama model name (sent in every request)
   server:
     host: 127.0.0.1
     port: 11434                        # Ollama default port

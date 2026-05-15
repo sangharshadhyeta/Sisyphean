@@ -313,16 +313,31 @@ function PipelineTree({ task }) {
 
       {/* Tree body — Extractor is internal; show Plan → steps → Synthesize */}
       <div>
-        {/* Plan + sub-tasks */}
+        {/* Plan + sub-tasks.
+            Single sub-task: skip the redundant sub-task label row and render
+            its steps directly under Plan (avoids showing the same text 3×).
+            Multiple sub-tasks: show each sub-task as a collapsible row. */}
         <SectionNode id="planner" label="Plan" status={planner.status}
           input="" output={planner.output}
           accentColor="#818cf8"
           selectedKey={selectedKey} onSelect={handleSelect}
           defaultOpen={planner.sub_tasks && planner.sub_tasks.length > 0}>
-          {(planner.sub_tasks || []).map((sub, ti) => (
-            <SubTaskNode key={ti} sub={sub} taskIdx={ti}
-              selectedKey={selectedKey} onSelect={handleSelect} />
-          ))}
+          {planner.sub_tasks && planner.sub_tasks.length === 1
+            ? (planner.sub_tasks[0].steps || []).map((step, si) => {
+                const sk = `step-0-${si}`;
+                return (
+                  <SectionNode key={sk} id={sk}
+                    label={step.type} status={step.status}
+                    input={step.input} output={step.output}
+                    accentColor={toolColor(step.type)}
+                    selectedKey={selectedKey} onSelect={handleSelect} />
+                );
+              })
+            : (planner.sub_tasks || []).map((sub, ti) => (
+                <SubTaskNode key={ti} sub={sub} taskIdx={ti}
+                  selectedKey={selectedKey} onSelect={handleSelect} />
+              ))
+          }
         </SectionNode>
 
         {/* Synthesize */}

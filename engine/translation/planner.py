@@ -586,6 +586,15 @@ def _extract_signals(task: str) -> dict:
         elif re.search(r'\b(folder|directory|dir)\b', tl):
             hints["tool_hint"] = "bash"
             hints["action"]    = "mkdir"
+            # Extract folder name (no file extension required)
+            folder_m = (
+                re.search(r'\b(?:folder|directory|dir)\s+(?:called\s+|named\s+)?([\w][\w.-]*)', t, re.IGNORECASE) or
+                re.search(r'\b(?:called|named)\s+([\w][\w.-]*)', t, re.IGNORECASE)
+            )
+            if folder_m:
+                candidate = folder_m.group(1).rstrip('?.,')
+                if candidate.lower() not in _DIR_SKIP and not hints.get("filename"):
+                    hints["filename"] = candidate
         if run_m:
             hints["run_after"] = True
 
@@ -1064,7 +1073,18 @@ async def _dispatch_intent(intent: dict, task: str, client) -> list[dict]:
 
     # ── mkdir ─────────────────────────────────────────────────────────────────
     if kind == "mkdir":
-        name = fname or "output"
+        name = fname
+        if not name:
+            # Extract folder name from task text (no file extension required)
+            m = (
+                re.search(r'\b(?:folder|directory|dir)\s+(?:called\s+|named\s+)?([\w][\w.-]*)', task, re.IGNORECASE) or
+                re.search(r'\b(?:called|named)\s+([\w][\w.-]*)', task, re.IGNORECASE)
+            )
+            if m:
+                candidate = m.group(1).rstrip('?.,')
+                if candidate.lower() not in _DIR_SKIP:
+                    name = candidate
+        name = name or "output"
         return [{"tool": "bash", "input": f"mkdir -p {name}"}]
 
     # ── math ──────────────────────────────────────────────────────────────────
@@ -1276,8 +1296,32 @@ async def plan_task(
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
         if data:
-            steps_raw = str(data.get("steps") or "").strip()
-            if steps_raw.startswith("["):
+            steps_raw_val = data.get("steps")
+
+            # Model sometimes returns steps as a dict or list of dicts instead
+            # of the pipe-separated string format. Handle all cases cleanly.
+            if isinstance(steps_raw_val, dict):
+                # Single step as dict: {"tool": "websearch", "input": "..."}
+                t = steps_raw_val.get("tool", "").strip().lower()
+                i = steps_raw_val.get("input", "").strip()
+                if t and i:
+                    logger.debug("plan_task: LLM returned step dict → %s", t)
+                    return [{"tool": t, "input": i}]
+            elif isinstance(steps_raw_val, list):
+                # List of step dicts: [{"tool": ..., "input": ...}, ...]
+                steps = [
+                    {"tool": s.get("tool", "").strip().lower(),
+                     "input": s.get("input", "").strip()}
+                    for s in steps_raw_val
+                    if isinstance(s, dict) and s.get("tool") and s.get("input")
+                ]
+                if steps:
+                    logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
+                    return steps
+
+            # Standard pipe-separated string format
+            steps_raw = str(steps_raw_val or "").strip()
+            if steps_raw.startswith("[") or steps_raw.startswith("{"):
                 steps_raw = ""
             steps = []
             for part in steps_raw.split("|"):
@@ -1291,12 +1335,9 @@ async def plan_task(
                     if tool:
                         steps.append({"tool": tool, "input": inp})
                 elif part and part.lower() not in ("tool", "input"):
-                    # Fragment without tool:input colon — skip it.
-                    # This happens when bash pipe syntax (cmd | cmd) gets split
-                    # by the step separator. Never use task as a fallback input.
                     logger.debug("plan_task: skipping fragment (no colon): %r", part[:60])
             if steps:
-                logger.debug("plan_task: LLM fallback → %d step(s)", len(steps))
+                logger.debug("plan_task: LLM → %d step(s)", len(steps))
                 return steps
     except Exception as exc:
         logger.warning("plan_task fallback LLM failed: %s", exc)

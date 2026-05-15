@@ -413,6 +413,21 @@ class Pipeline:
                                     context=task_ctx,
                                     soul_section=soul_section,
                                     user_prefs=user_prefs)
+
+            # ── Websearch fallback — if plan is empty and no graph recall ──────
+            # The model produced no steps (common on small models for factual
+            # questions). Rather than letting the synthesizer hallucinate from
+            # stale training data, default to a web search so the answer is
+            # grounded in real results. Graph recall hitting means we already
+            # have fresh data — no need to search again.
+            if not steps and not graph_recall:
+                ws_tool = "websearch" if any(
+                    t.get("name", "").lower() == "websearch"
+                    for t in (relevant_tools or available_tools)
+                ) else "web_search"
+                steps = [{"tool": ws_tool, "input": task}]
+                logger.info("pipeline: empty plan → websearch fallback for %r", task[:60])
+
             sub_tasks.append({"task": task, "steps": steps})
             steps_preview = " → ".join(f"[{s['tool']}] {s['input'][:30]}" for s in steps[:4])
             logger.info("pipeline: task=%r steps=%s", task[:60],

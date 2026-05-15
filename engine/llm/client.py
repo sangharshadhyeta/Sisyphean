@@ -424,7 +424,18 @@ class LlamaClient:
 
 # ── Module-level helper: strip <think> blocks from qwen3/deepseek-r1 output ──
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Standard thinking-block tokens emitted by various models:
+# <think>…</think>                     — Qwen3, DeepSeek-R1, Llama variants
+# <thinking>…</thinking>               — some Ollama builds
+# <|thinking|>…<|/thinking|>           — llama.cpp / some quantised models
+# <|channel>thought\n…<channel|>       — Gemma 4 (e2b/e4b ignore think:false, tokens leak)
+_THINK_RE = re.compile(
+    r"<think>.*?</think>"
+    r"|<thinking>.*?</thinking>"
+    r"|<\|thinking\|>.*?<\|/thinking\|>"
+    r"|<\|channel>thought\n.*?<channel\|>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 _REPEAT_MIN_LEN = 12   # ignore lines shorter than this (blanks, punctuation)
 _REPEAT_THRESHOLD = 3  # cut after a line appears this many times
@@ -578,19 +589,18 @@ def _strip_thinking(data: dict) -> None:
                         continue
 
             # 2. llama.cpp external puts thinking in "reasoning_content", answer in "content"
-            #    If content is still empty, promote reasoning_content as fallback
             for field in ("reasoning_content", "reasoning"):
                 thinking = msg.get(field) or ""
                 if thinking.strip():
-                    # Extract the last JSON from thinking — model puts answer at the end
+                    # Only rescue structured JSON from reasoning fields (plan calls).
+                    # Never promote plain-text reasoning as an answer — that leaks
+                    # the thinking chain. Plain-text callers (synthesizer) handle
+                    # empty content via their own retry/fallback logic.
                     rescued = _last_json(thinking)
                     if rescued:
                         msg["content"] = rescued
                         logger.debug("rescued JSON from %s field (%d chars)", field, len(rescued))
-                    else:
-                        msg["content"] = thinking.strip()
-                        logger.debug("promoted %s to content (%d chars)", field, len(thinking))
-                    break
+                        break
 
 
 # ── Module-level helper: flatten Anthropic content blocks to plain OAI text ──

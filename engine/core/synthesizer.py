@@ -23,6 +23,7 @@ _SYSTEM_WITH_RESULTS = (
     "- If multiple results are given, combine them into a complete picture.\n"
     "- If context is provided, use it to understand references to prior conversation.\n"
     "- If soul guidance is given, follow it.\n"
+    "- Output your reply ONLY. Do not write 'Thinking Process', reasoning steps, or analysis headers.\n"
     "- Be direct. No hollow openers ('Great question!', 'Certainly!'). No '/think'."
 )
 
@@ -34,7 +35,8 @@ _SYSTEM_NO_RESULTS = (
     "- Give a substantive, specific answer — not a single sentence.\n"
     "- Draw on the conversation context if provided.\n"
     "- If soul guidance is given, follow it.\n"
-    "- No hollow openers. No '/think'."
+    "- Output your reply ONLY. Do not write 'Thinking Process', reasoning steps, analysis headers, or any internal deliberation.\n"
+    "- Start directly with the reply. No hollow openers. No '/think'."
 )
 
 
@@ -115,23 +117,29 @@ async def synthesize(
     # - Results present: full synthesis, 600 tokens (enough for ~400 word answer)
     max_tokens = 200 if not has_results else 600
 
-    try:
-        result = await client.generate(
-            [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.3,
-            stream=False,
-            thinking=False,
-        )
-        text = (result["choices"][0]["message"]["content"] or "").strip()
-        if text:
-            logger.debug("synthesize: %d chars", len(text))
-            return text
-    except Exception as exc:
-        logger.warning("synthesize failed: %s", exc)
+    for _attempt in range(2):
+        try:
+            result = await client.generate(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3,
+                stream=False,
+                thinking=False,
+            )
+            text = (result["choices"][0]["message"]["content"] or "").strip()
+            if text:
+                logger.debug("synthesize: %d chars", len(text))
+                return text
+            # Empty response — retry with a minimal prompt
+            logger.warning("synthesize: empty response on attempt %d", _attempt + 1)
+            prompt = f"Reply to: {query[:200]}"
+            system = _SYSTEM_NO_RESULTS
+            max_tokens = 150
+        except Exception as exc:
+            logger.warning("synthesize failed attempt %d: %s", _attempt + 1, exc)
 
     best = good or weak
     if best:

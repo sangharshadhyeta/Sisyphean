@@ -386,7 +386,9 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         lines.append(f"  {name} — {desc}")
     lines += [
         "",
-        "NEVER answer factual questions from memory — always web_search.",
+        "Use web_search for any question about current facts, versions, prices, events, or anything",
+        "that could have changed since training — do not guess from memory for these.",
+        "Use general knowledge only for timeless facts (capitals, math, definitions).",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
         "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then save_memory).",
@@ -1195,42 +1197,13 @@ async def plan_task(
             logger.debug("plan_task: regex→dispatch %s → %d step(s)", sig_action, len(steps))
             return steps
 
-    # ── Stage 1: LLM normalize → Python dispatch ─────────────────────────────
-    # Skip Stage 1 for machine-local queries — _normalize_intent classifies them
-    # as "research" and produces a web_search step. Go straight to Stage 2 which
-    # has the tool list and the bash hint from sig_hint.
-    if sig_action == "machine_local":
-        intent = {}
-    else:
-        intent = await _normalize_intent(task, context, client)
-
-    if intent:
-        kind = intent.get("intent", "")
-        # Only treat as "direct" (no tools needed) for pure social exchanges —
-        # not for any task that contains an action verb or file/tool reference.
-        _ACTION_HINTS = frozenset({
-            "list", "write", "create", "run", "find", "show", "search", "check",
-            "edit", "make", "build", "install", "execute", "read", "get", "open",
-            "delete", "move", "copy", "fetch", "look", "print", "generate",
-        })
-        task_words = set(task.lower().split())
-        _looks_like_task = bool(task_words & _ACTION_HINTS)
-
-        if kind in ("direct", "answer") and not _looks_like_task:
-            logger.debug("plan_task: intent=%s, no action hints → synthesizer answers", kind)
-            return []
-        if kind in ("direct", "answer") and _looks_like_task:
-            logger.debug("plan_task: intent=%s but task has action hints → falling to Stage 2", kind)
-            # Fall through to Stage 2 which has the tool list
-        elif kind:
-            steps = await _dispatch_intent(intent, task, client)
-            if steps:
-                logger.debug("plan_task: normalize→dispatch → %d step(s) intent=%s",
-                             len(steps), kind)
-                return steps
-
-    # ── Stage 2: LLM fallback for complex/multi-step tasks ───────────────────
-    logger.debug("plan_task: normalize missed %r — falling back to LLM", task[:60])
+    # ── Single LLM planning call ──────────────────────────────────────────────
+    # _normalize_intent (Stage 1) was unreliable — it misclassified multi-step
+    # tasks as "direct"/"answer" producing empty plans, and added a full extra
+    # LLM round-trip. Removed. All tasks that reach here go to one well-structured
+    # planning call with the full tool list. Regex pre-filters above still handle
+    # math, memory, write_code, write_doc, and machine_local without any LLM call.
+    logger.debug("plan_task: LLM planning call for %r", task[:60])
     prompt = f"Task: {task[:200]}"
     if context:
         prompt += f"\nContext:\n{context[:400]}"
@@ -1262,11 +1235,11 @@ async def plan_task(
                 {"role": "system", "content": _build_plan_system(outer_tools)},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=600,
+            max_tokens=400,
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=True,
+            thinking=False,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)

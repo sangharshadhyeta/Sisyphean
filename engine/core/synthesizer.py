@@ -38,6 +38,55 @@ _SYSTEM_NO_RESULTS = (
 )
 
 
+# Tools whose results benefit from LLM synthesis (combining, interpreting, shaping).
+# Everything else (bash, write, edit, save_memory) is self-describing — return directly.
+_RESEARCH_TOOLS = frozenset({
+    "web_search", "search_memory", "search_knowledge",
+    "search_policy", "websearch", "webfetch",
+})
+_WRITE_TOOLS  = frozenset({"write", "edit", "write_plan"})
+_BASH_TOOLS   = frozenset({"bash", "powershell"})
+_MEMORY_TOOLS = frozenset({"save_memory", "remember"})
+
+
+def _fast_path(results: list[dict]) -> str | None:
+    """Return a deterministic response when no research results are present.
+
+    Covers three purely mechanical outcomes:
+      bash / powershell  → return stdout directly
+      write / edit       → "Done. Written to `X`."
+      save_memory        → "Saved: X"
+
+    Returns None when any research/web result is present — those need LLM synthesis.
+    """
+    valid = [r for r in results if r.get("result") is not None]
+    if not valid:
+        return None
+    if any(r.get("tool", "").lower() in _RESEARCH_TOOLS for r in valid):
+        return None  # has research results → let LLM synthesize
+
+    lines: list[str] = []
+    for r in valid:
+        tool = (r.get("tool") or "").lower()
+        inp  = (r.get("input") or "").strip()[:80]
+        out  = (r.get("result") or "").strip()
+
+        if tool in _BASH_TOOLS:
+            if out:
+                # Truncate very long outputs from the front, keep the tail
+                # (test runners, build tools put the important bit at the end)
+                trimmed = out if len(out) <= 800 else f"[…]\n{out[-800:]}"
+                lines.append(trimmed)
+        elif tool in _WRITE_TOOLS:
+            lines.append(f"Done. Written to `{inp}`." if inp else "Done.")
+        elif tool in _MEMORY_TOOLS:
+            lines.append(f"Saved: {inp}" if inp else "Saved.")
+        elif out:
+            lines.append(out[:300])
+
+    return "\n\n".join(lines) if lines else None
+
+
 async def synthesize(
     query: str,
     soul_section: str,
@@ -46,7 +95,18 @@ async def synthesize(
     client,
     context: str = "",
 ) -> str:
-    """Produce the final plain-text answer from all sub-task results."""
+    """Produce the final plain-text answer from all sub-task results.
+
+    Fast-path: bash/write/save_memory tasks return a deterministic template
+    without an LLM call — the output IS the answer.
+    LLM call is kept for: web search results, conversational turns, multi-source
+    synthesis, and any task whose results require interpretation or combination.
+    """
+    fast = _fast_path(results)
+    if fast:
+        logger.debug("synthesize: fast-path (%d chars)", len(fast))
+        return fast
+
     parts: list[str] = []
 
     if context:

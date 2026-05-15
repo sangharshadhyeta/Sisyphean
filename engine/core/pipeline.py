@@ -126,15 +126,23 @@ Your job: decide what to do next based on what was found.
 IF the search returned useful results:
   Derive execution steps from what was found — copy commands, package names,
   and values VERBATIM from the search result. Do not guess or paraphrase.
+  If the result already answers the question → reply {"steps": ""}
 
-IF the search returned nothing useful (empty, generic, or unrelated results):
+IF the search returned nothing useful OR off-topic results:
   Do NOT invent commands from thin air.
-  - If the task is about the current state of this machine (processes, hardware,
-    GPU, CPU, memory, disk, network, uptime) → plan a bash step that runs the
-    appropriate shell command directly.
-  - If the task genuinely requires web information → plan a better web_search
-    with a more specific query.
-  - If the task can be answered from general knowledge → reply {"steps": ""}
+  Read the result carefully — extract clues about what went wrong:
+    - Result about wrong OS/platform (e.g. Android result for a PC task)?
+      → reformulate with the correct OS context (e.g. add "Windows" or "Linux")
+    - Result about a different meaning of the query?
+      → narrow with the specific domain or context
+    - Task is about THIS machine's current state (processes, CPU, memory, disk,
+      system status, uptime, network) → plan a bash step, do NOT search the web
+    - If a better query is genuinely needed → plan web_search with the improved query
+
+RULES (enforce strictly):
+  - NEVER output the exact same search query that was just run — always reformulate
+  - A query that already ran once must not appear again in your steps
+  - For machine/system state queries: always bash, never web_search
 
 Reply as JSON: {"steps": "toolname:exact input | toolname:exact input"}
 
@@ -689,6 +697,24 @@ class Pipeline:
 
                 # ── Outer tool → return tool_use to Claude Code ───────────────
                 if tool in outer_tool_names:
+                    # ── Deduplication guard ───────────────────────────────────
+                    # Prevent the same (tool, input) from being dispatched twice.
+                    # A replan loop can otherwise generate identical web searches
+                    # indefinitely when the small model can't decide what to do.
+                    if tool in ("websearch", "webfetch", "web_search"):
+                        norm_inp = inp.strip().lower()
+                        already_run = any(
+                            r.get("tool", "").lower() in ("websearch", "web_search", "webfetch")
+                            and r.get("input", "").strip().lower() == norm_inp
+                            for r in state.results
+                        )
+                        if already_run:
+                            logger.warning(
+                                "pipeline: skipping duplicate outer %s(%r) — "
+                                "already in results", tool, inp[:60]
+                            )
+                            state.current_step_idx += 1
+                            continue
                     logger.info("pipeline: outer tool=%s input=%s", tool, inp[:60])
                     _log("bash", tool, inp[:80], session_id=state.task_id,
                          data={"action": "bash", "tool": tool, "input": inp[:200],
@@ -881,11 +907,17 @@ class Pipeline:
                     found = result.get("result", "")
                     remaining = len(steps) - state.current_step_idx - 1
                     if found and remaining > 0:
+                        _prior_qs = [
+                            r.get("input", "") for r in state.results
+                            if r.get("tool", "").lower() in ("web_search", "websearch", "webfetch")
+                            and r.get("input", "")
+                        ]
                         new_steps = await self._replan_after_search(
                             sub["task"], found, available_tools,
                             soul_section=state.soul_section,
                             user_prefs=state.user_prefs,
                             epistemic=_epistemic_block(state),
+                            prior_queries=_prior_qs,
                         )
                         old_count = remaining
                         sub["steps"] = steps[:state.current_step_idx + 1] + new_steps
@@ -958,6 +990,7 @@ class Pipeline:
         self, task: str, search_result: str, available_tools: list[dict],
         soul_section: str = "", user_prefs: str = "",
         epistemic: str = "",
+        prior_queries: list[str] | None = None,
     ) -> list[dict]:
         """Derive follow-up execution steps from an actual search/memory result.
 
@@ -965,16 +998,23 @@ class Pipeline:
         Soul guidance and user preferences shape which steps are chosen and how.
         Returns [] if the result already answers the task (no execution needed),
         or on any failure (caller keeps original steps in that case).
+
+        prior_queries: list of search queries already executed this session —
+        passed to the model so it never repeats a query verbatim.
         """
         logger.debug("pipeline: replan from search result for task=%r", task[:60])
         soul_block = f"\nPersonality guidance (follow this):\n{soul_section[:300]}" if soul_section else ""
         prefs_block = f"\nUser preferences:\n{user_prefs[:200]}" if user_prefs else ""
         ep_block = f"\n\n{epistemic}" if epistemic else ""
+        already_block = ""
+        if prior_queries:
+            qs = "\n".join(f"  - {q}" for q in prior_queries[:8])
+            already_block = f"\n\nAlready searched (do NOT repeat these queries):\n{qs}"
         try:
             r = await self.client.generate(
                 [
                     {"role": "system", "content": _REPLAN_SYSTEM + soul_block + prefs_block},
-                    {"role": "user",   "content": f"Task: {task}{ep_block}\n\nFound:\n{search_result[:3000]}"},
+                    {"role": "user",   "content": f"Task: {task}{ep_block}{already_block}\n\nFound:\n{search_result[:3000]}"},
                 ],
                 max_tokens=500,
                 temperature=0.1,
@@ -1063,13 +1103,28 @@ class Pipeline:
                 logger.warning("pipeline: _generate_edit_steps returned nothing — skipping edit")
 
         elif tool in ("websearch", "webfetch"):
+            # Informational queries with a non-empty result don't need replan —
+            # the websearch answer goes straight to synthesis.
+            # (Same logic as glob/grep informational guard above.)
+            if _is_informational_query(state.query) and result and len(result.strip()) > 50:
+                logger.info(
+                    "pipeline: %s informational query with results — skipping replan, "
+                    "going to synthesis", tool
+                )
+                return
             # Delegate to the existing search-result replan (derives bash/save steps)
             logger.info("pipeline: %s→replan from web result", tool)
+            _prior_qs = [
+                r.get("input", "") for r in state.results
+                if r.get("tool", "").lower() in ("web_search", "websearch", "webfetch")
+                and r.get("input", "")
+            ]
             new_steps = await self._replan_after_search(
                 state.query, result, available_tools,
                 soul_section=state.soul_section,
                 user_prefs=state.user_prefs,
                 epistemic=_epistemic_block(state),
+                prior_queries=_prior_qs,
             )
             if new_steps:
                 sub["steps"].extend(new_steps)

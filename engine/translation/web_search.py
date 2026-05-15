@@ -1,11 +1,14 @@
 """Web search for Sisyphean.
 
-Three-tier search with automatic fallback:
+Four-tier search with automatic fallback:
   1. SearXNG  — private, multi-engine. Requires local instance.
                Set `search.searxng_url` in config.yaml to enable.
-  2. DuckDuckGo package (ddgs / duckduckgo_search) — full results, no API key.
+  2. Jina AI  — free-tier AI-powered search (s.jina.ai). Returns clean,
+               AI-processed content. No API key required for basic use.
+               Results are marked is_ai_synthesized=True.
+  3. DuckDuckGo package (ddgs / duckduckgo_search) — full results, no API key.
                Install: pip install duckduckgo-search
-  3. DuckDuckGo Instant Answers API — pure httpx fallback, no extra package.
+  4. DuckDuckGo Instant Answers API — pure httpx fallback, no extra package.
                Limited to abstract + related topics.
 
 When running under Claude Code, the outer WebSearch tool is preferred over
@@ -16,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from engine.translation.pruner import keyword_prune
 from engine.translation.condenser import fast_clean, distill, strip_html
@@ -31,6 +34,8 @@ class SearchResult:
     title: str
     url: str
     snippet: str
+    source: str = field(default="")          # "jina", "searxng", "ddg", etc.
+    is_ai_synthesized: bool = field(default=False)  # True when result is pre-processed by an AI tier
 
     def to_context(self) -> str:
         return f"**{self.title}**\n{self.snippet}\nSource: {self.url}"
@@ -57,8 +62,12 @@ def _get_search_config():
 async def search(query: str, max_results: int = 5) -> list[SearchResult]:
     """Search the web and return results as SearchResult objects.
 
-    Falls through the three tiers automatically.  Returns [] only if all
+    Falls through four tiers automatically.  Returns [] only if all
     tiers fail (e.g. no network, all services down).
+
+    Jina AI (tier 2) returns AI-processed results marked with
+    is_ai_synthesized=True — the synthesizer can skip its LLM call
+    when all results carry this flag.
     """
     if not query or not query.strip():
         return []
@@ -75,13 +84,20 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
             return results
         logger.debug("web_search: SearXNG miss  query=%r", query[:50])
 
-    # ── Tier 2: DuckDuckGo package (ddgs / duckduckgo_search) ────────────────
+    # ── Tier 2: Jina AI (free-tier, AI-processed results) ────────────────────
+    results = await _search_jina(query, n, timeout)
+    if results:
+        logger.info("web_search: Jina ok  query=%r  results=%d", query[:50], len(results))
+        return results
+    logger.debug("web_search: Jina miss  query=%r", query[:50])
+
+    # ── Tier 3: DuckDuckGo package (ddgs / duckduckgo_search) ────────────────
     results = await _search_ddg_package(query, n)
     if results:
         logger.info("web_search: DDG package ok  query=%r  results=%d", query[:50], len(results))
         return results
 
-    # ── Tier 3: DuckDuckGo Instant Answers API (pure httpx) ──────────────────
+    # ── Tier 4: DuckDuckGo Instant Answers API (pure httpx) ──────────────────
     results = await _search_ddg_instant(query, n, timeout)
     if results:
         logger.info("web_search: DDG instant ok  query=%r  results=%d", query[:50], len(results))
@@ -115,6 +131,61 @@ async def _search_searxng(
     except Exception as exc:
         logger.debug("_search_searxng failed: %s", exc)
         return []
+
+
+async def _search_jina(
+    query: str, n: int, timeout: float
+) -> list[SearchResult]:
+    """Jina AI Reader search — free tier, no API key required.
+
+    Endpoint: GET https://s.jina.ai/{encoded_query}
+    Returns clean, AI-processed content from the top web results.
+    Results are marked is_ai_synthesized=True so the synthesizer
+    can skip its LLM call and return the content directly.
+    """
+    try:
+        import httpx
+        from urllib.parse import quote
+
+        encoded = quote(query, safe="")
+        url = f"https://s.jina.ai/{encoded}"
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Sisyphean/1.0",
+            "X-Respond-With": "no-references",  # omit inline citations for cleaner text
+        }
+
+        async with httpx.AsyncClient(timeout=timeout) as http:
+            resp = await http.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+    except Exception as exc:
+        logger.debug("_search_jina failed: %s", exc)
+        return []
+
+    raw_items = data.get("data") or []
+    if not raw_items:
+        return []
+
+    results: list[SearchResult] = []
+    for item in raw_items[:n]:
+        title   = (item.get("title") or "").strip()
+        url_str = (item.get("url") or "").strip()
+        # Prefer `content` (full cleaned text) over `description` (short snippet)
+        body    = (item.get("content") or item.get("description") or "").strip()
+        if not body:
+            continue
+        results.append(SearchResult(
+            title=title,
+            url=url_str,
+            snippet=body[:800],
+            source="jina",
+            is_ai_synthesized=True,
+        ))
+
+    return results
 
 
 async def _search_ddg_package(query: str, n: int) -> list[SearchResult]:

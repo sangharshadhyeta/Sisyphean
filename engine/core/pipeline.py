@@ -1622,7 +1622,12 @@ class Pipeline:
             # Live data (status, metrics) is filtered out by the extraction LLM.
             if content and "No results" not in content and "failed" not in content:
                 await self._save_research_to_graph(inp, content)
-            return {"tool": tool, "input": inp, "result": content, "summary": content[:2000]}
+            result_dict: dict = {"tool": tool, "input": inp, "result": content, "summary": content[:2000]}
+            # If ALL results came from the Jina AI tier they are already AI-processed.
+            # Flag this so the synthesizer can skip its LLM call and return directly.
+            if raw and all(getattr(r, "is_ai_synthesized", False) for r in raw):
+                result_dict["is_ai_synthesized"] = True
+            return result_dict
 
         if tool in ("save_memory", "remember"):
             # user_prefs are BirdClaw's domain — CLAUDE.md handles prefs in Claude Code.

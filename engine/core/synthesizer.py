@@ -50,20 +50,37 @@ _MEMORY_TOOLS = frozenset({"save_memory", "remember"})
 
 
 def _fast_path(results: list[dict]) -> str | None:
-    """Return a deterministic response when no research results are present.
+    """Return a deterministic response when LLM synthesis can be skipped.
 
-    Covers three purely mechanical outcomes:
-      bash / powershell  → return stdout directly
-      write / edit       → "Done. Written to `X`."
-      save_memory        → "Saved: X"
+    Covers four cases:
+      bash / powershell         → return stdout directly
+      write / edit              → "Done. Written to `X`."
+      save_memory               → "Saved: X"
+      AI-synthesized web search → return Jina content directly (already processed)
 
-    Returns None when any research/web result is present — those need LLM synthesis.
+    Returns None when raw/unprocessed research results are present — those need
+    LLM synthesis to combine and interpret.
     """
     valid = [r for r in results if r.get("result") is not None]
     if not valid:
         return None
-    if any(r.get("tool", "").lower() in _RESEARCH_TOOLS for r in valid):
-        return None  # has research results → let LLM synthesize
+
+    # Split research results into AI-synthesized vs raw
+    research = [r for r in valid if r.get("tool", "").lower() in _RESEARCH_TOOLS]
+    if research:
+        raw_research = [r for r in research if not r.get("is_ai_synthesized")]
+        if raw_research:
+            return None  # has raw research results → let LLM synthesize
+        # All research results are already AI-synthesized (e.g. Jina AI tier).
+        # Return their content directly — no LLM call needed.
+        lines = []
+        for r in research:
+            body = (r.get("result") or "").strip()
+            if body and body not in ("No results.", "[No search results found]"):
+                lines.append(body[:3000])
+        if lines:
+            return "\n\n".join(lines)
+        return None
 
     lines: list[str] = []
     for r in valid:

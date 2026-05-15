@@ -376,8 +376,9 @@ class Pipeline:
         all_extracted: list[str] = []
 
         for task in tasks:
-            # Re-extract focused on this specific sub-task (skip if only one task —
-            # top-level extract already covers it)
+            # Re-extract focused on this specific sub-task (bigram Jaccard, no LLM).
+            # Gives each sub-task a focused slice of history rather than the
+            # top-level extract which may include irrelevant exchanges.
             if len(tasks) > 1:
                 task_history = await extract_for_task(task, history_text, self.client)
                 extract_quality = "relevant" if len(task_history.split()) > 10 else ("minimal" if task_history else "none")

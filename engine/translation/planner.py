@@ -432,8 +432,13 @@ _MACHINE_LOCAL_RE = re.compile(
     r"temperature|fan|performance|usage|load|status|running|installed)\b",
     re.IGNORECASE,
 )
-_RESEARCH_KW = frozenset(["search online", "search for", "search the web", "look up",
-                           "look it up", "find online", "browse", "fetch online", "google"])
+# Phrases that unambiguously mean "search the web" — NOT "search for files",
+# "browse the workspace", "look up this config", etc.
+_RESEARCH_KW = frozenset([
+    "search online", "search the web", "search the internet",
+    "find online", "fetch online", "look up online",
+    "google ", "bing ", "browse the web", "browse online",
+])
 _EXT_LANG = {   # language/type word → glob pattern
     "python": "*.py", "py": "*.py", "javascript": "*.js", "js": "*.js",
     "typescript": "*.ts", "ts": "*.ts", "markdown": "*.md", "md": "*.md",
@@ -689,7 +694,26 @@ def _extract_signals(task: str) -> dict:
             hints["tool_hint"] = "bash"
             hints["action"]    = "machine_local"
 
-    # ── Web search signals ────────────────────────────────────────────────────
+    # ── Explicit search intent → web short-circuit ───────────────────────────
+    # "search online/for/the web", "look up", "find online" etc. are unambiguous
+    # search requests — route directly without an LLM call.
+    if not hints.get("tool_hint") and not write_m:
+        for kw in _RESEARCH_KW:
+            if kw in tl:
+                # Strip the search verb prefix to get the bare query
+                q = tl
+                for prefix in ("search online for ", "search the web for ",
+                                "search the internet for ", "find online ",
+                                "look up online ", "fetch online ", "google "):
+                    if q.startswith(prefix):
+                        q = q[len(prefix):]
+                        break
+                hints["tool_hint"] = "web"
+                hints["action"]    = "explicit_search"
+                hints["search_q"]  = q.rstrip('?.').strip()
+                break
+
+    # ── Web search signals (time-sensitive keywords) ──────────────────────────
     # Skip if a write verb was detected — "write an essay about X" is not a web search.
     if not hints.get("tool_hint") and not write_m:
         # Use word-boundary match to avoid "live" hitting "alive", "deliver", etc.
@@ -728,7 +752,7 @@ def _hints_to_str(sig: dict) -> str:
 # split + plan_task
 # ---------------------------------------------------------------------------
 
-async def split_deep(query: str, client, max_depth: int = 3) -> list[str]:
+async def split_deep(query: str, client, max_depth: int = 1) -> list[str]:
     """Iteratively split until every sub-task is atomic or max_depth reached.
 
     "Atomic" means split() returns the task unchanged — the LLM judged it
@@ -1133,6 +1157,14 @@ async def plan_task(
 
     if sig_hint == "policy":
         return [{"tool": "search_policy", "input": task}]
+
+    # ── Explicit search request → web_search, no LLM needed ──────────────────
+    if sig_action == "explicit_search":
+        q = signals.get("search_q") or task
+        tool = "websearch" if any(t.get("name", "").lower() == "websearch"
+                                  for t in outer_tools) else "web_search"
+        logger.debug("plan_task: explicit_search → %s %r", tool, q[:60])
+        return [{"tool": tool, "input": q}]
 
     # ── Machine-local queries → fall to Stage 2 LLM with bash hint ───────────
     # _MACHINE_LOCAL_RE matched (system, CPU, memory, disk, status, etc.).

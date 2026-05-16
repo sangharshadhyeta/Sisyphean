@@ -18,6 +18,7 @@ class MemoryConfig(BaseModel):
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8080
+    ollama_port: int = 11434
     context_size: int = 8192
     threads: int = 4
     gpu_layers: int = 0

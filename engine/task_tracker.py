@@ -158,7 +158,11 @@ def tree_plan_done(task_id: str, sub_tasks: list[dict]) -> None:
     if not t:
         return
     t["planner"]["status"] = "done"
-    t["planner"]["output"] = f"{len(sub_tasks)} sub-task(s)"
+    # Show actual stage goals, not a generic count
+    if len(sub_tasks) == 1:
+        t["planner"]["output"] = sub_tasks[0]["task"][:120]
+    else:
+        t["planner"]["output"] = "  →  ".join(st["task"][:35] for st in sub_tasks[:5])
     now = round(time.time())
     t["planner"]["sub_tasks"] = [
         {

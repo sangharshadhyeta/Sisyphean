@@ -240,6 +240,13 @@ function SectionNode({ id, label, status, input, output, children, selectedKey, 
     if (status === 'running') setOpen(true);
   }, [status]);
 
+  // Re-open when defaultOpen flips to true after mount.
+  // Handles the race where sub_tasks arrive after the component already mounted
+  // with defaultOpen=false (polling caught the task before planning finished).
+  React.useEffect(() => {
+    if (defaultOpen) setOpen(true);
+  }, [defaultOpen]);
+
   const labelStyle = accentColor ? { color: accentColor } : {};
 
   return (
@@ -323,16 +330,29 @@ function PipelineTree({ task }) {
           selectedKey={selectedKey} onSelect={handleSelect}
           defaultOpen={planner.sub_tasks && planner.sub_tasks.length > 0}>
           {planner.sub_tasks && planner.sub_tasks.length === 1
-            ? (planner.sub_tasks[0].steps || []).map((step, si) => {
-                const sk = `step-0-${si}`;
+            ? (() => {
+                const steps = planner.sub_tasks[0].steps || [];
+                if (steps.length > 0) {
+                  return steps.map((step, si) => {
+                    const sk = `step-0-${si}`;
+                    return (
+                      <SectionNode key={sk} id={sk}
+                        label={step.type} status={step.status}
+                        input={step.input} output={step.output}
+                        accentColor={toolColor(step.type)}
+                        selectedKey={selectedKey} onSelect={handleSelect} />
+                    );
+                  });
+                }
+                // Direct answer — no tool steps, but show the goal so Plan has visible content
                 return (
-                  <SectionNode key={sk} id={sk}
-                    label={step.type} status={step.status}
-                    input={step.input} output={step.output}
-                    accentColor={toolColor(step.type)}
-                    selectedKey={selectedKey} onSelect={handleSelect} />
+                  <div className="tree-indent">
+                    <span className="text-slate-500 text-xs italic pl-1">
+                      {planner.sub_tasks[0].text || 'direct answer'}
+                    </span>
+                  </div>
                 );
-              })
+              })()
             : (planner.sub_tasks || []).map((sub, ti) => (
                 <SubTaskNode key={ti} sub={sub} taskIdx={ti}
                   selectedKey={selectedKey} onSelect={handleSelect} />

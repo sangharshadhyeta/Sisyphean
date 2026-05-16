@@ -408,9 +408,12 @@ class Pipeline:
             logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
                         [(s["type"], s["goal"][:40]) for s in stages])
 
-        # Fall back to the query as a single task if decomposition returned nothing.
+        # If think_decompose returned no stages, the model decided no tool steps are
+        # needed (greeting, thanks, capability question, trivial answer).
+        # Mark as "direct" so the pipeline skips planning and goes straight to synthesizer.
+        # If decomposition genuinely failed on a complex query, synthesizer handles it.
         if not stages:
-            stages = [{"type": infer_stage_type(query), "goal": query}]
+            stages = [{"type": "direct", "goal": query}]
 
         # Map stages back to the task list that plan_task expects.
         # Each stage goal becomes the sub-task text; infer_stage_type already

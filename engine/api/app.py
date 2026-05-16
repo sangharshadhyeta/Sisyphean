@@ -186,8 +186,14 @@ def create_app(config: Config) -> FastAPI:
         elif ext_cfg.enabled and ext_cfg.base_url and ext_cfg.api_key:
             result = True
         else:
-            llm_url = f"http://{config.llm.server.host}:{config.llm.server.port}"
-            health_path = "/api/tags" if config.llm.local_model else "/health"
+            if config.llm.local_model:
+                # Ollama: use ollama_port, not llama-server port
+                port = config.llm.server.ollama_port
+                health_path = "/api/tags"
+            else:
+                port = config.llm.server.port
+                health_path = "/health"
+            llm_url = f"http://{config.llm.server.host}:{port}"
             try:
                 async with httpx.AsyncClient(timeout=1.5) as c:
                     r = await c.get(llm_url + health_path)

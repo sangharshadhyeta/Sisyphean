@@ -393,7 +393,7 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         "Use web_search for any factual question worth knowing — current or timeless.",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
-        "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then save_memory).",
+        "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then direct).",
         "Complex multi-part tasks MUST use 3+ steps — use pipe-separated steps for each action.",
         'Single step: {"steps": "toolname:input"}',
         'Multiple steps: {"steps": "toolname:input | toolname:input | toolname:input"}',
@@ -497,8 +497,11 @@ ROUTING RULES — apply in this order:
 
 1. steps="" for greetings, social chat, acknowledgements, opinions, capability questions,
    and general knowledge (geography, history, science, definitions) you already know.
+   NEVER route a factual question to save_memory — knowing the answer is not the same as
+   the user asking you to remember it.
 
-2. steps="Save: <verbatim fact>" when the user says remember/note/save/keep-in-mind.
+2. steps="Save: <verbatim fact>" ONLY when the user explicitly says remember/note/save/
+   keep-in-mind/store. The word "remember" or "save" must be in the user's message.
    Put the exact fact after "Save: " — nothing else on this step.
 
 3. steps="Run python -c \"print(expr)\"" for any arithmetic or mathematical calculation.

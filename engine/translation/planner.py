@@ -547,7 +547,7 @@ async def think_decompose(
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=True,
+            thinking=False,  # json_object + thinking is unreliable on small models
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
@@ -561,6 +561,12 @@ async def think_decompose(
             plain_steps = [s.strip() for s in steps_raw if str(s).strip()]
         else:
             plain_steps = [s.strip() for s in str(steps_raw).split("|") if s.strip()]
+
+        # Model explicitly returned steps="" — direct answer, no tool calls needed.
+        # Return a "direct" stage so the pipeline skips planning entirely.
+        if not plain_steps:
+            logger.info("think_decompose: steps='' → direct answer for %r", query[:60])
+            return outcome, [{"type": "direct", "goal": query}]
 
         stages: list[dict] = []
         for step in plain_steps:
@@ -610,7 +616,7 @@ async def plan_task(
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=True,
+            thinking=False,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)

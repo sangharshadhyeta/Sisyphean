@@ -213,6 +213,8 @@ class PipelineState:
     wp_run_after: bool = False  # run the file with python after all items done
     wp_retry_count: int = 0  # retries for the current item (resets on advance)
     wp_resume_ctx:  str = ""  # verifier resume context for the current retry
+    # ── Bash retry state ──────────────────────────────────────────────────────
+    bash_retry_count: int = 0  # consecutive bash failures on current step
 
     def to_json(self) -> str:
         return json.dumps({
@@ -244,6 +246,7 @@ class PipelineState:
                 "rc":    self.wp_retry_count,
                 "rctx":  self.wp_resume_ctx[:800],
             } if self.wp_items else {},
+            "brc": self.bash_retry_count,
         })
 
     @classmethod
@@ -273,6 +276,7 @@ class PipelineState:
         obj.wp_run_after   = wp.get("run",   False)
         obj.wp_retry_count = wp.get("rc",    0)
         obj.wp_resume_ctx  = wp.get("rctx",  "")
+        obj.bash_retry_count = d.get("brc", 0)
         return obj
 
 
@@ -704,6 +708,29 @@ class Pipeline:
                 brief = tr[:120].replace("\n", " ").strip()
                 state.commands_run.append({"cmd": outer_input[:100], "brief": brief})
                 logger.debug("epistemic: ran cmd len=%d", len(outer_input))
+
+                # Bash failure retry — ask the synthesizer for a corrected command
+                _MAX_BASH_RETRIES = 2
+                if _is_bash_failure(tr) and state.bash_retry_count < _MAX_BASH_RETRIES:
+                    corrected = await _bash_correct(outer_input, tr, self.client)
+                    if corrected:
+                        logger.warning(
+                            "pipeline: bash failed — retrying with corrected cmd "
+                            "(attempt %d): %s",
+                            state.bash_retry_count + 1, corrected[:80],
+                        )
+                        try:
+                            sub = state.sub_tasks[state.current_task_idx]
+                            sub["steps"][state.current_step_idx]["input"] = corrected
+                        except (IndexError, KeyError):
+                            pass
+                        state.bash_retry_count += 1
+                        state.current_step_idx -= 1  # re-run same step
+                        state.results.pop()          # discard failed result
+                    else:
+                        state.bash_retry_count = 0
+                else:
+                    state.bash_retry_count = 0
 
             # Mark outer tool as done in dashboard
             _tracker.tree_subtask_step(
@@ -1922,6 +1949,75 @@ def _extract_state(raw_history: list[dict]) -> PipelineState | None:
                     except Exception as exc:
                         logger.warning("pipeline: state decode failed: %s", exc)
     return None
+
+
+_BASH_FAIL_PREFIXES = (
+    "[exit ",      # non-zero exit code from bash tool
+    "[timeout",    # command timed out
+    "Error:",      # Python exception or tool-level error
+    "error:",
+)
+_BASH_FAIL_SUBSTRINGS = (
+    "command not found",
+    "is not recognized",   # Windows cmd error
+    "No such file or directory",
+    "Permission denied",
+    "cannot find the path",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "Traceback (most recent call last)",
+)
+
+def _is_bash_failure(result: str) -> bool:
+    """Return True if a bash tool result indicates the command failed."""
+    r = result.strip()
+    if not r or r == "(no output)":
+        return False  # silent success
+    for prefix in _BASH_FAIL_PREFIXES:
+        if r.startswith(prefix):
+            return True
+    low = r.lower()
+    for sub in _BASH_FAIL_SUBSTRINGS:
+        if sub.lower() in low:
+            return True
+    return False
+
+
+_BASH_CORRECT_SYSTEM = """\
+A shell command failed. Output ONLY a corrected JSON object: {"command": "<fixed shell command>"}
+Rules:
+- Fix the specific error shown — wrong path, missing module, syntax error, etc.
+- Keep the same intent as the original command.
+- Do not explain. Do not use markdown. Output only the JSON object.
+"""
+
+async def _bash_correct(original_cmd: str, error: str, client) -> str:
+    """Ask the LLM to produce a corrected command given the failure output.
+
+    Returns the corrected command string, or "" if correction fails.
+    """
+    prompt = (
+        f"Original command: {original_cmd[:300]}\n"
+        f"Error output:\n{error[:400]}\n\n"
+        "Output the corrected command as JSON."
+    )
+    try:
+        result = await client.generate(
+            [{"role": "user", "content": prompt}],
+            max_tokens=128,
+            temperature=0.0,
+            stream=False,
+            thinking=False,
+            response_format={"type": "json_object"},
+        )
+        raw = (result["choices"][0]["message"]["content"] or "").strip()
+        import json as _json
+        obj = _json.loads(raw)
+        cmd = obj.get("command", "").strip()
+        return cmd
+    except Exception as exc:
+        logger.warning("bash_correct: LLM call failed: %s", exc)
+        return ""
 
 
 def _extract_tool_results(raw_history: list[dict]) -> list[str]:

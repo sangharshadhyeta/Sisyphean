@@ -343,15 +343,23 @@ class Pipeline:
         # what's relevant rather than pre-filtering with bigrams.
         history_text = _format_history(raw_history)
 
+        # ── BirdClaw pre-made plan ────────────────────────────────────────────
+        # When BirdClaw routes via engine_client it calls generate_plan() first
+        # (thinking=True) and injects the result as a [BirdClaw-Plan] message.
+        # Detect it here so _start() can skip think_decompose() and go straight
+        # to per-task execution — no duplicate planning call.
+        bc_plan = _extract_birdclaw_plan(raw_history)
+
         return await self._start(user_message, available_tools, session_id=session_id,
                                  history_text=history_text, project_ctx=project_ctx,
-                                 project_dir=project_dir)
+                                 project_dir=project_dir, bc_plan=bc_plan)
 
     # ── Fresh request ─────────────────────────────────────────────────────────
 
     async def _start(self, query: str, available_tools: list[dict], session_id: str = "",
                      history_text: str = "", project_ctx: str = "",
-                     project_dir: str = "") -> LoopResponse:
+                     project_dir: str = "",
+                     bc_plan: "tuple[str, list[dict]] | None" = None) -> LoopResponse:
         from engine.policy.router import load_user_prefs
 
         task_id = _tracker.start_task(session_id=session_id, user_message=query)
@@ -367,22 +375,31 @@ class Pipeline:
         top_quality  = "relevant" if len(top_context.split()) > 10 else ("minimal" if top_context else "none")
         _tracker.tree_context_done(task_id, f"top-level extract: {top_quality}")
 
-        # ── Stage 2: Think-first decomposition (thinking=True) ───────────────
-        # One planning-only LLM call that reasons about the task before any
-        # execution begins. Returns (outcome, stages) where each stage has a
-        # type (research/write_code/verify/direct/…) and a plain-English goal.
-        # This sets PIPELINE_STATE accurately from the very first API turn —
-        # the full plan is visible before execution starts, matching BirdClaw's
-        # generate_plan() → stage-queue approach.
-        _tracker.tree_context_running(task_id, "think-decompose")
-        outcome, stages = await think_decompose(
-            query, self.client,
-            context=top_context,
-            soul_section=soul_section,
-        )
-        _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
-        logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
-                    [(s["type"], s["goal"][:40]) for s in stages])
+        # ── Stage 2: Decompose into stages ───────────────────────────────────
+        # If BirdClaw already ran generate_plan() (thinking=True) before routing
+        # here, use that plan directly — no duplicate LLM planning call.
+        # Otherwise fall back to think_decompose() (standalone Sisyphean path).
+        if bc_plan is not None:
+            outcome, stages = bc_plan
+            _tracker.tree_context_running(task_id, "birdclaw-plan")
+            _tracker.tree_context_done(task_id, f"BirdClaw plan: {len(stages)} stage(s)")
+            logger.info("pipeline: using BirdClaw plan — outcome=%r stages=%s",
+                        outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
+        else:
+            # One thinking-enabled planning call that reasons about the task
+            # before any execution begins. Returns (outcome, stages) where each
+            # stage has a type (research/write_code/verify/direct/…) and a
+            # plain-English goal. Sets PIPELINE_STATE accurately from the very
+            # first API turn — the full plan is visible before execution starts.
+            _tracker.tree_context_running(task_id, "think-decompose")
+            outcome, stages = await think_decompose(
+                query, self.client,
+                context=top_context,
+                soul_section=soul_section,
+            )
+            _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
+            logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
+                        [(s["type"], s["goal"][:40]) for s in stages])
 
         # Fall back to the query as a single task if decomposition returned nothing.
         if not stages:
@@ -1838,6 +1855,52 @@ def _format_history(raw_history: list[dict]) -> str:
         label = "User" if role == "user" else "Assistant"
         turns.append(f"{label}: {text}")
     return "\n".join(turns)
+
+
+def _extract_birdclaw_plan(raw_history: list[dict]) -> "tuple[str, list[dict]] | None":
+    """Detect a pre-made plan injected by BirdClaw's generate_plan() call.
+
+    BirdClaw inserts a user message of the form:
+        [BirdClaw-Plan]
+        outcome: <one-sentence success criteria>
+        steps: step1 | step2 | step3
+
+    before delegating to Sisyphean.  When found, return (outcome, stages) so
+    _start() can skip think_decompose() and avoid a duplicate planning call.
+    Returns None if no such block is found (standalone Sisyphean / Claude Code).
+    """
+    _MARKER = "[BirdClaw-Plan]"
+    for msg in raw_history:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        if _MARKER not in content:
+            continue
+        # Parse outcome and steps lines
+        outcome = ""
+        steps_raw = ""
+        for line in content.splitlines():
+            line = line.strip()
+            if line.lower().startswith("outcome:"):
+                outcome = line[len("outcome:"):].strip()
+            elif line.lower().startswith("steps:"):
+                steps_raw = line[len("steps:"):].strip()
+        if not steps_raw:
+            return None
+        plain_steps = [s.strip() for s in steps_raw.split("|") if s.strip()]
+        if not plain_steps:
+            return None
+        stages: list[dict] = [
+            {"type": infer_stage_type(step), "goal": step}
+            for step in plain_steps
+        ]
+        if not outcome:
+            outcome = plain_steps[0]
+        logger.info("pipeline: BirdClaw plan detected — outcome=%r stages=%d", outcome[:60], len(stages))
+        return outcome, stages
+    return None
 
 
 def _last_turns_text(raw_history: list[dict], n: int = 4) -> str:

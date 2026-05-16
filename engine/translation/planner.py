@@ -489,6 +489,42 @@ async def split(query: str, client) -> list[str]:
     return [query]
 
 
+_RESOLVE_BASH_SYSTEM = """\
+Output ONLY a JSON object: {"command": "<shell command to run>"}
+The tool is already decided: bash. Your only job is to write the command.
+Do not explain. Do not pick a different tool. Output the command string only.
+"""
+
+
+async def resolve_bash_command(goal: str, client, context: str = "") -> str:
+    """Ask the model what bash command to run for a verify-stage goal.
+
+    Returns the command string, or empty string on failure.
+    The tool selection has already been made (bash) — this only resolves WHAT to run.
+    """
+    prompt = f"Goal: {goal}"
+    if context:
+        prompt += f"\nContext: {context[:300]}"
+    try:
+        result = await client.generate(
+            [
+                {"role": "system", "content": _RESOLVE_BASH_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            stream=False,
+            thinking=False,
+        )
+        raw = result["choices"][0]["message"]["content"].strip()
+        data = parse_format_response(raw)
+        if data and isinstance(data.get("command"), str):
+            return data["command"].strip()
+    except Exception as exc:
+        logger.warning("resolve_bash_command failed: %s", exc)
+    return ""
+
+
 _THINK_DECOMPOSE_SYSTEM = """\
 You are a task planner. Output ONLY a JSON object with this exact shape:
 {"outcome": "one-sentence success criteria", "steps": ""}

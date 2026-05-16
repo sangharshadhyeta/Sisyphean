@@ -25,7 +25,7 @@ from pathlib import Path
 from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
-from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response
+from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command
 from engine.translation.web_search import search as _web_search, fetch as _web_fetch_page, format_results
 import engine.task_tracker as _tracker
 from engine.activity import log_event as _log
@@ -511,6 +511,18 @@ class Pipeline:
                 cmd = _normalize_python_c(task.strip()[4:].strip())
                 logger.info("pipeline: direct-run stage → bash: %s", cmd[:80])
                 steps = [{"tool": "bash", "input": cmd}]
+            elif stage_type == "verify":
+                # Tool already decided by think_decompose: bash.
+                # Only ask "what command?" — don't re-do tool selection via plan_task.
+                cmd = await resolve_bash_command(task, self.client, context=task_ctx)
+                if cmd:
+                    cmd = _normalize_python_c(cmd)
+                    logger.info("pipeline: verify stage → bash: %s", cmd[:80])
+                    steps = [{"tool": "bash", "input": cmd}]
+                else:
+                    steps = await plan_task(task, relevant_tools or available_tools, self.client,
+                                            context=task_ctx, soul_section=soul_section,
+                                            user_prefs=user_prefs)
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                         context=task_ctx,

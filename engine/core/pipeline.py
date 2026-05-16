@@ -463,13 +463,21 @@ class Pipeline:
 
             # ── Tool filtering (keyword score, synchronous) ───────────────────
             relevant_tools = filter_tools_for_task(task, available_tools)
-            filtered_names = [t.get("name", "") for t in relevant_tools]
-            logger.info("pipeline: task=%r filtered_tools=%s", task[:60], filtered_names)
 
             # ── Planning stage ────────────────────────────────────────────────
             # Stage type from think_decompose guides tool selection so plan_task
             # can skip the LLM for well-understood stage types.
             stage_type = stage.get("type", "")
+
+            # verify stages execute commands — strip search tools so plan_task
+            # can't pick WebSearch even if the model is confused about the goal.
+            _WEB_TOOL_NAMES = frozenset({"websearch", "webfetch", "web_search", "web_fetch"})
+            if stage_type == "verify":
+                relevant_tools = [t for t in relevant_tools
+                                  if t.get("name", "").lower() not in _WEB_TOOL_NAMES]
+
+            filtered_names = [t.get("name", "") for t in relevant_tools]
+            logger.info("pipeline: task=%r filtered_tools=%s", task[:60], filtered_names)
 
             # For "direct" stages (social messages, trivial answers) skip planning.
             # For "save_memory" stages, extract the fact and save it directly.

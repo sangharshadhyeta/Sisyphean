@@ -61,6 +61,7 @@ def _find_llama_server() -> str:
             return found
 
     candidates = [
+        "C:/llama.cpp/llama-server.exe",
         "./llama.cpp/build/bin/llama-server",
         "./llama.cpp/build/bin/Release/llama-server.exe",
         "./llama.cpp/build/Release/llama-server.exe",

@@ -2,15 +2,15 @@
 # Set mock: true to run without llama-server (useful when no GPU is available)
 
 llm:
-  model_path: ""                       # not needed when using Ollama
+  model_path: "C:/llama.cpp/models/gemma4-e2b-q8.gguf"
   model_name: sisyphean-gemma4:e2b          # name exposed via /v1/models
-  local_model: "gemma4:e2b"             # Ollama model name (sent in every request)
+  local_model: ""                      # empty = use llama-server (not Ollama)
   server:
     host: 127.0.0.1
-    port: 11434                        # Ollama default port
+    port: 8080                         # llama-server default port
     context_size: 8192
     threads: 8                         # Ryzen 7 7735U has 8 cores
-    gpu_layers: 0                      # integrated GPU — keep on CPU
+    gpu_layers: 0                      # CPU only
     extra_args: []
 
   # ── Optional: external OpenAI-compatible API ──────────────────────────────

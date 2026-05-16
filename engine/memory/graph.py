@@ -34,6 +34,15 @@ from pathlib import Path
 
 import networkx as nx
 
+try:
+    from filelock import FileLock as _FileLock
+    _HAS_FILELOCK = True
+except ImportError:
+    _HAS_FILELOCK = False
+    logging.getLogger(__name__).warning(
+        "filelock not installed — cross-process graph locking disabled"
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -225,6 +234,10 @@ class GraphStore:
         self._path = persist_path
         self._graph: nx.DiGraph = nx.DiGraph()
         self._lock = threading.Lock()
+        self._file_lock = (
+            _FileLock(str(persist_path) + ".lock", timeout=10)
+            if persist_path and _HAS_FILELOCK else None
+        )
         if persist_path and persist_path.exists():
             self._load()
 
@@ -270,18 +283,32 @@ class GraphStore:
             self._save_unlocked()
 
     def _save_unlocked(self) -> None:
+        """Write graph to disk. Caller must hold self._lock.
+        Acquires cross-process file lock when filelock is available."""
         assert self._path is not None
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        data = nx.node_link_data(self._graph, edges="edges")
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        bak = self._path.with_suffix(self._path.suffix + ".bak")
-        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-        if self._path.exists():
+
+        def _write() -> None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
+            data = nx.node_link_data(self._graph, edges="edges")
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")  # type: ignore[union-attr]
+            bak = self._path.with_suffix(self._path.suffix + ".bak")  # type: ignore[union-attr]
+            tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+            if self._path.exists():  # type: ignore[union-attr]
+                try:
+                    self._path.replace(bak)  # type: ignore[union-attr]
+                except OSError:
+                    pass
+            tmp.replace(self._path)  # type: ignore[union-attr]
+
+        if self._file_lock is not None:
             try:
-                self._path.replace(bak)
-            except OSError:
-                pass
-        tmp.replace(self._path)
+                with self._file_lock:
+                    _write()
+            except Exception as exc:
+                logger.warning("graph file lock failed (%s) — saving without lock", exc)
+                _write()
+        else:
+            _write()
 
     # ── Node upsert ────────────────────────────────────────────────────────────
 

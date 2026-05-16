@@ -215,7 +215,11 @@ async def main() -> None:
         """Background task: poll until the LLM backend is ready, then log status."""
         if config.mock or using_external:
             return
-        llm_url = f"http://{config.llm.server.host}:{config.llm.server.port}"
+        if using_ollama:
+            port = config.llm.server.ollama_port
+        else:
+            port = config.llm.server.port
+        llm_url = f"http://{config.llm.server.host}:{port}"
         probe = LlamaClient(llm_url, model=config.llm.local_model)
         if using_ollama:
             logger.info(

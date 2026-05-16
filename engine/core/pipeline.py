@@ -853,6 +853,19 @@ class Pipeline:
                     tool = "webfetch"
                     step["tool"] = "webfetch"
 
+                # ── Normalise shell-like tool names to "bash" ────────────────
+                # Small models sometimes plan "shell", "terminal", "cmd", "mkdir",
+                # "run", "execute" instead of "bash". Map them so the outer-tool
+                # dispatch fires correctly instead of silently skipping the step.
+                _BASH_ALIASES = frozenset({
+                    "shell", "terminal", "cmd", "command", "run", "execute",
+                    "mkdir", "powershell", "sh", "zsh",
+                })
+                if tool in _BASH_ALIASES and "bash" in outer_tool_names:
+                    logger.info("pipeline: normalising tool %r → bash", tool)
+                    tool = "bash"
+                    step["tool"] = "bash"
+
                 # ── direct — skip all steps, synthesizer answers from query ──
                 # Used for greetings, thanks, simple questions where no tool
                 # call is needed. Break out of both step and task loops.
@@ -1917,19 +1930,29 @@ class Pipeline:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _normalize_python_c(cmd: str) -> str:
-    """Ensure `python -c '...'` uses double quotes so the shell doesn't break.
+    """Fix common model mistakes in `python -c '...'` commands.
 
-    Models often emit single-quoted python -c expressions which fail when the
-    code itself contains single quotes (e.g. import statements, string literals).
-    Re-wrap with double quotes, escaping any bare double quotes inside.
+    1. Re-wrap single-quoted bodies with double quotes (single quotes break
+       when the code contains string literals or imports).
+    2. Insert semicolons between adjacent Python statements that the model
+       concatenated without a separator (e.g. print(1)print(2) → print(1); print(2)).
     """
     import re as _re
-    m = _re.match(r"^(python\d*\s+-c\s+)'(.*)'$", cmd, _re.DOTALL)
-    if m:
-        prefix, body = m.group(1), m.group(2)
-        body = body.replace('"', '\\"')
-        return f'{prefix}"{body}"'
-    return cmd
+
+    # Unwrap whichever quoting style was used
+    m = _re.match(r'^(python\d*\s+-c\s+)[\'"](.*)[\'"]\s*$', cmd, _re.DOTALL)
+    if not m:
+        return cmd
+
+    prefix, body = m.group(1), m.group(2)
+
+    # Insert "; " between adjacent statements: identifier/closing-paren
+    # immediately followed by an opening token with no whitespace/semicolon.
+    # Covers: print(x)print(y), a=1b=2, etc.
+    body = _re.sub(r'(\)|\w)(print\s*\(|import\s+|\w+\s*=)', r'\1; \2', body)
+
+    body = body.replace('"', '\\"')
+    return f'{prefix}"{body}"'
 
 
 def _extract_state(raw_history: list[dict]) -> PipelineState | None:

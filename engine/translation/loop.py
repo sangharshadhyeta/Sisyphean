@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 from engine.translation.prompts import SYSTEM, dynamic_context
 
@@ -143,28 +142,16 @@ class TranslationLoop:
                 return block["text"]
         return ""
 
-    async def stream(
-        self,
-        message: str,
-        history: list[dict],
-        memory_context: str = "",
-    ) -> AsyncIterator[str]:
-        """Legacy: stream final text word by word."""
-        text = await self.run(message, history, memory_context)
-        words = text.split(" ")
-        for i, word in enumerate(words):
-            yield word + (" " if i < len(words) - 1 else "")
-            if i % 10 == 0:
-                await asyncio.sleep(0.01)
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _flatten_history(raw_history: list[dict], max_turns: int = 6) -> list[dict]:
-    """Convert the last max_turns messages to flat string format.
+    """Convert the last max_turns messages to plain text for _direct() Q&A.
 
-    Only used by _direct() for simple Q&A.  Skips thinking, tool_use, and
-    tool_result blocks — only keeps text blocks from the actual conversation.
+    Intentionally simpler than executor_context._history_to_messages():
+    - Drops ALL non-text blocks (thinking, tool_use, tool_result).
+    - No JSON annotation of tool actions — the direct path doesn't need them.
+    executor_context._history_to_messages() is for the micro-loop where the
+    model needs to see its own past tool actions in action-JSON form.
     """
     tail = raw_history[-max_turns:] if len(raw_history) > max_turns else raw_history
     result = []

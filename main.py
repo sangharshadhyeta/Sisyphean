@@ -226,7 +226,9 @@ async def main() -> None:
                 "Waiting for Ollama at %s (model: %s) — start it with: ollama serve",
                 llm_url, config.llm.local_model,
             )
-        # Retry indefinitely in short bursts so the loop stays alive
+        # Retry indefinitely with exponential backoff (5 → 10 → 20 → 40 → 60s cap).
+        # Log only on first attempt and every 6 attempts after — avoids log spam
+        # if the backend is down for a long time.
         attempt = 0
         while True:
             ready = await probe.health_check(retries=15, interval=2.0, ollama=using_ollama)
@@ -235,15 +237,20 @@ async def main() -> None:
                 await probe.close()
                 return
             attempt += 1
-            if using_ollama:
-                logger.warning(
-                    "Ollama not yet reachable (attempt %d) — "
-                    "start it with: ollama serve  |  ollama pull %s",
-                    attempt, config.llm.local_model,
-                )
-            else:
-                logger.warning("llama-server not yet ready (attempt %d)", attempt)
-            await asyncio.sleep(5)
+            delay = min(5 * 2 ** min(attempt - 1, 4), 60)  # 5→10→20→40→60s
+            if attempt == 1 or attempt % 6 == 0:
+                if using_ollama:
+                    logger.warning(
+                        "Ollama not yet reachable (attempt %d, retry in %ds) — "
+                        "start it with: ollama serve  |  ollama pull %s",
+                        attempt, delay, config.llm.local_model,
+                    )
+                else:
+                    logger.warning(
+                        "llama-server not yet ready (attempt %d, retry in %ds)",
+                        attempt, delay,
+                    )
+            await asyncio.sleep(delay)
 
     try:
         # Run server and model-wait concurrently — server starts immediately,

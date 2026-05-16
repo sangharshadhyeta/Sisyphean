@@ -101,10 +101,10 @@ class MemoryInjector:
                 if text:
                     sections.append(text)
 
-        # ── 4b. Research knowledge (new GraphStore — NER + extracted facts) ───
-        # The knowledge_graph GraphStore holds entities indexed by extractor.py
-        # (extracted facts from conversations) and retrieval.py (NER from tool
-        # results).  Query it separately so both memory layers are injected.
+        # ── 4b. Research knowledge (extracted facts + NER entities) ─────────
+        # retrieval.py indexes entities extracted from conversations (extractor.py)
+        # and from tool results (NER pass in retrieval.py).  Queried separately
+        # so both memory layers contribute to the injected context.
         if remaining > 60:
             try:
                 from engine.memory.retrieval import retrieve as _retrieve
@@ -137,19 +137,20 @@ class MemoryInjector:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-# Standard approximation: ~4 characters per token.
-# Combined with the 12% safety margin this is accurate enough for budget
-# enforcement without any network round-trips.
+# ~4 chars/token is a standard approximation for Latin-script text.
+# The safety margin reserves headroom for the heuristic's estimation error
+# (longer tokens in code/URLs, shorter in CJK) and for system prompt overhead.
+# With a 1500-token budget: margin reserves ~180 tokens.  Tune if the model
+# regularly hits context limits (raise _BUDGET_SAFETY_MARGIN) or wastes budget
+# (lower it).
 _CHARS_PER_TOKEN = 4
+_BUDGET_SAFETY_MARGIN = 0.88
 
 
 def _fit(text: str, budget: int) -> tuple[str, int]:
     """Truncate *text* to fit within *budget* tokens.
 
-    Uses a 4-chars-per-token heuristic instead of a live /tokenize call,
-    eliminating up to 5 HTTP round-trips per request with negligible
-    accuracy loss (the 12% safety margin absorbs the estimation error).
-
+    Uses _CHARS_PER_TOKEN heuristic — no /tokenize round-trip needed.
     Returns (possibly_truncated_text, remaining_budget).
     Returns ("", budget) if text is empty.
     """
@@ -158,6 +159,5 @@ def _fit(text: str, budget: int) -> tuple[str, int]:
     tokens = max(1, len(text) // _CHARS_PER_TOKEN)
     if tokens <= budget:
         return text, budget - tokens
-    # Hard-truncate to fit — apply 12% safety margin
-    max_chars = int(budget * _CHARS_PER_TOKEN * 0.88)
+    max_chars = int(budget * _CHARS_PER_TOKEN * _BUDGET_SAFETY_MARGIN)
     return text[:max_chars].rstrip() + "…", 0

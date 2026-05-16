@@ -42,12 +42,7 @@ from engine.translation.executor_tools import (
     _filter_tools,
     _build_tool_prompt,
 )
-from engine.translation.executor_legacy import (
-    execute_stage,
-    _is_uncertain,
-    _make_search_query,
-    _force_answer,
-)
+from engine.translation.executor_legacy import execute_stage
 
 logger = logging.getLogger(__name__)
 
@@ -186,14 +181,14 @@ async def decide(
             raw = ""
 
         if not raw:
-            logger.debug("decide: no JSON in response — retrying without thinking")
+            logger.debug("decide: no JSON — retrying with explicit JSON instruction")
             retry_messages = messages[:]
             retry_messages.append({
                 "role": "user",
                 "content": (
-                    "Your previous output was unusable. "
-                    "Continue with the planned task — do NOT answer yet unless all steps are done. "
-                    + action_prompt
+                    "Output ONLY a single valid JSON object — no prose, no markdown fences. "
+                    "Do NOT answer yet unless all steps are done. "
+                    + _action_prompt
                 ),
             })
             result2 = await client.generate(

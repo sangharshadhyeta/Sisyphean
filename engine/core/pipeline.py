@@ -42,7 +42,10 @@ _INFO_TOOLS = frozenset({"web_search", "web_fetch", "fetch_url", "search_memory"
 # Outer tools (returned to Claude Code harness) whose results require replanning.
 # Read/Grep/Glob → find/read file, then generate edit steps.
 # WebSearch/WebFetch → delegate to _replan_after_search for execution steps.
-_OUTER_INFO_TOOLS = frozenset({"read", "glob", "grep", "websearch", "webfetch"})
+# All recognised spellings of web-search / web-fetch tools.
+# Used to strip them from verify stages and to build websearch fallback steps.
+_WEB_TOOL_NAMES = frozenset({"websearch", "webfetch", "web_search", "web_fetch"})
+_OUTER_INFO_TOOLS = frozenset({"read", "glob", "grep"}) | _WEB_TOOL_NAMES
 
 _EDIT_SYSTEM = """\
 Given the task and current file, decide the minimal change needed. Output ONE JSON object only.
@@ -484,7 +487,6 @@ class Pipeline:
 
             # verify stages execute commands — strip search tools so plan_task
             # can't pick WebSearch even if the model is confused about the goal.
-            _WEB_TOOL_NAMES = frozenset({"websearch", "webfetch", "web_search", "web_fetch"})
             if stage_type == "verify":
                 relevant_tools = [t for t in relevant_tools
                                   if t.get("name", "").lower() not in _WEB_TOOL_NAMES]
@@ -544,10 +546,8 @@ class Pipeline:
 
             # ── Websearch fallback — if plan is empty and no graph recall ──────
             if not steps and stage_type == "research" and not graph_recall:
-                ws_tool = "websearch" if any(
-                    t.get("name", "").lower() == "websearch"
-                    for t in (relevant_tools or available_tools)
-                ) else "web_search"
+                all_names = {t.get("name", "").lower() for t in (relevant_tools or available_tools)}
+                ws_tool = next((n for n in all_names if n in _WEB_TOOL_NAMES), "web_search")
                 steps = [{"tool": ws_tool, "input": task}]
                 logger.info("pipeline: empty plan → websearch fallback for %r", task[:60])
             elif not steps and stage_type not in ("direct",) and not graph_recall:

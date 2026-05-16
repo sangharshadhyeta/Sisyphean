@@ -307,7 +307,14 @@ def _tree(task_id: str) -> dict | None:
 
 
 def _evict() -> None:
-    """Keep only the last _MAX_TASKS tasks, but never evict running ones."""
-    finished = [k for k, v in _tasks.items() if v["status"] != "running"]
-    while len(_tasks) > _MAX_TASKS and finished:
-        del _tasks[finished.pop(0)]
+    """Keep only the last _MAX_TASKS tasks.
+
+    Eviction candidates: finished tasks first, then tasks that have been
+    "running" long enough to have been expired by _expire_stale().  Pure
+    running tasks (started recently) are never evicted — they would appear
+    to vanish from the dashboard mid-execution.
+    """
+    _expire_stale()  # age out any hung tasks before eviction decisions
+    evictable = [k for k, v in _tasks.items() if v["status"] != "running"]
+    while len(_tasks) > _MAX_TASKS and evictable:
+        del _tasks[evictable.pop(0)]

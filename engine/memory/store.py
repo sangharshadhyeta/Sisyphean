@@ -81,7 +81,12 @@ class ArtifactStore:
         with self._lock:
             self._entries.append(entry)
             self._append_disk(entry)
-            self._encode_one(entry)
+        # Encoding runs in a daemon thread so the async caller is never blocked.
+        # _embeddings is updated under _lock once encoding finishes, so searches
+        # that arrive before the thread completes fall back to keyword search for
+        # that one entry — acceptable eventual-consistency trade-off.
+        if self._encoder is not None:
+            threading.Thread(target=self._encode_one, args=(entry,), daemon=True).start()
         return entry["id"]
 
     # ── Search ───────────────────────────────────────────────────────────────
@@ -124,16 +129,19 @@ class ArtifactStore:
         return f"{entry.get('summary', '')} {entry.get('content', '')[:300]}"
 
     def _encode_one(self, entry: dict) -> None:
-        """Encode a single new entry and append to the embeddings array."""
-        if self._encoder is None:
-            return
+        """Encode a single entry and append to _embeddings under lock.
+
+        Designed to run in a background thread — encoder.encode() is CPU-bound
+        and must not block the async event loop.
+        """
         import numpy as np
         try:
             vec = self._encoder.encode([self._text(entry)], show_progress_bar=False)[0]
-            if self._embeddings is None:
-                self._embeddings = vec.reshape(1, -1)
-            else:
-                self._embeddings = np.vstack([self._embeddings, vec])
+            with self._lock:
+                if self._embeddings is None:
+                    self._embeddings = vec.reshape(1, -1)
+                else:
+                    self._embeddings = np.vstack([self._embeddings, vec])
         except Exception as exc:
             logger.warning("Embedding encode failed (%s)", exc)
 
@@ -151,7 +159,10 @@ class ArtifactStore:
     def _semantic(self, query: str, pool: list[dict], top_n: int) -> list[dict]:
         import numpy as np
         pool_ids = {e["id"] for e in pool}
-        indices = [i for i, e in enumerate(self._entries) if e["id"] in pool_ids]
+        n_embedded = len(self._embeddings) if self._embeddings is not None else 0
+        # Only include entries whose embedding has already been computed.
+        indices = [i for i, e in enumerate(self._entries)
+                   if e["id"] in pool_ids and i < n_embedded]
         if not indices or self._embeddings is None:
             return []
         q_emb = self._encoder.encode([query], show_progress_bar=False)[0]

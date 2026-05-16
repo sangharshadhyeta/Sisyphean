@@ -234,8 +234,12 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/tasks", tags=["info"])
     async def api_tasks():
-        """Live task state for the dashboard flowchart panel."""
-        return {"tasks": active_tasks(10)}
+        """Live task state for the dashboard flowchart panel.
+
+        ephemeral=true — state resets on server restart; callers must not
+        persist or cache this data across sessions.
+        """
+        return {"tasks": active_tasks(10), "ephemeral": True}
 
     # ── Dashboard HTML ───────────────────────────────────────────────────────
 

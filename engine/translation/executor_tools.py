@@ -33,12 +33,15 @@ def _filter_tools(
     scored.sort(key=lambda x: (-x[0], x[1]))
     result: list[dict] = [t for _, _, t in scored[:top_n]]
 
+    # Bash is always included regardless of relevance score: it's a universal
+    # fallback for any shell operation the model might need, and small models
+    # often emit "bash" for tasks that don't obviously keyword-match any tool.
     bash = next(
         (t for t in available_tools if t.get("name", "").lower() == "bash"),
         None,
     )
     if bash and bash not in result:
-        result[-1] = bash
+        result[-1] = bash  # replace lowest-scored slot
 
     return result
 

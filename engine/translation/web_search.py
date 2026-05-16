@@ -193,10 +193,11 @@ async def _search_ddg_package(query: str, n: int) -> list[SearchResult]:
     import asyncio
     try:
         def _sync_search():
+            # ddgs is the maintained fork; fall back to the original package name
             try:
-                from ddgs import DDGS
+                from ddgs import DDGS  # type: ignore[import]
             except ImportError:
-                from duckduckgo_search import DDGS
+                from duckduckgo_search import DDGS  # type: ignore[import]
             results = []
             with DDGS() as ddgs:
                 for r in ddgs.text(query, max_results=n):

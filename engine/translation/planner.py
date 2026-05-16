@@ -547,7 +547,7 @@ async def think_decompose(
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=False,         # keep the planning call fast; model decides routing
+            thinking=True,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
@@ -610,7 +610,7 @@ async def plan_task(
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=False,
+            thinking=True,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)

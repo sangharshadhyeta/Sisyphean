@@ -26,7 +26,7 @@ from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
 from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response
-from engine.translation.web_search import search as _web_search, format_results
+from engine.translation.web_search import search as _web_search, fetch as _web_fetch_page, format_results
 import engine.task_tracker as _tracker
 from engine.activity import log_event as _log
 
@@ -37,7 +37,7 @@ _STATE_PREFIX = "PIPELINE_STATE:"
 # Tools whose results should trigger dynamic replanning of subsequent steps.
 # After these run, pre-guessed follow-up steps are replaced with steps derived
 # from what was actually found — the result IS the reasoning.
-_INFO_TOOLS = frozenset({"web_search", "search_memory", "search_knowledge"})
+_INFO_TOOLS = frozenset({"web_search", "web_fetch", "fetch_url", "search_memory", "search_knowledge"})
 
 # Outer tools (returned to Claude Code harness) whose results require replanning.
 # Read/Grep/Glob → find/read file, then generate edit steps.
@@ -149,8 +149,15 @@ Reply as JSON: {"steps": "toolname:exact input | toolname:exact input"}
 Available tools:
   bash        — run a shell command (write the exact command; never prefix with
                 'python' unless running a .py file — other executables run directly)
+  web_fetch   — fetch a specific URL to read its full page content; use the exact
+                URL from the search results above (e.g. web_fetch:https://example.com/page)
   web_search  — search for more specific information if still needed
   save_memory — save a key fact that was discovered
+
+WHEN TO USE web_fetch:
+  - Search result snippets mention the answer but are too short to be useful
+  - A result title/URL clearly contains what you need (docs, tutorial, spec)
+  - The task requires exact commands, version numbers, or configuration details
 
 If the result already fully answers the task, reply: {"steps": ""}"""
 
@@ -1729,16 +1736,64 @@ class Pipeline:
                     return {"tool": "search_memory", "input": inp, "result": mem,
                             "summary": f"recalled: {mem[:120]}"}
             # Nothing in graph — fetch from web
+            raw = []
             try:
                 raw = await _web_search(inp, max_results=4)
                 content = format_results(raw) if raw else "No results."
             except Exception as exc:
                 content = f"Search failed: {exc}"
+            # ── Auto-fetch page content when snippets are thin ────────────────
+            # Jina AI tier (is_ai_synthesized=True) already returns rich content.
+            # DDG / SearXNG tiers return short snippets (≤500 chars) that are
+            # often too thin for the model to act on. Fetch the top pages to give
+            # the same deep-content behaviour BirdClaw's web_fetch tool provided.
+            if raw and not any(getattr(r, "is_ai_synthesized", False) for r in raw):
+                fetched_parts: list[str] = []
+                for r in raw[:3]:
+                    url = getattr(r, "url", "") or ""
+                    if not url.startswith("http"):
+                        continue
+                    try:
+                        page = await _web_fetch_page(url, goal=inp, client=self.client)
+                        if page and len(page) > 150 and not page.startswith("("):
+                            fetched_parts.append(f"[{getattr(r, 'title', url)}]\n{url}\n{page[:2000]}")
+                    except Exception as _fe:
+                        logger.debug("auto-fetch failed for %s: %s", url[:60], _fe)
+                    if len(fetched_parts) >= 2:
+                        break
+                if fetched_parts:
+                    content += "\n\n### Page Content\n\n" + "\n\n---\n\n".join(fetched_parts)
             # Extract and save reusable procedural knowledge (not raw data) to graph.
             # Live data (status, metrics) is filtered out by the extraction LLM.
             if content and "No results" not in content and "failed" not in content:
                 await self._save_research_to_graph(inp, content)
             return {"tool": tool, "input": inp, "result": content, "summary": content[:2000]}
+
+        if tool in ("web_fetch", "fetch_url"):
+            # Fetch a specific URL and return its cleaned text content.
+            # Triggered by replan steps like "web_fetch:https://docs.example.com/page"
+            # when search snippets are too thin to act on directly.
+            url = inp.strip()
+            if not url.startswith("http"):
+                return {"tool": tool, "input": url, "result": "(invalid URL — must start with http)",
+                        "summary": "invalid URL"}
+            current_goal = (
+                state.sub_tasks[state.current_task_idx].get("task", "")
+                if state.sub_tasks and state.current_task_idx < len(state.sub_tasks)
+                else ""
+            )
+            try:
+                page = await _web_fetch_page(url, goal=current_goal or inp, client=self.client)
+                if page and not page.startswith("("):
+                    logger.info("pipeline: web_fetch ok  url=%s  chars=%d", url[:60], len(page))
+                    return {"tool": tool, "input": url, "result": page,
+                            "summary": page[:200]}
+                return {"tool": tool, "input": url, "result": page or "(empty page)",
+                        "summary": "empty or unsupported page"}
+            except Exception as exc:
+                logger.warning("pipeline: web_fetch error  url=%s  %s", url[:60], exc)
+                return {"tool": tool, "input": url, "result": f"(fetch error: {exc})",
+                        "summary": f"fetch error: {exc}"}
 
         if tool in ("save_memory", "remember"):
             # user_prefs are BirdClaw's domain — CLAUDE.md handles prefs in Claude Code.

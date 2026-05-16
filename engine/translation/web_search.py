@@ -264,12 +264,48 @@ async def _search_ddg_instant(
 # ---------------------------------------------------------------------------
 
 async def fetch(url: str, goal: str = "", client=None) -> str:
-    """Fetch a URL and return cleaned text."""
+    """Fetch a URL and return cleaned text.
+
+    Tries Jina Reader first (https://r.jina.ai/{url}) which returns clean,
+    article-extracted text without requiring HTML parsing.  Falls back to a
+    direct HTTP fetch + HTML stripping when Jina is unavailable or returns
+    an error.  Optionally distils the page against the goal using an LLM call
+    when a client is provided and the cleaned text is long (>1000 chars).
+    """
     try:
         import httpx
     except ImportError:
         return f"(httpx not installed — cannot fetch {url})"
 
+    goal_hint = goal or url.split("/")[-1].replace("-", " ").replace("_", " ")
+
+    # ── Tier 1: Jina Reader — clean article extraction, no HTML parsing ──────
+    try:
+        from urllib.parse import quote as _quote
+        jina_url = f"https://r.jina.ai/{_quote(url, safe=':/?#[]@!$&\'()*+,;=%')}"
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as http:
+            resp = await http.get(
+                jina_url,
+                headers={
+                    "Accept": "text/plain",
+                    "User-Agent": "Sisyphean/1.0",
+                    "X-Remove-Selector": "nav,header,footer,aside",
+                },
+            )
+            resp.raise_for_status()
+            raw_text = resp.text.strip()
+        if raw_text and len(raw_text) > 100:
+            cleaned = keyword_prune(raw_text, goal=goal_hint, max_chars=3000) if len(raw_text) > 3000 else raw_text
+            if goal and client and len(cleaned) > 1000:
+                notes = await distill(cleaned, goal=goal, client=client, source=url)
+                if notes and len(notes) > 50:
+                    return notes
+            logger.debug("fetch(jina) ok  url=%s  chars=%d", url[:60], len(cleaned))
+            return cleaned
+    except Exception as _jina_exc:
+        logger.debug("fetch(jina) miss  url=%s  err=%s", url[:60], _jina_exc)
+
+    # ── Tier 2: Direct HTTP fetch + HTML stripping ────────────────────────────
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as http:
             resp = await http.get(url, headers={"User-Agent": "Sisyphean/1.0"})
@@ -283,7 +319,6 @@ async def fetch(url: str, goal: str = "", client=None) -> str:
         return f"(unsupported content type: {content_type})"
 
     raw_text = strip_html(resp.text)
-    goal_hint = goal or url.split("/")[-1].replace("-", " ").replace("_", " ")
 
     if len(raw_text) > 3000:
         cleaned = keyword_prune(raw_text, goal=goal_hint, max_chars=2000)
@@ -295,7 +330,7 @@ async def fetch(url: str, goal: str = "", client=None) -> str:
         if notes and len(notes) > 50:
             return notes
 
-    logger.debug("fetch ok  url=%s  chars=%d", url[:60], len(cleaned))
+    logger.debug("fetch(direct) ok  url=%s  chars=%d", url[:60], len(cleaned))
     return cleaned
 
 

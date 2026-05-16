@@ -286,6 +286,18 @@ async def plan(
         default_kind = "function" if file_type == "code" else "section"
         raw_items = [{"title": stage_goal[:60], "anchor": stage_goal[:60], "kind": default_kind, "min_chars": 400}]
 
+    # ── Item count cap for code files ─────────────────────────────────────────
+    # Code files are written whole-file in a single pass; over-segmenting into
+    # many small functions causes excessive Write round-trips (10 per file).
+    # Cap at 3 items for code so simple scripts stay within max_rounds budgets.
+    # Doc files keep their original count (they can legitimately be long).
+    if file_type == "code" and len(raw_items) > 3:
+        logger.info(
+            "SubtaskPlanner: capping code items from %d → 3 for %r",
+            len(raw_items), file_path,
+        )
+        raw_items = raw_items[:3]
+
     return SubtaskManifest(
         stage_goal=stage_goal,
         file_path=file_path,

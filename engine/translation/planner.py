@@ -414,11 +414,26 @@ _GREETING_RE = re.compile(
 _SOCIAL_RE = re.compile(
     r'^\s*(?:thanks?(?:\s+you)?|thank\s+you|thx|ty|cheers'
     r'|ok(?:ay)?|sure|got\s+it|sounds?\s+good|great|cool|nice'
-    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)\s*[!?.]*\s*$',
+    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)'
+    # Allow a short trailing phrase: "thanks, that helps", "thanks a lot", "thanks for that"
+    r'(?:\s*[,!]?\s*(?:a\s+lot|so\s+much|very\s+much|for\s+\w+|that\s+helps?|that\'?s?\s+\w+|\w{1,12}))?'
+    r'\s*[!?.]*\s*$',
     re.IGNORECASE,
 )
 _REMEMBER_RE = re.compile(
     r'^\s*(?:remember|note that|keep in mind|don\'?t forget|save that|store that)\s+(.+)',
+    re.IGNORECASE,
+)
+# Capability / meta questions about what the agent can do — answer directly
+# from soul.md context; no tools or web search needed.
+_CAPABILITY_RE = re.compile(
+    r'^\s*(?:what\s+can\s+you\s+(?:do|help\s+(?:me\s+)?with)'
+    r'|what\s+are\s+you\s+(?:capable\s+of|able\s+to\s+do)'
+    r'|what\s+(?:tools?|features?|commands?|abilities)\s+do\s+you\s+have'
+    r'|what\s+(?:do|does)\s+(?:you|this)\s+(?:do|support)'
+    r'|tell\s+me\s+(?:about\s+)?(?:your\s+)?(?:capabilities?|features?)'
+    r'|how\s+can\s+(?:you|i\s+use\s+you)\s+help'
+    r')\s*[?!.]*\s*$',
     re.IGNORECASE,
 )
 _SOUL_KW = frozenset(["alive", "sentient", "conscious", "exist", "real", "feel",
@@ -895,7 +910,7 @@ async def think_decompose(
     plan before execution begins.
     """
     # Fast pre-checks — skip the LLM for trivially simple inputs
-    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query):
+    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query) or _CAPABILITY_RE.match(query):
         return query[:80], [{"type": "direct", "goal": query}]
     m = _REMEMBER_RE.match(query)
     if m:
@@ -1280,9 +1295,9 @@ async def plan_task(
     sig_hint   = signals.get("tool_hint", "")
     sig_action = signals.get("action", "")
 
-    # ── Greeting / social — answer directly, never call any tool ─────────────
-    if _GREETING_RE.match(task) or _SOCIAL_RE.match(task):
-        logger.debug("plan_task: greeting/social → direct answer")
+    # ── Greeting / social / capability — answer directly, never call any tool ──
+    if _GREETING_RE.match(task) or _SOCIAL_RE.match(task) or _CAPABILITY_RE.match(task):
+        logger.debug("plan_task: greeting/social/capability → direct answer")
         return []
 
     if sig_hint == "math":

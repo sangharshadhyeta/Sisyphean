@@ -406,34 +406,8 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 _MATH_RE   = re.compile(r'^[\d\s\+\-\*\/\%\(\)\.\^]+$')
-_GREETING_RE = re.compile(
-    r'^\s*(?:hi|hello|hey|howdy|greetings|sup|yo)'
-    r'(?:\s+(?:there|everyone|all|friend))?\s*[!?.]*\s*$',
-    re.IGNORECASE,
-)
-_SOCIAL_RE = re.compile(
-    r'^\s*(?:thanks?(?:\s+you)?|thank\s+you|thx|ty|cheers'
-    r'|ok(?:ay)?|sure|got\s+it|sounds?\s+good|great|cool|nice'
-    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)'
-    # Allow a short trailing phrase: "thanks, that helps", "thanks a lot", "thanks for that"
-    r'(?:\s*[,!]?\s*(?:a\s+lot|so\s+much|very\s+much|for\s+\w+|that\s+helps?|that\'?s?\s+\w+|\w{1,12}))?'
-    r'\s*[!?.]*\s*$',
-    re.IGNORECASE,
-)
 _REMEMBER_RE = re.compile(
     r'^\s*(?:remember|note that|keep in mind|don\'?t forget|save that|store that)\s+(.+)',
-    re.IGNORECASE,
-)
-# Capability / meta questions about what the agent can do — answer directly
-# from soul.md context; no tools or web search needed.
-_CAPABILITY_RE = re.compile(
-    r'^\s*(?:what\s+can\s+you\s+(?:do|help\s+(?:me\s+)?with)'
-    r'|what\s+are\s+you\s+(?:capable\s+of|able\s+to\s+do)'
-    r'|what\s+(?:tools?|features?|commands?|abilities)\s+do\s+you\s+have'
-    r'|what\s+(?:do|does)\s+(?:you|this)\s+(?:do|support)'
-    r'|tell\s+me\s+(?:about\s+)?(?:your\s+)?(?:capabilities?|features?)'
-    r'|how\s+can\s+(?:you|i\s+use\s+you)\s+help'
-    r')\s*[?!.]*\s*$',
     re.IGNORECASE,
 )
 _SOUL_KW = frozenset(["alive", "sentient", "conscious", "exist", "real", "feel",
@@ -866,21 +840,21 @@ async def split(query: str, client) -> list[str]:
 
 
 _THINK_DECOMPOSE_SYSTEM = """\
-You are a task planner. Think carefully, then output a structured plan.
+You are a task planner. Output a structured plan as ONE JSON object:
 
-Output ONE JSON object:
 {"outcome": "one-sentence success criteria",
  "steps": "stage1 | stage2 | stage3"}
 
 Steps are pipe-separated plain-English actions. Scale to complexity:
-- 0 steps: pure social exchanges (hi, thanks, ok, bye)
-- 1 step:  single-action tasks (math, factual question, run a command)
+- 0 steps (steps=""): greetings, thanks, social replies, capability/meta questions
+              ("what can you do?", "hi", "thanks", "are you alive?")
+- 1 step:    math, single factual question, one shell command
 - 2-3 steps: research-then-answer, write-then-run
 - 3-5 steps: multi-part tasks (search + write lib + write tests + run)
 
 Use clear action verbs: Search, Write, Run, Read, Edit, Summarise.
-Name the output file explicitly in Write steps: "Write hasher.py using hashlib.md5".
-Name the run command in Run steps: "Run python hasher.py and check output".
+Name the output file in Write steps: "Write hasher.py using hashlib.md5".
+Name the command in Run steps: "Run python hasher.py and check output".
 """
 
 
@@ -890,7 +864,7 @@ async def think_decompose(
     context: str = "",
     soul_section: str = "",
 ) -> tuple[str, list[dict]]:
-    """One thinking-enabled planning call that decomposes the task into stages.
+    """LLM planning call that decomposes the task into stages.
 
     This is the FIRST call in the pipeline — it happens before any execution.
     Returns (outcome, stages) where stages is:
@@ -904,18 +878,10 @@ async def think_decompose(
       verify     → bash
       edit       → plan_task (complex, keeps LLM routing)
 
-    Uses thinking=True so the model reasons through dependencies and ordering
-    before committing to a step list. This makes PIPELINE_STATE accurate from
-    the first API turn — the test harness (and BirdClaw) can read the full
-    plan before execution begins.
+    The LLM decides routing — greetings, social replies, capability questions
+    all return steps="" (direct) based on the prompt instructions.
+    No regex pre-filters: the model owns the routing decision.
     """
-    # Fast pre-checks — skip the LLM for trivially simple inputs
-    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query) or _CAPABILITY_RE.match(query):
-        return query[:80], [{"type": "direct", "goal": query}]
-    m = _REMEMBER_RE.match(query)
-    if m:
-        return query[:80], [{"type": "direct", "goal": query}]
-
     prompt = f"Task: {query[:300]}"
     if context:
         prompt += f"\nContext:\n{context[:300]}"
@@ -932,7 +898,7 @@ async def think_decompose(
             temperature=0.1,
             response_format={"type": "json_object"},
             stream=False,
-            thinking=True,          # ← reasoned planning, not just pattern matching
+            thinking=False,         # keep the planning call fast; model decides routing
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
@@ -1294,11 +1260,6 @@ async def plan_task(
     signals = _extract_signals(task)
     sig_hint   = signals.get("tool_hint", "")
     sig_action = signals.get("action", "")
-
-    # ── Greeting / social / capability — answer directly, never call any tool ──
-    if _GREETING_RE.match(task) or _SOCIAL_RE.match(task) or _CAPABILITY_RE.match(task):
-        logger.debug("plan_task: greeting/social/capability → direct answer")
-        return []
 
     if sig_hint == "math":
         expr = signals.get("expr", "")

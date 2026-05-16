@@ -511,9 +511,9 @@ ROUTING RULES — apply in this order:
    live prices, today's weather, latest software releases, recent news.
 
 5. For live system state (CPU, memory, disk, processes, hardware info, system status):
-   steps="Run python -c \"import platform,subprocess; r=subprocess.run('systeminfo' if platform.system()=='Windows' else 'uname -a && free -h && df -h',shell=True,capture_output=True,text=True); print(r.stdout[:3000] or r.stderr[:500])\""
-   This single step auto-detects the OS and runs the right command.
-   NEVER use WebSearch for system status — run a command instead.
+   write a Run step that uses Python's platform module to detect the OS and execute
+   the appropriate shell command for that platform.
+   NEVER use WebSearch for live system queries — always run a command.
 
 6. steps="Write FILENAME" when the user asks to create or generate a file.
 

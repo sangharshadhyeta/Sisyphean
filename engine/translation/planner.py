@@ -533,6 +533,7 @@ ROUTING RULES — apply in this order:
 
 1. steps="" for greetings, social chat, acknowledgements, opinions, capability questions,
    and general knowledge (geography, history, science, definitions) you already know.
+   The words hi, hello, hey, thanks, ok, bye, sure are ALWAYS steps="" — never a Run step.
    NEVER route a factual question to save_memory — knowing the answer is not the same as
    the user asking you to remember it.
 

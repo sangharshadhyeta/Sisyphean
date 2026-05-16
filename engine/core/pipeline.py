@@ -421,6 +421,15 @@ class Pipeline:
         if not stages:
             stages = [{"type": infer_stage_type(query), "goal": query}]
 
+        # Hard guard: single-word greetings/acks are always direct — the small
+        # model sometimes routes "hi" to Run echo 'hi' which wastes a bash call.
+        _DIRECT_WORDS = frozenset({
+            "hi", "hello", "hey", "thanks", "thank", "thankyou", "ok", "okay",
+            "sure", "bye", "goodbye", "yes", "no", "yep", "nope",
+        })
+        if query.strip().lower().rstrip("!.,?") in _DIRECT_WORDS:
+            stages = [{"type": "direct", "goal": query}]
+
         # Map stages back to the task list that plan_task expects.
         # Each stage goal becomes the sub-task text; infer_stage_type already
         # annotated the type which pipeline uses for tool selection below.

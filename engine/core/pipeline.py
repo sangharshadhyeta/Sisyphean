@@ -1097,7 +1097,7 @@ class Pipeline:
                 temperature=0.1,
                 response_format={"type": "json_object"},
                 stream=False,
-                thinking=True,
+                thinking=False,  # json_object + thinking → empty content on llama.cpp
             )
             raw  = r["choices"][0]["message"]["content"].strip()
             data = parse_format_response(raw) or {}

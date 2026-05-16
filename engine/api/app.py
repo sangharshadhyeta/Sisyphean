@@ -52,9 +52,12 @@ def create_app(config: Config) -> FastAPI:
             mock=False,
         )
     else:
-        llm_url = f"http://{config.llm.server.host}:{config.llm.server.port}"
         if config.llm.local_model:
+            ollama_port = getattr(config.llm.server, "ollama_port", 11434)
+            llm_url = f"http://{config.llm.server.host}:{ollama_port}"
             logger.info("Using Ollama at %s  model=%s", llm_url, config.llm.local_model)
+        else:
+            llm_url = f"http://{config.llm.server.host}:{config.llm.server.port}"
         client = LlamaClient(llm_url, mock=config.mock, model=config.llm.local_model)
     ctx = ContextManager(client, config.llm.server.context_size)
 
@@ -83,7 +86,8 @@ def create_app(config: Config) -> FastAPI:
         budget_tracker=budget_tracker,
         workspace=config.workspace,
         permission_guard=permission_guard,
-        injector=injector,   # enables per-step memory refresh
+        injector=injector,
+        knowledge_graph=graph,
     )
 
     # Seed graph with engine policy and empty stubs on first run

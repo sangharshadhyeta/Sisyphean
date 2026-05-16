@@ -146,11 +146,13 @@ def parse_format_response(content: str) -> dict | None:
 def infer_stage_type(step_text: str) -> str:
     """Classify a plain-English step into a stage type.
 
-    Priority: research > verify > write_doc > write_code
+    Priority: save_memory > research > verify > write_doc > write_code
     Research wins when a step mentions both search and write — the intent
     is to gather information, not produce a file.
     """
     s = step_text.lower()
+    if s.startswith("save:") or s.startswith("save_memory:") or s.startswith("save_memory "):
+        return "save_memory"
     if any(k in s for k in _RESEARCH_KW):
         return "research"
     if any(k in s for k in _VERIFY_KW):
@@ -210,7 +212,8 @@ async def make_plan(goal: str, client, workspace: str = "") -> Plan:
                 ],
                 max_tokens=512,
                 temperature=0.2,
-                response_format={"type": "json_object"},
+                # No response_format: llama.cpp + thinking model → content empty
+                # with json_object; free-form output is parsed by parse_format_response
                 stream=False,
                 thinking=True,
             )
@@ -274,9 +277,8 @@ async def reflect_on_stage(
         try:
             result = await client.generate(
                 [{"role": "user", "content": prompt}],
-                max_tokens=128,
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"},  # "{" prefix on llama.cpp
                 stream=False,
                 thinking=False,
             )
@@ -465,9 +467,8 @@ async def split(query: str, client) -> list[str]:
                 {"role": "system", "content": _SPLIT_SYSTEM},
                 {"role": "user",   "content": query[:300]},
             ],
-            max_tokens=800,
             temperature=0.1,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # "{" prefix on llama.cpp
             stream=False,
             thinking=False,
         )
@@ -489,21 +490,30 @@ async def split(query: str, client) -> list[str]:
 
 
 _THINK_DECOMPOSE_SYSTEM = """\
-You are a task planner. Output a structured plan as ONE JSON object:
+You are a task planner. Output ONLY a JSON object with this exact shape:
+{"outcome": "one-sentence success criteria", "steps": ""}
 
-{"outcome": "one-sentence success criteria",
- "steps": "stage1 | stage2 | stage3"}
+ROUTING RULES — apply in this order:
 
-Steps are pipe-separated plain-English actions. Scale to complexity:
-- 0 steps (steps=""): greetings, thanks, social replies, capability/meta questions
-              ("what can you do?", "hi", "thanks", "are you alive?")
-- 1 step:    math, single factual question, one shell command
-- 2-3 steps: research-then-answer, write-then-run
-- 3-5 steps: multi-part tasks (search + write lib + write tests + run)
+1. steps="" for greetings, social chat, acknowledgements, opinions, capability questions,
+   and general knowledge (geography, history, science, definitions) you already know.
 
-Use clear action verbs: Search, Write, Run, Read, Edit, Summarise.
-Name the output file in Write steps: "Write hasher.py using hashlib.md5".
-Name the command in Run steps: "Run python hasher.py and check output".
+2. steps="Save: <verbatim fact>" when the user says remember/note/save/keep-in-mind.
+   Put the exact fact after "Save: " — nothing else on this step.
+
+3. steps="Run python -c \"print(expr)\"" for any arithmetic or mathematical calculation.
+   Always run the computation — never answer from memory.
+
+4. steps="Search KEYWORDS" only for information that changes day to day: current events,
+   live prices, today's weather, latest software releases, recent news.
+
+5. For live system state or filesystem operations, describe what to run as the step goal.
+   If the right command depends on the OS (e.g. hardware info, process list, network state),
+   prepend a "check OS" step so the executor can pick the correct command.
+
+6. steps="Write FILENAME" when the user asks to create or generate a file.
+
+7. Use pipe-separated steps for multi-part tasks: "step1 | step2 | step3"
 """
 
 
@@ -543,24 +553,22 @@ async def think_decompose(
                 {"role": "system", "content": _THINK_DECOMPOSE_SYSTEM},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=300,
             temperature=0.1,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # "{" prefix on llama.cpp; json_object elsewhere
             stream=False,
-            thinking=False,  # json_object + thinking → empty content on llama.cpp
+            thinking=False,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
         if not data:
             return query[:80], []
 
-        outcome   = (data.get("outcome") or query[:80]).strip()
-        steps_raw = (data.get("steps") or "").strip()
-
-        if isinstance(steps_raw, list):
-            plain_steps = [s.strip() for s in steps_raw if str(s).strip()]
+        outcome  = (data.get("outcome") or query[:80]).strip()
+        raw_steps = data.get("steps") or ""
+        if isinstance(raw_steps, list):
+            plain_steps = [str(s).strip() for s in raw_steps if str(s).strip()]
         else:
-            plain_steps = [s.strip() for s in str(steps_raw).split("|") if s.strip()]
+            plain_steps = [s.strip() for s in str(raw_steps).strip().split("|") if s.strip()]
 
         # Model explicitly returned steps="" — direct answer, no tool calls needed.
         # Return a "direct" stage so the pipeline skips planning entirely.
@@ -612,11 +620,10 @@ async def plan_task(
                 {"role": "system", "content": _build_plan_system(outer_tools)},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=400,
             temperature=0.1,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # "{" prefix on llama.cpp; json_object elsewhere
             stream=False,
-            thinking=False,  # json_object + thinking → empty content on llama.cpp
+            thinking=False,
         )
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)

@@ -247,9 +247,27 @@ python tests/test_openclaw.py
 
 ---
 
+## Pipeline Routing
+
+The planning prompt uses **rules only** (no hardcoded examples):
+
+| Trigger | Route |
+|---------|-------|
+| Math expression | `verify` → `Run python -c "print(expr)"` via Bash |
+| "remember X" / "prefer Y" | `save_memory` → persisted to knowledge graph |
+| Multi-step task | `plan_task` → typed stage list |
+| Conversational / greeting | direct answer, no tool use |
+| OS-specific shell command | `verify` → OS check first, then execute |
+
+**Direct-run bypass** — when a stage goal starts with `Run `, Sisyphean skips `plan_task` and emits the Bash step immediately. Shell quoting is normalised (`python -c '...'` → `python -c "..."`) before dispatch.
+
+---
+
 ## Roadmap
 
-- [ ] Switch to llama.cpp + gemma4 e4b (better reasoning on consumer GPU)
+- [x] Switch to llama.cpp + gemma4 (configurable via `external_api` in config.yaml)
+- [x] Math/computation routed through Bash for verifiable results
+- [x] `save_memory` stage persists facts and preferences to the knowledge graph
 - [ ] Telegram / Discord channel adapters
 - [ ] PC control (screenshot, mouse/keyboard) via BirdClaw tool bridge
 - [ ] Self-modification (agent edits own source, runs tests, commits)

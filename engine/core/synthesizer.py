@@ -111,12 +111,6 @@ async def synthesize(
     has_results = bool(good or weak)
     system = _SYSTEM_WITH_RESULTS if has_results else _SYSTEM_NO_RESULTS
 
-    # Token budget: generous enough for real answers, tight enough to avoid
-    # the model rambling for 60s on a 4B model.
-    # - No results (greeting, ack, pure conversation): short reply, 200 tokens
-    # - Results present: full synthesis, 600 tokens (enough for ~400 word answer)
-    max_tokens = 200 if not has_results else 600
-
     for _attempt in range(2):
         try:
             result = await client.generate(
@@ -124,7 +118,8 @@ async def synthesize(
                     {"role": "system", "content": system},
                     {"role": "user",   "content": prompt},
                 ],
-                max_tokens=max_tokens,
+                # No max_tokens: thinking is suppressed via prefix injection on llama.cpp
+                # so the model outputs its answer directly without wasting tokens on reasoning.
                 temperature=0.3,
                 stream=False,
                 thinking=False,
@@ -133,11 +128,9 @@ async def synthesize(
             if text:
                 logger.debug("synthesize: %d chars", len(text))
                 return text
-            # Empty response — retry with a minimal prompt
             logger.warning("synthesize: empty response on attempt %d", _attempt + 1)
             prompt = f"Reply to: {query[:200]}"
             system = _SYSTEM_NO_RESULTS
-            max_tokens = 150
         except Exception as exc:
             logger.warning("synthesize failed attempt %d: %s", _attempt + 1, exc)
 

@@ -3,11 +3,12 @@
 
 llm:
   model_path: "C:/llama.cpp/models/gemma4-e2b-q8.gguf"
-  model_name: sisyphean-gemma4:e2b          # name exposed via /v1/models
-  local_model: ""                      # empty = use llama-server (not Ollama)
+  model_name: sisyphean-qwen3:1.7b          # name exposed via /v1/models
+  local_model: "qwen3:1.7b"            # non-empty = use Ollama
   server:
     host: 127.0.0.1
     port: 8080                         # llama-server default port
+    ollama_port: 11434                 # Ollama default port (used when local_model is set)
     context_size: 8192
     threads: 8                         # Ryzen 7 7735U has 8 cores
     gpu_layers: 0                      # CPU only

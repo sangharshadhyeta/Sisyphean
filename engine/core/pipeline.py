@@ -368,10 +368,18 @@ class Pipeline:
                      project_dir: str = "",
                      bc_plan: "tuple[str, list[dict]] | None" = None) -> LoopResponse:
         from engine.policy.router import load_user_prefs
+        from engine.soul.router import parse_soul_sections, match_soul_section
 
         task_id = _tracker.start_task(session_id=session_id, user_message=query)
 
-        soul_section = self.soul_path.read_text(encoding="utf-8").strip() if self.soul_path.exists() else ""
+        if self.soul_path.exists():
+            _soul_sections = parse_soul_sections(self.soul_path)
+            _, soul_section = match_soul_section(query, _soul_sections)
+            if not soul_section:
+                # No section matched — fall back to first 400 chars of full soul
+                soul_section = self.soul_path.read_text(encoding="utf-8").strip()[:400]
+        else:
+            soul_section = ""
         user_prefs   = load_user_prefs(self.prefs_path)
 
         logger.info("pipeline.start: query=%r history=%d chars", query[:60], len(history_text))
@@ -444,7 +452,10 @@ class Pipeline:
             ws_snap = _workspace_snapshot(self.workspace) if self.workspace else ""
             ws_block = f"[Workspace files]\n{ws_snap}" if ws_snap else ""
 
-            task_ctx = "\n\n".join(p for p in (task_history, graph_block, ws_block, project_ctx) if p)
+            # Prepend the original query so plan_task always has the full user request,
+            # even when the stage goal is a vague placeholder like "check system status".
+            original_ctx = f"Original request: {query}" if task != query else ""
+            task_ctx = "\n\n".join(p for p in (original_ctx, task_history, graph_block, ws_block, project_ctx) if p)
             all_extracted.append(task_history)
 
             if graph_recall:
@@ -461,8 +472,37 @@ class Pipeline:
             stage_type = stage.get("type", "")
 
             # For "direct" stages (social messages, trivial answers) skip planning.
+            # For "save_memory" stages, extract the fact and save it directly.
             if stage_type == "direct":
                 steps = []
+            elif stage_type == "save_memory":
+                # Extract fact from goal: strip leading verb/prefix
+                goal_text = stage.get("goal", task)
+                fact = goal_text
+                for prefix in ("save: ", "save_memory:", "save_memory ", "save "):
+                    if fact.lower().startswith(prefix):
+                        fact = fact[len(prefix):].strip()
+                        break
+                # Strip literal placeholder words if model echoed them
+                for junk in ("FACT:", "fact:", "<verbatim fact>", "<fact>"):
+                    if fact.startswith(junk):
+                        fact = fact[len(junk):].strip()
+                if self.graph and fact:
+                    try:
+                        existing = self.graph.find_by_label(fact[:80], type="user")
+                        if not existing:
+                            self.graph.add_node(type="user", label=fact[:80], content=fact)
+                        logger.info("pipeline: save_memory stage → stored %r", fact[:60])
+                    except Exception as exc:
+                        logger.warning("pipeline: save_memory stage failed: %s", exc)
+                steps = [{"tool": "save_memory", "input": fact, "result": "saved",
+                          "summary": f"saved: {fact[:80]}"}]
+            elif task.strip().lower().startswith("run "):
+                # Stage goal is already a concrete command — skip plan_task,
+                # extract the command and emit a bash step directly.
+                cmd = _normalize_python_c(task.strip()[4:].strip())
+                logger.info("pipeline: direct-run stage → bash: %s", cmd[:80])
+                steps = [{"tool": "bash", "input": cmd}]
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                         context=task_ctx,
@@ -810,7 +850,7 @@ class Pipeline:
                     tool_id = f"toolu_{uuid.uuid4().hex[:16]}"
                     cl = canonical.lower()
                     if cl == "bash":
-                        tool_input = {"command": inp}
+                        tool_input = {"command": _normalize_python_c(inp)}
                     elif cl == "write":
                         file_path = step.get("file_path") or inp[:120]
                         if not file_path or not file_path.strip():
@@ -1093,11 +1133,10 @@ class Pipeline:
                     {"role": "system", "content": _REPLAN_SYSTEM + soul_block + prefs_block},
                     {"role": "user",   "content": f"Task: {task}{ep_block}{already_block}\n\nFound:\n{search_result[:3000]}"},
                 ],
-                max_tokens=500,
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"},  # "{" prefix on llama.cpp
                 stream=False,
-                thinking=False,  # json_object + thinking → empty content on llama.cpp
+                thinking=False,
             )
             raw  = r["choices"][0]["message"]["content"].strip()
             data = parse_format_response(raw) or {}
@@ -1558,9 +1597,8 @@ class Pipeline:
                     {"role": "user",   "content":
                         f"Goal: {goal[:300]}\n\nWritten content:\n{content_preview}"},
                 ],
-                max_tokens=200,
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"},  # "{" prefix on llama.cpp
                 stream=False,
                 thinking=False,
             )
@@ -1598,9 +1636,8 @@ class Pipeline:
                     {"role": "user", "content":
                         f"Task: {task}{ep_note}\n\nFile:\n{file_content[:3000]}"},
                 ],
-                max_tokens=400,
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"},  # "{" prefix on llama.cpp
                 stream=False,
                 thinking=False,
             )
@@ -1805,15 +1842,15 @@ class Pipeline:
                         "summary": f"fetch error: {exc}"}
 
         if tool in ("save_memory", "remember"):
-            # user_prefs are BirdClaw's domain — CLAUDE.md handles prefs in Claude Code.
-            # Just write to graph so the fact is recalled during future requests.
             if self.graph:
                 try:
-                    self.graph.upsert_node(name=inp[:80], node_type="user",
-                                           summary=inp, sources=["pipeline"])
-                    self.graph.save()
-                except Exception:
-                    pass
+                    label = inp[:80]
+                    existing = self.graph.find_by_label(label, type="user")
+                    if not existing:
+                        self.graph.add_node(type="user", label=label, content=inp)
+                    logger.info("pipeline: save_memory → stored %r", label)
+                except Exception as exc:
+                    logger.warning("pipeline: save_memory graph write failed: %s", exc)
             return {"tool": tool, "input": inp, "result": "saved", "summary": f"saved: {inp[:80]}"}
 
         # Unknown tool — log and skip
@@ -1822,6 +1859,22 @@ class Pipeline:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _normalize_python_c(cmd: str) -> str:
+    """Ensure `python -c '...'` uses double quotes so the shell doesn't break.
+
+    Models often emit single-quoted python -c expressions which fail when the
+    code itself contains single quotes (e.g. import statements, string literals).
+    Re-wrap with double quotes, escaping any bare double quotes inside.
+    """
+    import re as _re
+    m = _re.match(r"^(python\d*\s+-c\s+)'(.*)'$", cmd, _re.DOTALL)
+    if m:
+        prefix, body = m.group(1), m.group(2)
+        body = body.replace('"', '\\"')
+        return f'{prefix}"{body}"'
+    return cmd
+
 
 def _extract_state(raw_history: list[dict]) -> PipelineState | None:
     """Find and decode PIPELINE_STATE from thinking blocks in history."""

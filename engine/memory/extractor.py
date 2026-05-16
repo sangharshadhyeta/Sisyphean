@@ -128,7 +128,7 @@ class MemoryExtractor:
                 [{"role": "user", "content": prompt}],
                 max_tokens=512,
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"},  # "{" prefix on llama.cpp
                 stream=False,
                 thinking=False,
             )

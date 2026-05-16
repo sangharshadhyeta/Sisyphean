@@ -162,7 +162,7 @@ async def _call_planner(client: Any, prompt: str, system: str) -> list[dict]:
             messages,
             max_tokens=400,
             temperature=0.2,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # "{" prefix on llama.cpp
             stream=False,
             thinking=False,
         )

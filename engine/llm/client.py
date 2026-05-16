@@ -121,12 +121,22 @@ class LlamaClient:
 
     # ── Generation ───────────────────────────────────────────────────────────
 
+    @property
+    def _is_llama_cpp(self) -> bool:
+        """True when talking directly to a llama-server (not Ollama, not external API).
+
+        Detection: llama-server mode has no api_key and no model name.
+        local_model="" in config.yaml means llama-server; a non-empty local_model
+        means Ollama where the model name is the pull tag (e.g. "qwen3:0.6b").
+        """
+        return not self.api_key and not self.mock and not self.model
+
     async def generate(
         self,
         messages: list[dict],
         *,
         stream: bool = False,
-        max_tokens: int = 1024,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         stop: list[str] | None = None,
         response_format: dict | None = None,
@@ -136,7 +146,18 @@ class LlamaClient:
 
         - stream=False  → awaitable, returns the full response dict.
         - stream=True   → returns an async iterator of raw JSON chunk strings.
-        - response_format → e.g. {"type": "json_object"} for structured output.
+        - max_tokens=None → no limit; model generates until EOS / context boundary.
+        - thinking=True  → let the model reason (slower, deeper). On llama.cpp this
+                           means no prefix injection; the model thinks then answers.
+        - thinking=False → suppress thinking for speed. On llama.cpp this is
+                           implemented by injecting a partial assistant-turn prefix:
+                             response_format set  → "{" prefix → model outputs JSON directly
+                             response_format None → "\\n" prefix → model outputs text directly
+                           On Ollama this sends the native think:false parameter.
+        - response_format → {"type": "json_object"} signals JSON output.
+                            On llama.cpp: NOT forwarded to the server (gemma4 ignores it
+                            and it causes empty content); used only as a prefix selector.
+                            On Ollama/external: forwarded as-is.
         """
         if self.mock:
             if stream:
@@ -145,36 +166,63 @@ class LlamaClient:
 
         # External APIs (OpenRouter, Groq, etc.) don't accept Anthropic-specific
         # content block types like "thinking" or "tool_use" in message history.
-        # Strip them down to plain text before forwarding.
         if self.api_key:
             messages = _flatten_messages_for_oai(messages)
 
         payload: dict = {
             "messages": messages,
-            "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": stream,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if self.model:
             payload["model"] = self.model
         if stop:
             payload["stop"] = stop
-        # response_format (json_object) is only supported by some models/providers.
-        # For external APIs we skip it — the engine's _parse_json() is tolerant
-        # enough to handle freeform JSON embedded in prose.
-        if response_format and not self.api_key:
+
+        # ── response_format handling ──────────────────────────────────────────
+        # Ollama and external APIs: forward response_format to the server.
+        # llama.cpp: do NOT forward it — gemma4 + json_object → empty content.
+        #            It is used below only as a signal to choose the prefix.
+        if response_format and not self._is_llama_cpp:
             payload["response_format"] = response_format
-        # thinking=True  → free-form answer calls (_direct) where reasoning helps
-        # thinking=False → all structured JSON calls (soul, decompose, executor)
-        #                  Ollama/llama.cpp: thinking + response_format=json_object
-        #                  produces reasoning-only output with no JSON — must be False.
-        # Ollama honours "think": bool on /v1/chat/completions since v0.9.
+
+        # ── Thinking control ─────────────────────────────────────────────────
+        # Ollama (v0.9+): honours "think": bool natively.
+        # llama.cpp: ignores "think" entirely; gemma4:e2b always starts reasoning.
+        #   Suppression technique (discovered empirically):
+        #     Any non-empty partial assistant message injected as the last turn
+        #     causes llama.cpp to use it as a generation prefix, skipping the
+        #     reasoning_content phase entirely.
+        #     - JSON calls: prefix="{" → model continues JSON immediately (2-3s)
+        #     - Text calls: prefix="\n" → model continues text immediately (2s),
+        #                   the leading newline is stripped by the caller's .strip()
+        injected_prefix = ""
         if not self.api_key and not self.mock:
-            payload["think"] = thinking
+            if self._is_llama_cpp:
+                if not thinking:
+                    is_json = bool(response_format and
+                                   response_format.get("type") == "json_object")
+                    injected_prefix = "{" if is_json else "\n"
+                    payload["messages"] = _inject_prefix(
+                        payload["messages"], injected_prefix
+                    )
+            else:
+                payload["think"] = thinking
 
         if stream:
             return self._stream(payload)
-        return await self._sync(payload)
+        result = await self._sync(payload)
+
+        # Prepend the injected prefix to the generated content so callers get
+        # the complete output (e.g. "{" + '"outcome": ...' = valid JSON object).
+        if injected_prefix:
+            for choice in result.get("choices", []):
+                msg = choice.get("message")
+                if isinstance(msg, dict):
+                    msg["content"] = injected_prefix + (msg.get("content") or "")
+        return result
 
     # ── Internal: non-streaming ──────────────────────────────────────────────
 
@@ -422,13 +470,38 @@ class LlamaClient:
         return f"[MOCK] Echo: {last}"
 
 
+# ── Module-level helper: inject assistant prefix to suppress thinking ─────────
+
+def _inject_prefix(messages: list[dict], prefix: str) -> list[dict]:
+    """Inject a partial assistant turn as a generation prefix.
+
+    When the last message in the array has role=assistant, llama.cpp treats its
+    content as a prompt prefix and continues generation from there — bypassing
+    the reasoning_content phase entirely.
+
+    If the last message is already an assistant turn, the prefix is prepended
+    to its existing content.  Otherwise a new turn is appended.
+    """
+    if not messages or not prefix:
+        return messages
+    msgs = list(messages)
+    if msgs[-1].get("role") == "assistant":
+        existing = msgs[-1].get("content") or ""
+        msgs[-1] = {**msgs[-1], "content": prefix + existing}
+    else:
+        msgs.append({"role": "assistant", "content": prefix})
+    return msgs
+
+
 # ── Module-level helper: strip <think> blocks from qwen3/deepseek-r1 output ──
 
 # Standard thinking-block tokens emitted by various models:
 # <think>…</think>                     — Qwen3, DeepSeek-R1, Llama variants
 # <thinking>…</thinking>               — some Ollama builds
 # <|thinking|>…<|/thinking|>           — llama.cpp / some quantised models
-# <|channel>thought\n…<channel|>       — Gemma 4 (e2b/e4b ignore think:false, tokens leak)
+# <|channel>thought\n…<channel|>       — Gemma 4; now suppressed via prefix injection
+#                                         (_suppress_thinking_llamacpp), but kept here
+#                                         as a safety net in case any tokens leak through
 _THINK_RE = re.compile(
     r"<think>.*?</think>"
     r"|<thinking>.*?</thinking>"
@@ -588,19 +661,21 @@ def _strip_thinking(data: dict) -> None:
                         logger.debug("rescued JSON from <think> block (%d chars)", len(rescued))
                         continue
 
-            # 2. llama.cpp external puts thinking in "reasoning_content", answer in "content"
+            # 2. llama.cpp puts thinking in "reasoning_content" / "reasoning" field.
+            #    Without response_format (our approach after json_object was dropped),
+            #    the model should output its answer in content after thinking.
+            #    If content is still empty (token budget exhausted mid-think), rescue
+            #    structured JSON only — never promote plain-text reasoning as an answer
+            #    (that leaks the thinking chain to the user).
             for field in ("reasoning_content", "reasoning"):
                 thinking = msg.get(field) or ""
-                if thinking.strip():
-                    # Only rescue structured JSON from reasoning fields (plan calls).
-                    # Never promote plain-text reasoning as an answer — that leaks
-                    # the thinking chain. Plain-text callers (synthesizer) handle
-                    # empty content via their own retry/fallback logic.
-                    rescued = _last_json(thinking)
-                    if rescued:
-                        msg["content"] = rescued
-                        logger.debug("rescued JSON from %s field (%d chars)", field, len(rescued))
-                        break
+                if not thinking.strip():
+                    continue
+                rescued = _last_json(thinking)
+                if rescued:
+                    msg["content"] = rescued
+                    logger.debug("rescued JSON from %s field (%d chars)", field, len(rescued))
+                    break
 
 
 # ── Module-level helper: flatten Anthropic content blocks to plain OAI text ──

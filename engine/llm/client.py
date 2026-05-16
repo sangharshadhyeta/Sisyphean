@@ -4,11 +4,60 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import AsyncIterator
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_CB_FAIL_THRESHOLD = 5    # consecutive failures before opening circuit
+_CB_RESET_SECONDS  = 30   # seconds in open state before allowing a probe
+
+
+class _CircuitBreaker:
+    """Simple three-state circuit breaker (closed → open → half-open).
+
+    closed    — normal operation
+    open      — backend is down; calls fail fast with 503 for _CB_RESET_SECONDS
+    half-open — one probe attempt allowed; success → closed, failure → open
+    """
+
+    def __init__(self) -> None:
+        self._failures = 0
+        self._state = "closed"   # "closed" | "open" | "half-open"
+        self._opened_at = 0.0
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= _CB_FAIL_THRESHOLD:
+            if self._state != "open":
+                logger.warning(
+                    "Circuit breaker OPEN after %d consecutive LLM failures",
+                    self._failures,
+                )
+            self._state = "open"
+            self._opened_at = time.monotonic()
+
+    def allow_request(self) -> bool:
+        if self._state == "closed":
+            return True
+        if self._state == "open":
+            if time.monotonic() - self._opened_at >= _CB_RESET_SECONDS:
+                self._state = "half-open"
+                logger.info("Circuit breaker HALF-OPEN — probing LLM backend")
+                return True
+            return False
+        # half-open: allow one probe
+        return True
+
+    @property
+    def is_open(self) -> bool:
+        return self._state == "open"
 
 
 class LlamaClient:
@@ -46,6 +95,7 @@ class LlamaClient:
             timeout=httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=10.0),
             headers=headers,
         )
+        self._cb = _CircuitBreaker()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -105,19 +155,47 @@ class LlamaClient:
 
     # ── Token counting ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Conservative token estimate when no tokenizer endpoint is available.
+
+        Uses word count × 1.4 rather than char count / 4.  Word-based counting
+        is more stable across languages and models (Qwen/Gemma average ~1.2–1.5
+        tokens per whitespace-separated word; 1.4 gives a slight overestimate
+        which is the safe direction for context budget calculations).
+        """
+        words = len(text.split())
+        return max(1, int(words * 1.4))
+
     async def tokenize(self, text: str) -> int:
-        """Return the token count for *text*. Falls back to len/4 approximation."""
+        """Return the token count for *text*.
+
+        Priority:
+          1. llama-server /tokenize endpoint (exact)
+          2. Ollama /api/tokenize endpoint (exact, Ollama ≥0.5)
+          3. Word-count × 1.4 heuristic (conservative overestimate)
+        """
         if self.mock or self.api_key:
-            return max(1, len(text) // 4)
+            return self._estimate_tokens(text)
         try:
+            # llama-server endpoint
             r = await self._http.post("/tokenize", json={"content": text})
-            if r.status_code == 404:
-                # Ollama doesn't expose /tokenize — silently use approximation
-                return max(1, len(text) // 4)
-            r.raise_for_status()
-            return len(r.json().get("tokens", []))
+            if r.status_code == 200:
+                return len(r.json().get("tokens", [])) or self._estimate_tokens(text)
+            if r.status_code == 404 and self.model:
+                # Ollama: try its own tokenize endpoint (available since ~0.5)
+                try:
+                    r2 = await self._http.post(
+                        "/api/tokenize",
+                        json={"model": self.model, "prompt": text},
+                    )
+                    if r2.status_code == 200:
+                        return len(r2.json().get("tokens", [])) or self._estimate_tokens(text)
+                except Exception:
+                    pass
         except Exception:
-            return max(1, len(text) // 4)
+            pass
+        return self._estimate_tokens(text)
 
     # ── Generation ───────────────────────────────────────────────────────────
 
@@ -211,6 +289,12 @@ class LlamaClient:
             else:
                 payload["think"] = thinking
 
+        if not self._cb.allow_request():
+            raise RuntimeError(
+                "LLM backend circuit breaker is OPEN — backend appears down. "
+                f"Will retry in {_CB_RESET_SECONDS}s."
+            )
+
         if stream:
             return self._stream(payload)
         result = await self._sync(payload)
@@ -254,14 +338,19 @@ class LlamaClient:
             r.raise_for_status()
             data = r.json()
             _strip_thinking(data)
+            self._cb.record_success()
             return data
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
             if _attempt >= 2:
+                self._cb.record_failure()
                 raise
             wait = 2 ** _attempt
             logger.warning("LLM request failed (%s), retrying in %ds", exc, wait)
             await asyncio.sleep(wait)
             return await self._sync(payload, _attempt + 1)
+        except Exception:
+            self._cb.record_failure()
+            raise
 
     # ── Internal: streaming ──────────────────────────────────────────────────
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class KnowledgeGraph:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._g: nx.DiGraph = nx.DiGraph()
+        self._lock = threading.Lock()
         self._load()
 
     # ── Node CRUD ────────────────────────────────────────────────────────────
@@ -52,27 +54,29 @@ class KnowledgeGraph:
         content: str,
         metadata: dict | None = None,
     ) -> str:
-        node_id = str(uuid.uuid4())
-        now = _now()
-        self._g.add_node(node_id, **{
-            "id": node_id,
-            "type": type,
-            "label": label,
-            "content": content,
-            "created_at": now,
-            "updated_at": now,
-            "metadata": metadata or {},
-        })
-        self._save()
-        return node_id
+        with self._lock:
+            node_id = str(uuid.uuid4())
+            now = _now()
+            self._g.add_node(node_id, **{
+                "id": node_id,
+                "type": type,
+                "label": label,
+                "content": content,
+                "created_at": now,
+                "updated_at": now,
+                "metadata": metadata or {},
+            })
+            self._save_unlocked()
+            return node_id
 
     def update_node(self, node_id: str, **kwargs) -> bool:
-        if node_id not in self._g:
-            return False
-        kwargs["updated_at"] = _now()
-        self._g.nodes[node_id].update(kwargs)
-        self._save()
-        return True
+        with self._lock:
+            if node_id not in self._g:
+                return False
+            kwargs["updated_at"] = _now()
+            self._g.nodes[node_id].update(kwargs)
+            self._save_unlocked()
+            return True
 
     def get_node(self, node_id: str) -> dict | None:
         if node_id not in self._g:
@@ -95,10 +99,11 @@ class KnowledgeGraph:
     # ── Edges ────────────────────────────────────────────────────────────────
 
     def add_edge(self, source_id: str, target_id: str, relation: str, weight: float = 1.0) -> None:
-        if source_id not in self._g or target_id not in self._g:
-            return
-        self._g.add_edge(source_id, target_id, relation=relation, weight=weight)
-        self._save()
+        with self._lock:
+            if source_id not in self._g or target_id not in self._g:
+                return
+            self._g.add_edge(source_id, target_id, relation=relation, weight=weight)
+            self._save_unlocked()
 
     def get_neighbors(self, node_id: str, relation: str | None = None) -> list[dict]:
         if node_id not in self._g:
@@ -138,31 +143,49 @@ class KnowledgeGraph:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [d for _, d in scored[:top_n]]
 
-    # ── Persistence (atomic) ─────────────────────────────────────────────────
+    # ── Persistence (atomic + backup recovery) ───────────────────────────────
 
     def _load(self) -> None:
-        if not self.path.exists():
-            logger.info("No graph at %s — starting fresh", self.path)
-            return
-        try:
-            with open(self.path) as f:
-                data = json.load(f)
-            for node in data.get("nodes", []):
-                self._g.add_node(node["id"], **node)
-            for edge in data.get("edges", []):
-                self._g.add_edge(
-                    edge["source"], edge["target"],
-                    relation=edge.get("relation", ""),
-                    weight=edge.get("weight", 1.0),
+        bak = self.path.with_suffix(".bak")
+        for candidate in (self.path, bak):
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate) as f:
+                    data = json.load(f)
+                for node in data.get("nodes", []):
+                    self._g.add_node(node["id"], **node)
+                for edge in data.get("edges", []):
+                    self._g.add_edge(
+                        edge["source"], edge["target"],
+                        relation=edge.get("relation", ""),
+                        weight=edge.get("weight", 1.0),
+                    )
+                logger.info(
+                    "Graph loaded from %s: %d nodes, %d edges",
+                    candidate, self._g.number_of_nodes(), self._g.number_of_edges(),
                 )
-            logger.info("Graph loaded: %d nodes, %d edges", self._g.number_of_nodes(), self._g.number_of_edges())
-        except Exception as exc:
-            logger.error("Failed to load graph (%s) — starting fresh", exc)
+                return
+            except Exception as exc:
+                logger.warning("Failed to load graph from %s (%s) — trying backup", candidate, exc)
 
-    def _save(self) -> None:
-        """Atomic write: serialise to .tmp then os.replace()."""
+        if self.path.exists() or bak.exists():
+            logger.error(
+                "All graph candidates corrupt — starting fresh. "
+                "Corrupt files kept at %s for manual recovery.", self.path,
+            )
+        else:
+            logger.info("No graph at %s — starting fresh", self.path)
+
+    def save(self) -> None:
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        """Atomic write: current → .bak, .tmp → current. Caller must hold _lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
+        bak = self.path.with_suffix(".bak")
         payload = {
             "nodes": [dict(d) for _, d in self._g.nodes(data=True)],
             "edges": [
@@ -172,6 +195,12 @@ class KnowledgeGraph:
         }
         with open(tmp, "w") as f:
             json.dump(payload, f, indent=2, default=str)
+        # Rotate: current → .bak before replacing
+        if self.path.exists():
+            try:
+                os.replace(self.path, bak)
+            except OSError:
+                pass
         os.replace(tmp, self.path)
 
 
@@ -195,6 +224,7 @@ class GraphStore:
     def __init__(self, persist_path: Path | None = None) -> None:
         self._path = persist_path
         self._graph: nx.DiGraph = nx.DiGraph()
+        self._lock = threading.Lock()
         if persist_path and persist_path.exists():
             self._load()
 
@@ -236,6 +266,11 @@ class GraphStore:
         """Atomic write with .bak — no-op for in-memory graphs."""
         if self._path is None:
             return
+        with self._lock:
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        assert self._path is not None
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = nx.node_link_data(self._graph, edges="edges")
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
@@ -258,40 +293,46 @@ class GraphStore:
         sources: list[str] | None = None,
         **extra,
     ) -> str:
-        key = _node_key(name)
-        ts = _now()
-        if self._graph.has_node(key):
-            node = self._graph.nodes[key]
-            existing = set(node.get("sources", []))
-            existing.update(sources or [])
-            node["sources"] = list(existing)
-            node["last_seen"] = ts
-            if summary:
-                node["summary"] = summary
-            node.update(extra)
-        else:
-            self._graph.add_node(
-                key,
-                name=name,
-                type=node_type,
-                summary=summary,
-                sources=list(sources or []),
-                created_at=ts,
-                last_seen=ts,
-                **extra,
-            )
-        return key
+        with self._lock:
+            key = _node_key(name)
+            ts = _now()
+            if self._graph.has_node(key):
+                node = self._graph.nodes[key]
+                existing = set(node.get("sources", []))
+                existing.update(sources or [])
+                node["sources"] = list(existing)
+                node["last_seen"] = ts
+                if summary:
+                    node["summary"] = summary
+                node.update(extra)
+            else:
+                self._graph.add_node(
+                    key,
+                    name=name,
+                    type=node_type,
+                    summary=summary,
+                    sources=list(sources or []),
+                    created_at=ts,
+                    last_seen=ts,
+                    **extra,
+                )
+            if self._path is not None:
+                self._save_unlocked()
+            return key
 
     def upsert_edge(self, subject: str, relation: str, obj: str, weight: float = 1.0) -> None:
-        s_key = _node_key(subject)
-        o_key = _node_key(obj)
-        for key, name in ((s_key, subject), (o_key, obj)):
-            if not self._graph.has_node(key):
-                self._graph.add_node(key, name=name, type="entity", summary="", sources=[], last_seen=_now())
-        if self._graph.has_edge(s_key, o_key):
-            self._graph.edges[s_key, o_key]["weight"] = self._graph.edges[s_key, o_key].get("weight", 1.0) + weight
-        else:
-            self._graph.add_edge(s_key, o_key, relation=relation, weight=weight)
+        with self._lock:
+            s_key = _node_key(subject)
+            o_key = _node_key(obj)
+            for key, name in ((s_key, subject), (o_key, obj)):
+                if not self._graph.has_node(key):
+                    self._graph.add_node(key, name=name, type="entity", summary="", sources=[], last_seen=_now())
+            if self._graph.has_edge(s_key, o_key):
+                self._graph.edges[s_key, o_key]["weight"] = self._graph.edges[s_key, o_key].get("weight", 1.0) + weight
+            else:
+                self._graph.add_edge(s_key, o_key, relation=relation, weight=weight)
+            if self._path is not None:
+                self._save_unlocked()
 
     # ── Query ──────────────────────────────────────────────────────────────────
 

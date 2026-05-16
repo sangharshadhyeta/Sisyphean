@@ -66,6 +66,9 @@ class Tool(BaseModel):
     input_schema: dict | None = None
 
 
+_MAX_TOKENS_LIMIT = 32768  # hard cap — prevents accidental OOM from malformed requests
+
+
 class AnthropicRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str
@@ -76,6 +79,10 @@ class AnthropicRequest(BaseModel):
     stream: bool = False
     stop_sequences: list[str] | None = None
     tools: list[Tool] | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.max_tokens > _MAX_TOKENS_LIMIT:
+            self.max_tokens = _MAX_TOKENS_LIMIT
 
     def system_text(self) -> str | None:
         """Return system as a plain string regardless of input format."""

@@ -13,14 +13,14 @@ Search strategy
   configured: full semantic cosine-similarity search.
 - Otherwise: keyword overlap fallback (always works, no GPU needed).
 
-Embeddings are computed in-memory on load and on each new entry.
-Nothing is stored on disk except the JSONL entries themselves —
-embeddings are rebuilt from text on startup (fast for small corpora).
+Embeddings are computed incrementally: new entries are encoded on save
+and appended to the in-memory array. Full rebuild only happens on startup.
 """
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +48,7 @@ class ArtifactStore:
         self._entries: list[dict] = []
         self._encoder: Any = None
         self._embeddings: Any = None  # np.ndarray shape (N, D) once built
+        self._lock = threading.Lock()
 
         if _HAS_ST and embedding_model:
             try:
@@ -77,9 +78,10 @@ class ArtifactStore:
             "graph_node_id": graph_node_id,
             "created_at": _now(),
         }
-        self._entries.append(entry)
-        self._append_disk(entry)
-        self._rebuild_embeddings()
+        with self._lock:
+            self._entries.append(entry)
+            self._append_disk(entry)
+            self._encode_one(entry)
         return entry["id"]
 
     # ── Search ───────────────────────────────────────────────────────────────
@@ -90,12 +92,13 @@ class ArtifactStore:
         top_n: int = 5,
         type_filter: str | None = None,
     ) -> list[dict]:
-        pool = [e for e in self._entries if type_filter is None or e.get("type") == type_filter]
-        if not pool:
-            return []
-        if self._encoder is not None and self._embeddings is not None and _HAS_ST:
-            return self._semantic(query, pool, top_n)
-        return self._keyword(query, pool, top_n)
+        with self._lock:
+            pool = [e for e in self._entries if type_filter is None or e.get("type") == type_filter]
+            if not pool:
+                return []
+            if self._encoder is not None and self._embeddings is not None and _HAS_ST:
+                return self._semantic(query, pool, top_n)
+            return self._keyword(query, pool, top_n)
 
     # ── Load / append ────────────────────────────────────────────────────────
 
@@ -117,11 +120,29 @@ class ArtifactStore:
 
     # ── Embedding helpers ────────────────────────────────────────────────────
 
+    def _text(self, entry: dict) -> str:
+        return f"{entry.get('summary', '')} {entry.get('content', '')[:300]}"
+
+    def _encode_one(self, entry: dict) -> None:
+        """Encode a single new entry and append to the embeddings array."""
+        if self._encoder is None:
+            return
+        import numpy as np
+        try:
+            vec = self._encoder.encode([self._text(entry)], show_progress_bar=False)[0]
+            if self._embeddings is None:
+                self._embeddings = vec.reshape(1, -1)
+            else:
+                self._embeddings = np.vstack([self._embeddings, vec])
+        except Exception as exc:
+            logger.warning("Embedding encode failed (%s)", exc)
+
     def _rebuild_embeddings(self) -> None:
+        """Full rebuild — only called on startup when loading existing entries."""
         if self._encoder is None or not self._entries:
             return
         import numpy as np
-        texts = [f"{e.get('summary', '')} {e.get('content', '')[:300]}" for e in self._entries]
+        texts = [self._text(e) for e in self._entries]
         try:
             self._embeddings = self._encoder.encode(texts, show_progress_bar=False, batch_size=64)
         except Exception as exc:
@@ -131,7 +152,7 @@ class ArtifactStore:
         import numpy as np
         pool_ids = {e["id"] for e in pool}
         indices = [i for i, e in enumerate(self._entries) if e["id"] in pool_ids]
-        if not indices:
+        if not indices or self._embeddings is None:
             return []
         q_emb = self._encoder.encode([query], show_progress_bar=False)[0]
         sub = self._embeddings[indices]

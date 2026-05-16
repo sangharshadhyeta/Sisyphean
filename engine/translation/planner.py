@@ -510,9 +510,10 @@ ROUTING RULES — apply in this order:
 4. steps="Search KEYWORDS" only for information that changes day to day: current events,
    live prices, today's weather, latest software releases, recent news.
 
-5. For live system state or filesystem operations, describe what to run as the step goal.
-   If the right command depends on the OS (e.g. hardware info, process list, network state),
-   prepend a "check OS" step so the executor can pick the correct command.
+5. For live system state (CPU, memory, disk, processes, hardware info, system status):
+   steps="Run python -c \"import platform,subprocess; r=subprocess.run('systeminfo' if platform.system()=='Windows' else 'uname -a && free -h && df -h',shell=True,capture_output=True,text=True); print(r.stdout[:3000] or r.stderr[:500])\""
+   This single step auto-detects the OS and runs the right command.
+   NEVER use WebSearch for system status — run a command instead.
 
 6. steps="Write FILENAME" when the user asks to create or generate a file.
 

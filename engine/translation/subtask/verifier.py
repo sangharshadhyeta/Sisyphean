@@ -125,25 +125,18 @@ def run(manifest: SubtaskManifest, file_content: str) -> SubtaskDiff:
 
         if stub or current_chars < item.expected_min_chars:
             prev_complete = item.status == "complete"
-            prev_chars = item.actual_chars
             item.is_stub = stub
             item.mark_partial(body)
-            if prev_complete and prev_chars > 0 and current_chars < prev_chars * 0.8:
+            if prev_complete:
+                # Was complete before, now drops below threshold → genuine regression
                 item.status = "regressed"
                 diff.regressed.append(item)
             else:
                 diff.partial.append(item)
             continue
 
-        prev_chars = item.actual_chars
-        prev_hash = item.content_hash
         item.mark_complete(body)
-
-        if prev_hash and prev_chars > 0 and current_chars < prev_chars * 0.8:
-            item.status = "regressed"
-            diff.regressed.append(item)
-        else:
-            diff.complete.append(item)
+        diff.complete.append(item)
 
     diff.seam_index = next(
         (it.index for it in manifest.items if it.status != "complete"),

@@ -1862,7 +1862,7 @@ class Pipeline:
             # DDG / SearXNG tiers return short snippets (≤500 chars) that are
             # often too thin for the model to act on. Fetch the top pages to give
             # the same deep-content behaviour BirdClaw's web_fetch tool provided.
-            if raw and not any(getattr(r, "is_ai_synthesized", False) for r in raw):
+            if raw:
                 fetched_parts: list[str] = []
                 for r in raw[:3]:
                     url = getattr(r, "url", "") or ""

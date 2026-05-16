@@ -366,6 +366,7 @@ Output only the JSON — no explanation."""
 
 # Sisyphean's own internal tools — always available regardless of harness
 _INTERNAL_TOOLS = [
+    ("direct",        "answer directly without any tool call — use for greetings, thanks, simple chat, capability questions"),
     ("web_search",    "search the web for any factual or current information"),
     ("save_memory",   "save a user preference or important fact for later recall"),
     ("search_memory", "look up previously saved facts or research"),
@@ -374,7 +375,7 @@ _INTERNAL_TOOL_NAMES = frozenset(t[0] for t in _INTERNAL_TOOLS)
 
 
 def _build_plan_system(outer_tools: list[dict]) -> str:
-    """Build the Stage 2 system prompt from harness-provided tools + internal tools."""
+    """Build the plan system prompt from harness-provided tools + internal tools."""
     lines = ["Pick the right tool and write its exact input. Use pipe | to chain steps.\n"]
     lines.append("Available tools:")
     for t in outer_tools:
@@ -386,15 +387,12 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         lines.append(f"  {name} — {desc}")
     lines += [
         "",
+        "Use 'direct' for: hi, hello, thanks, what can you do, are you alive, simple social exchanges.",
         "Use web_search for any factual question worth knowing — current or timeless.",
-        "Searching builds the knowledge graph so facts are recalled instantly next time.",
-        "Skip web_search only for: pure math/computation, greetings, memory saves, local file tasks.",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
         "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then save_memory).",
         "Complex multi-part tasks MUST use 3+ steps — use pipe-separated steps for each action.",
-        "For write/create file tasks: bash input must be a SHORT description only — NEVER embed actual code.",
-        'For greetings, thanks, or social messages output: {"steps": ""}',
         'Single step: {"steps": "toolname:input"}',
         'Multiple steps: {"steps": "toolname:input | toolname:input | toolname:input"}',
     ]

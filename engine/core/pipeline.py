@@ -756,6 +756,14 @@ class Pipeline:
                     tool = "webfetch"
                     step["tool"] = "webfetch"
 
+                # ── direct — skip all steps, synthesizer answers from query ──
+                # Used for greetings, thanks, simple questions where no tool
+                # call is needed. Break out of both step and task loops.
+                if tool == "direct":
+                    logger.info("pipeline: direct step → skipping to synthesizer")
+                    state.current_step_idx = len(steps)   # exhaust steps
+                    break
+
                 # ── write_plan — start the incremental write pipeline ─────────
                 # Not an outer tool; handled entirely inside Sisyphean.
                 # Runs the subtask planner to get items, then yields to _execute

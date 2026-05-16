@@ -850,6 +850,102 @@ async def split(query: str, client) -> list[str]:
     return [query]
 
 
+_THINK_DECOMPOSE_SYSTEM = """\
+You are a task planner. Think carefully, then output a structured plan.
+
+Output ONE JSON object:
+{"outcome": "one-sentence success criteria",
+ "steps": "stage1 | stage2 | stage3"}
+
+Steps are pipe-separated plain-English actions. Scale to complexity:
+- 0 steps: pure social exchanges (hi, thanks, ok, bye)
+- 1 step:  single-action tasks (math, factual question, run a command)
+- 2-3 steps: research-then-answer, write-then-run
+- 3-5 steps: multi-part tasks (search + write lib + write tests + run)
+
+Use clear action verbs: Search, Write, Run, Read, Edit, Summarise.
+Name the output file explicitly in Write steps: "Write hasher.py using hashlib.md5".
+Name the run command in Run steps: "Run python hasher.py and check output".
+"""
+
+
+async def think_decompose(
+    query: str,
+    client,
+    context: str = "",
+    soul_section: str = "",
+) -> tuple[str, list[dict]]:
+    """One thinking-enabled planning call that decomposes the task into stages.
+
+    This is the FIRST call in the pipeline — it happens before any execution.
+    Returns (outcome, stages) where stages is:
+      [{"type": str, "goal": str}, ...]
+
+    Stage types map to how they are executed:
+      direct     → synthesizer answers directly (no tool call)
+      research   → web_search
+      write_code → write_plan (subtask pipeline)
+      write_doc  → write_plan (doc variant)
+      verify     → bash
+      edit       → plan_task (complex, keeps LLM routing)
+
+    Uses thinking=True so the model reasons through dependencies and ordering
+    before committing to a step list. This makes PIPELINE_STATE accurate from
+    the first API turn — the test harness (and BirdClaw) can read the full
+    plan before execution begins.
+    """
+    # Fast pre-checks — skip the LLM for trivially simple inputs
+    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query):
+        return query[:80], [{"type": "direct", "goal": query}]
+    m = _REMEMBER_RE.match(query)
+    if m:
+        return query[:80], [{"type": "direct", "goal": query}]
+
+    prompt = f"Task: {query[:300]}"
+    if context:
+        prompt += f"\nContext:\n{context[:300]}"
+    if soul_section:
+        prompt += f"\nPersonality guidance:\n{soul_section[:150]}"
+
+    try:
+        result = await client.generate(
+            [
+                {"role": "system", "content": _THINK_DECOMPOSE_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=300,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            stream=False,
+            thinking=True,          # ← reasoned planning, not just pattern matching
+        )
+        raw  = result["choices"][0]["message"]["content"].strip()
+        data = parse_format_response(raw)
+        if not data:
+            return query[:80], []
+
+        outcome   = (data.get("outcome") or query[:80]).strip()
+        steps_raw = (data.get("steps") or "").strip()
+
+        if isinstance(steps_raw, list):
+            plain_steps = [s.strip() for s in steps_raw if str(s).strip()]
+        else:
+            plain_steps = [s.strip() for s in str(steps_raw).split("|") if s.strip()]
+
+        stages: list[dict] = []
+        for step in plain_steps:
+            stype = infer_stage_type(step)
+            stages.append({"type": stype, "goal": step})
+
+        logger.info("think_decompose: outcome=%r stages=%s",
+                    outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
+        return outcome, stages
+
+    except Exception as exc:
+        logger.warning("think_decompose failed: %s", exc)
+        return query[:80], []
+
+
 _CODE_GEN_SYSTEM = """\
 Write only the code — no explanation, no markdown fences, no comments.
 Keep it concise: minimal imports, no docstrings, no unittest boilerplate.

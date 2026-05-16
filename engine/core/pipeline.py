@@ -25,7 +25,7 @@ from pathlib import Path
 from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
-from engine.translation.planner import split_deep, plan_task, parse_format_response
+from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response
 from engine.translation.web_search import search as _web_search, format_results
 import engine.task_tracker as _tracker
 from engine.activity import log_event as _log
@@ -367,15 +367,37 @@ class Pipeline:
         top_quality  = "relevant" if len(top_context.split()) > 10 else ("minimal" if top_context else "none")
         _tracker.tree_context_done(task_id, f"top-level extract: {top_quality}")
 
-        # ── Stage 2: Split — informed by extracted context ────────────────────
-        tasks = await split_deep(query, self.client)
-        logger.info("pipeline: %d task(s): %s", len(tasks), tasks)
+        # ── Stage 2: Think-first decomposition (thinking=True) ───────────────
+        # One planning-only LLM call that reasons about the task before any
+        # execution begins. Returns (outcome, stages) where each stage has a
+        # type (research/write_code/verify/direct/…) and a plain-English goal.
+        # This sets PIPELINE_STATE accurately from the very first API turn —
+        # the full plan is visible before execution starts, matching BirdClaw's
+        # generate_plan() → stage-queue approach.
+        _tracker.tree_context_running(task_id, "think-decompose")
+        outcome, stages = await think_decompose(
+            query, self.client,
+            context=top_context,
+            soul_section=soul_section,
+        )
+        _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
+        logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
+                    [(s["type"], s["goal"][:40]) for s in stages])
+
+        # Fall back to the query as a single task if decomposition returned nothing.
+        if not stages:
+            stages = [{"type": infer_stage_type(query), "goal": query}]
+
+        # Map stages back to the task list that plan_task expects.
+        # Each stage goal becomes the sub-task text; infer_stage_type already
+        # annotated the type which pipeline uses for tool selection below.
+        tasks = [s["goal"] for s in stages]
 
         # ── Stage 3: Per-task context extraction + planning ───────────────────
         sub_tasks: list[dict] = []
         all_extracted: list[str] = []
 
-        for task in tasks:
+        for task, stage in zip(tasks, stages):
             # Re-extract focused on this specific sub-task (bigram Jaccard, no LLM).
             # Gives each sub-task a focused slice of history rather than the
             # top-level extract which may include irrelevant exchanges.
@@ -409,26 +431,32 @@ class Pipeline:
             logger.info("pipeline: task=%r filtered_tools=%s", task[:60], filtered_names)
 
             # ── Planning stage ────────────────────────────────────────────────
-            steps = await plan_task(task, relevant_tools or available_tools, self.client,
-                                    context=task_ctx,
-                                    soul_section=soul_section,
-                                    user_prefs=user_prefs)
+            # Stage type from think_decompose guides tool selection so plan_task
+            # can skip the LLM for well-understood stage types.
+            stage_type = stage.get("type", "")
+
+            # For "direct" stages (social messages, trivial answers) skip planning.
+            if stage_type == "direct":
+                steps = []
+            else:
+                steps = await plan_task(task, relevant_tools or available_tools, self.client,
+                                        context=task_ctx,
+                                        soul_section=soul_section,
+                                        user_prefs=user_prefs)
 
             # ── Websearch fallback — if plan is empty and no graph recall ──────
-            # The model produced no steps (common on small models for factual
-            # questions). Rather than letting the synthesizer hallucinate from
-            # stale training data, default to a web search so the answer is
-            # grounded in real results. Graph recall hitting means we already
-            # have fresh data — no need to search again.
-            if not steps and not graph_recall:
+            if not steps and stage_type == "research" and not graph_recall:
                 ws_tool = "websearch" if any(
                     t.get("name", "").lower() == "websearch"
                     for t in (relevant_tools or available_tools)
                 ) else "web_search"
                 steps = [{"tool": ws_tool, "input": task}]
                 logger.info("pipeline: empty plan → websearch fallback for %r", task[:60])
+            elif not steps and stage_type not in ("direct",) and not graph_recall:
+                # Non-research stage with no plan — let synthesizer handle it
+                logger.info("pipeline: empty plan for %s stage %r", stage_type, task[:60])
 
-            sub_tasks.append({"task": task, "steps": steps})
+            sub_tasks.append({"task": task, "type": stage_type, "steps": steps})
             steps_preview = " → ".join(f"[{s['tool']}] {s['input'][:30]}" for s in steps[:4])
             logger.info("pipeline: task=%r steps=%s", task[:60],
                         [(s["tool"], s["input"][:40]) for s in steps])

@@ -4,6 +4,10 @@ A local AI agent engine that runs as a background service. It exposes both the A
 
 Sisyphean is the **engine** — stateless, reasoning-focused, no personality. Pair it with [BirdClaw](https://github.com/sangharshadhyeta/BirdClaw) for a full autonomous agent with soul, dreaming, and a persistent web UI.
 
+### Status
+
+Early-stage, working prototype. Core loop, memory, and API compat are functional. Several known rough edges documented in [Known Limitations](#known-limitations). Not yet production-ready — designed for personal use and local experimentation.
+
 ---
 
 ## Quick Start
@@ -241,8 +245,8 @@ python tests/test_regimen.py
 python tests/test_api.py
 python tests/test_openclaw.py
 
-# Note: tests hardcode port 8000 — update BASE_URL or temporarily change
-# config.yaml api.port to 8000 before running.
+# Tests expect the engine on port 47291 (default). If you changed api.port,
+# update BASE_URL at the top of each test file to match.
 ```
 
 ---
@@ -263,11 +267,38 @@ The planning prompt uses **rules only** (no hardcoded examples):
 
 ---
 
+## Known Limitations
+
+These are real issues in the current codebase, documented honestly:
+
+**Token counting is approximate.** `ContextManager` falls back to `len(text) // 4` when the backend doesn't expose a `/tokenize` endpoint. For models like Qwen or Gemma the real ratio can be 3–3.5 chars/token, meaning the sliding window may overflow or over-compress. This affects context reliability on long sessions.
+
+**Knowledge graph has race conditions.** `graph.py` uses atomic file writes but no `asyncio.Lock` on in-memory state. Two concurrent tasks can both read, modify, and write — last write wins and one set of facts is silently lost. Low risk in single-user local use; real risk if parallel tasks are enabled.
+
+**Embedding store rebuilds from scratch on every insert.** `ArtifactStore._rebuild_embeddings()` re-encodes the entire corpus each time a new artifact is saved. Performance degrades linearly as the store grows.
+
+**Streaming is untested.** The SSE streaming path in `anthropic.py` is implemented but has no test coverage. Mid-stream disconnection, delta JSON errors, and connection drops in streaming mode are unvalidated.
+
+**Graph corruption is silent data loss.** If `knowledge_graph.json` is corrupted (partial write, disk full), `KnowledgeGraph._load()` logs "starting fresh" and discards all stored knowledge. No backup file is attempted. The `GraphStore` layer does check a `.bak` file; `KnowledgeGraph` does not.
+
+**`executor.py` is 1000+ lines.** The single `decide()` function handles multi-turn context building, JSON parsing, retry logic, and tool mapping. No class boundary. Difficult to test in isolation.
+
+**No input validation on `max_tokens`.** The API accepts arbitrarily large values (1M+) without bounds checking.
+
+**Subtask regression detection can false-positive.** `verifier.py` compares char counts against a snapshot; across multiple retries of the same item, a growing partial implementation can be flagged as regression.
+
+---
+
 ## Roadmap
 
 - [x] Switch to llama.cpp + gemma4 (configurable via `external_api` in config.yaml)
 - [x] Math/computation routed through Bash for verifiable results
 - [x] `save_memory` stage persists facts and preferences to the knowledge graph
+- [ ] Fix token counting — use real tokenizer or `/tokenize` endpoint
+- [ ] Add `asyncio.Lock` to knowledge graph mutations
+- [ ] Incremental embedding updates (don't rebuild full corpus on each insert)
+- [ ] Streaming test coverage
+- [ ] `max_tokens` bounds validation
 - [ ] Telegram / Discord channel adapters
 - [ ] PC control (screenshot, mouse/keyboard) via BirdClaw tool bridge
 - [ ] Self-modification (agent edits own source, runs tests, commits)

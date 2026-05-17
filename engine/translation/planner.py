@@ -564,6 +564,7 @@ steps="" for: greetings, thanks, social replies, capability questions,
 
 steps="Run python -c 'print(EXPRESSION)'" for ALL arithmetic.
   Write the Python EXPRESSION, not the pre-computed answer.
+  Use only built-in operators — no imports (math, etc.) in -c mode.
   Example: "square root of 144" → Run python -c 'print(144**0.5)'
   Example: "15 times 7" → Run python -c 'print(15*7)'
   Example: "2+2" → Run python -c 'print(2+2)'

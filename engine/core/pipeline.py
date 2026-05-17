@@ -428,29 +428,7 @@ class Pipeline:
         if not stages:
             stages = [{"type": infer_stage_type(query), "goal": query}]
 
-        # Hard guard: greetings/acks are always direct — the small model sometimes
-        # routes "hi" to Run echo 'hi' or "thanks" to a web search.
-        _DIRECT_WORDS = frozenset({
-            "hi", "hello", "hey", "thanks", "thank", "thankyou", "ok", "okay",
-            "sure", "bye", "goodbye", "yes", "no", "yep", "nope",
-        })
-        _q_lower = query.strip().lower()
-        _q_bare  = _q_lower.rstrip("!.,?")
-        if _q_bare in _DIRECT_WORDS:
-            stages = [{"type": "direct", "goal": query}]
-        elif re.match(
-            r"^(thanks?\b|thank you\b|ty\b|thx\b|cheers\b|cool\b|great\b|nice\b|good\b|got it\b|sounds good\b)",
-            _q_lower,
-        ):
-            stages = [{"type": "direct", "goal": query}]
-        elif re.match(
-            # Pure arithmetic expression — always compute, never answer from memory.
-            # Catches: "2+2", "3 * 4", "100 / 7", "(1+2)*3", "2**10"
-            r"^[\d\s\.\+\-\*\/\%\^\(\)]+$",
-            _q_bare,
-        ) and any(c in _q_bare for c in "+-*/^%"):
-            safe_expr = _q_bare.strip()
-            stages = [{"type": "verify", "goal": f"python -c 'print({safe_expr})'"}]
+        # No hardcoded routing overrides — think_decompose() owns all routing decisions.
 
         # Map stages back to the task list that plan_task expects.
         # Each stage goal becomes the sub-task text; infer_stage_type already

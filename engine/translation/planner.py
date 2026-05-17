@@ -367,11 +367,14 @@ If NO — a single search covers both, or both parts are independent:
 Output only the JSON — no explanation."""
 
 # Sisyphean's own internal tools — always available regardless of harness
+# save_memory is intentionally excluded: it is a routing decision made by
+# think_decompose() when the user explicitly asks to save something, NOT a
+# step the planner should suggest — small models otherwise emit save_memory
+# for tasks that should run bash.
 _INTERNAL_TOOLS = [
     ("direct",        "answer directly without any tool call — use for greetings, thanks, simple chat, capability questions"),
     ("web_search",    "search the web for any factual or current information"),
-    ("save_memory",   "save a user preference or important fact for later recall"),
-    ("search_memory", "look up previously saved facts or research"),
+    ("search_memory", "look up previously saved facts or research from past sessions"),
 ]
 _INTERNAL_TOOL_NAMES = frozenset(t[0] for t in _INTERNAL_TOOLS)
 
@@ -496,12 +499,29 @@ Do not explain. Do not pick a different tool. Output the command string only.
 """
 
 
+_CONCRETE_CMD_RE = re.compile(
+    r"^(python\d*|pip\d*|node|npm|npx|go|cargo|make|cmake|gcc|g\+\+|"
+    r"powershell|pwsh|cmd|bash|sh|zsh|Get-|Set-|New-|Remove-|"
+    r"git|docker|kubectl|curl|wget|ls|dir|cd|mkdir|rm|cp|mv|cat|echo|"
+    r"systeminfo|ipconfig|ifconfig|ps|top|htop|nvidia-smi|wmic|tasklist|"
+    r"pytest|unittest|coverage|mypy|ruff|black|flake8)\b",
+    re.IGNORECASE,
+)
+
+
 async def resolve_bash_command(goal: str, client, context: str = "") -> str:
     """Ask the model what bash command to run for a verify-stage goal.
 
     Returns the command string, or empty string on failure.
     The tool selection has already been made (bash) — this only resolves WHAT to run.
+    Short-circuits without an LLM call when the goal is already a concrete command.
     """
+    # Goal is already a runnable command — no LLM call needed.
+    goal_stripped = goal.strip()
+    if _CONCRETE_CMD_RE.match(goal_stripped):
+        logger.debug("resolve_bash_command: goal IS the command — skipping LLM: %s", goal_stripped[:80])
+        return goal_stripped
+
     prompt = f"Goal: {goal}"
     if context:
         prompt += f"\nContext: {context[:300]}"
@@ -526,35 +546,34 @@ async def resolve_bash_command(goal: str, client, context: str = "") -> str:
 
 
 _THINK_DECOMPOSE_SYSTEM = """\
-You are a task planner. Output ONLY a JSON object with this exact shape:
-{"outcome": "one-sentence success criteria", "steps": ""}
+You are a task planner. Output ONLY a JSON object:
+{"outcome": "one-sentence success criteria", "steps": "..."}
 
-ROUTING RULES — apply in this order:
+ROUTING — apply rules in order, stop at first match:
 
-1. steps="" for greetings, social chat, acknowledgements, opinions, capability questions,
-   and general knowledge (geography, history, science, definitions) you already know.
-   The words hi, hello, hey, thanks, ok, bye, sure are ALWAYS steps="" — never a Run step.
-   NEVER route a factual question to save_memory — knowing the answer is not the same as
-   the user asking you to remember it.
+RULE 1 — steps="" (answer directly, no tool) for:
+  - Greetings: hi, hello, hey, thanks, ok, bye, sure, you're welcome, got it
+  - Social replies: "sounds good", "great", "nice work", "cheers", "cool"
+  - Opinions or preferences (favourite, best, recommend)
+  - General knowledge you already know: capitals, history, definitions, famous people
+  - Capability questions: what can you do, are you alive, do you know X
 
-2. steps="Save: <verbatim fact>" ONLY when the user explicitly says remember/note/save/
-   keep-in-mind/store. The word "remember" or "save" must be in the user's message.
-   Put the exact fact after "Save: " — nothing else on this step.
+RULE 2 — steps="Save: <fact>" ONLY when the user's message contains "remember",
+  "note that", "save", "keep in mind", or "store". Never use Save for anything else.
 
-3. steps="Run python -c \"print(expr)\"" for any arithmetic or mathematical calculation.
-   Always run the computation — never answer from memory.
+RULE 3 — steps="Search KEYWORDS" ONLY for live/current information: today's news,
+  live prices, current weather, latest releases. DO NOT use Search for static facts
+  you already know, and NEVER use Search for greetings or thanks.
 
-4. steps="Search KEYWORDS" only for information that changes day to day: current events,
-   live prices, today's weather, latest software releases, recent news.
+RULE 4 — steps="Run COMMAND" for:
+  - Live system state: CPU, memory, disk, GPU, processes, network, uptime
+  - Running or testing code files
+  - Installing packages
+  Write the exact shell command as the step text.
 
-5. For live system state (CPU, memory, disk, processes, hardware info, system status):
-   write a Run step that uses Python's platform module to detect the OS and execute
-   the appropriate shell command for that platform.
-   NEVER use WebSearch for live system queries — always run a command.
+RULE 5 — steps="Write FILENAME" when the user explicitly asks to create a file.
 
-6. steps="Write FILENAME" when the user asks to create or generate a file.
-
-7. Use pipe-separated steps for multi-part tasks: "step1 | step2 | step3"
+RULE 6 — pipe-separate multi-step tasks: "step1 | step2 | step3"
 """
 
 

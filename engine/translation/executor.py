@@ -218,7 +218,7 @@ async def decide(
                 "role": "user",
                 "content": (
                     "Your previous answer was empty. Provide a real response now.\n"
-                    + action_prompt
+                    + _action_prompt
                 ),
             }]
             r_fill = await client.generate(

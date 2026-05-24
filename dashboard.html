@@ -621,6 +621,47 @@ function ActivityPanel({ events }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY GRAPH PANE  (header + graph, reused in split and full-width modes)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function MemoryGraphPane({ graph, h, splitMode }) {
+  const containerRef = useRef(null);
+  const [width, setWidth] = useState(splitMode
+    ? Math.floor((window.innerWidth - 80) / 2)
+    : Math.max(600, window.innerWidth - 80));
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(entries => {
+      for (const e of entries) setWidth(Math.max(200, e.contentRect.width));
+    });
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  return (
+    <div className={splitMode ? 'flex flex-col' : 'flex flex-col'} style={{ height: h }}>
+      <div className="px-4 py-2 border-b border-slate-800/40 flex items-center justify-between">
+        <span className="text-slate-500 text-xs uppercase tracking-widest">
+          Memory Graph
+        </span>
+        <span className="text-slate-700 text-xs font-mono">
+          {graph.nodes.length} nodes · {graph.edges.length} edges
+        </span>
+      </div>
+      <div ref={containerRef} style={{ flex:1, overflow:'hidden', position:'relative' }}>
+        <MemoryGraph
+          nodes={graph.nodes}
+          edges={graph.edges}
+          w={width}
+          h={h - 40}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -717,11 +758,11 @@ function App() {
           </div>
 
           {/* ── Active task: flowchart + memory graph ──────────────── */}
-          {running && (
+          {running ? (
             <div>
               <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Active task</div>
               <div ref={paneRef} className="card overflow-hidden"
-                   style={{ display:'grid', gridTemplateColumns:'1fr 1fr', minHeight:400 }}>
+                   style={{ display:'grid', gridTemplateColumns:'1fr 1fr', minHeight:420 }}>
 
                 {/* Left — flowchart */}
                 <div className="border-r border-slate-800/60 flex flex-col"
@@ -740,22 +781,18 @@ function App() {
                   </div>
                 </div>
 
-                {/* Right — memory graph */}
-                <div className="flex flex-col" style={{ height: paneH }}>
-                  <div className="px-4 py-2 border-b border-slate-800/40">
-                    <span className="text-slate-500 text-xs uppercase tracking-widest">
-                      Memory Graph · {graph.nodes.length} nodes
-                    </span>
-                  </div>
-                  <div style={{ flex:1, overflow:'hidden', position:'relative' }}>
-                    <MemoryGraph
-                      nodes={graph.nodes}
-                      edges={graph.edges}
-                      w={Math.floor((window.innerWidth - 80) / 2) || 500}
-                      h={paneH - 40}
-                    />
-                  </div>
-                </div>
+                {/* Right — memory graph (live, always fetched) */}
+                <MemoryGraphPane graph={graph} h={paneH} splitMode />
+              </div>
+            </div>
+          ) : (
+            /* ── Memory graph (full-width when idle) ───────────────── */
+            <div>
+              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
+                Memory Graph
+              </div>
+              <div ref={paneRef} className="card overflow-hidden">
+                <MemoryGraphPane graph={graph} h={Math.max(420, paneH)} splitMode={false} />
               </div>
             </div>
           )}

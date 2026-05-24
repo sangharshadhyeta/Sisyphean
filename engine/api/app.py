@@ -340,27 +340,39 @@ def create_app(config: Config) -> FastAPI:
         Each edge: {source, target}
         """
         all_n = graph.all_nodes()
-        # Sort by recency, cap at 120
-        sorted_n = sorted(all_n, key=lambda n: n.get("last_seen", 0), reverse=True)[:120]
-        id_set = {n.get("name", n.get("label", "")) for n in sorted_n}
+        # Sort by recency (last_seen is a float unix timestamp from upsert_node),
+        # fall back to created_at string, cap at 120
+        def _sort_ts(n: dict) -> float:
+            v = n.get("last_seen", 0)
+            if isinstance(v, str):
+                try:
+                    from datetime import datetime, timezone as _tz
+                    return datetime.fromisoformat(v).timestamp()
+                except Exception:
+                    return 0.0
+            return float(v) if v else 0.0
+
+        sorted_n = sorted(all_n, key=_sort_ts, reverse=True)[:120]
+        # "key" field is the graph node key (= name.lower().strip())
+        key_set = {n.get("key", "") for n in sorted_n}
 
         nodes = [
             {
-                "id":      n.get("name") or n.get("label", "?"),
-                "label":   (n.get("name") or n.get("label", "?"))[:32],
+                "id":      n.get("key", n.get("name", "?")),
+                "label":   (n.get("name") or n.get("label", n.get("key", "?")))[:32],
                 "type":    n.get("type", "fact"),
                 "summary": (n.get("summary") or n.get("content", ""))[:120],
-                "ts":      n.get("last_seen", 0),
+                "ts":      _sort_ts(n),
             }
             for n in sorted_n
         ]
 
-        # Edges from the graph's adjacency — only include edges where both
-        # endpoints are in our capped node set.
+        # Edges from the graph's adjacency (GraphStore uses _graph, not _g).
+        # Only include edges where both endpoints are in our capped node set.
         edges = []
         try:
-            for src, dst in graph._g.edges():
-                if src in id_set and dst in id_set:
+            for src, dst in graph._graph.edges():
+                if src in key_set and dst in key_set:
                     edges.append({"source": src, "target": dst})
         except Exception:
             pass

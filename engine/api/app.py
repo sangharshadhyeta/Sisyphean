@@ -329,6 +329,44 @@ def create_app(config: Config) -> FastAPI:
             "recent": recent_events(30),
         }
 
+    # ── Memory graph API ─────────────────────────────────────────────────────
+
+    @app.get("/api/graph", tags=["info"])
+    async def api_graph():
+        """Return a lightweight snapshot of the knowledge graph for visualisation.
+
+        Returns up to 120 most-recently-updated nodes and their edges.
+        Each node: {id, label, type, summary}
+        Each edge: {source, target}
+        """
+        all_n = graph.all_nodes()
+        # Sort by recency, cap at 120
+        sorted_n = sorted(all_n, key=lambda n: n.get("last_seen", 0), reverse=True)[:120]
+        id_set = {n.get("name", n.get("label", "")) for n in sorted_n}
+
+        nodes = [
+            {
+                "id":      n.get("name") or n.get("label", "?"),
+                "label":   (n.get("name") or n.get("label", "?"))[:32],
+                "type":    n.get("type", "fact"),
+                "summary": (n.get("summary") or n.get("content", ""))[:120],
+                "ts":      n.get("last_seen", 0),
+            }
+            for n in sorted_n
+        ]
+
+        # Edges from the graph's adjacency — only include edges where both
+        # endpoints are in our capped node set.
+        edges = []
+        try:
+            for src, dst in graph._g.edges():
+                if src in id_set and dst in id_set:
+                    edges.append({"source": src, "target": dst})
+        except Exception:
+            pass
+
+        return {"nodes": nodes, "edges": edges[:300]}
+
     # ── Task flowchart API ───────────────────────────────────────────────────
 
     @app.get("/api/tasks", tags=["info"])

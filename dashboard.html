@@ -18,48 +18,49 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <style>
-    body { background: #0f1117; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; }
+    * { box-sizing: border-box; }
+    body { background: #0a0c14; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; margin: 0; }
     .dot-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-    .card { background: #1a1d2e; border: 1px solid #2d3148; }
+    .card { background: #12152a; border: 1px solid #1e2235; border-radius: 12px; }
     .stat-val { font-size: 2rem; font-weight: 600; line-height: 1; }
     .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:.7rem; font-weight:600; }
     /* Status dots */
-    .status-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; display:inline-block; }
-    .dot-pending  { background:#4b5563; }
+    .status-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; display:inline-block; }
+    .dot-pending  { background:#374151; }
     .dot-running  { background:#22c55e; animation:pulse 1.2s ease-in-out infinite; }
-    .dot-done     { background:#3b82f6; }
+    .dot-done     { background:#6366f1; }
     .dot-failed   { background:#ef4444; }
-    /* Tree */
-    .tree-node { border-radius:7px; border:1.5px solid #2d3148; background:#12152a;
-                 padding:8px 11px; cursor:pointer; transition:border-color .18s; }
-    .tree-node:hover { border-color:#6366f1; }
-    .tree-node.selected { border-color:#6366f1; }
-    .tree-node.status-running { border-color:#22c55e55; }
-    .tree-node.status-done    { border-color:#3b82f655; }
-    .tree-node.status-failed  { border-color:#ef444455; }
-    .tree-indent { margin-left:18px; border-left:1px solid #2d3148; padding-left:10px; }
-    .detail-panel { background:#0d0f1c; border:1px solid #6366f1; border-radius:7px;
-                    padding:10px 12px; font-size:.7rem; font-family:monospace;
-                    color:#cbd5e1; white-space:pre-wrap; word-break:break-word; }
-    .type-badge { font-size:.6rem; padding:1px 5px; border-radius:3px; background:#1e2235; color:#94a3b8; }
-    .chevron { transition:transform .15s; display:inline-block; color:#64748b; margin-right:4px; }
-    .chevron.open { transform:rotate(90deg); }
+    /* Scrollbars */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 4px; }
+    /* Flowchart node */
+    .fc-node { cursor: pointer; }
+    .fc-node rect { transition: filter .15s; }
+    .fc-node:hover rect { filter: brightness(1.3); }
+    /* Memory graph */
+    .mg-node { cursor: pointer; }
+    .mg-node circle { transition: r .15s; }
+    .mg-node:hover circle { r: 7; }
+    /* Activity row */
+    .ev-row { border-bottom: 1px solid #1a1d2e; }
+    .ev-row:last-child { border-bottom: none; }
   </style>
 </head>
-<body class="min-h-screen p-6">
+<body class="min-h-screen">
 <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
+// ── Helpers ────────────────────────────────────────────────────────────────────
 function formatUptime(s) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
   return `${h}h ${m}m`;
 }
-
 function timeAgo(ts) {
   const d = Math.round(Date.now()/1000 - ts);
   if (d < 5) return 'just now';
@@ -67,464 +68,510 @@ function timeAgo(ts) {
   if (d < 3600) return `${Math.floor(d/60)}m ago`;
   return `${Math.floor(d/3600)}h ago`;
 }
-
-function StatCard({ label, value, sub, color = 'text-emerald-400' }) {
-  return (
-    <div className="card rounded-xl p-5 flex flex-col gap-1">
-      <span className="text-slate-400 text-xs uppercase tracking-widest">{label}</span>
-      <span className={`stat-val ${color}`}>{value}</span>
-      {sub && <span className="text-slate-500 text-xs">{sub}</span>}
-    </div>
-  );
+function elapsedFmt(ms) {
+  if (!ms) return '';
+  return ms >= 1000 ? `${(ms/1000).toFixed(1)}s` : `${ms}ms`;
 }
 
+// ── Tool / type colours ────────────────────────────────────────────────────────
+const TOOL_COLOR = {
+  web_search:'#06b6d4', websearch:'#06b6d4', webfetch:'#0891b2',
+  search_memory:'#0ea5e9', search_knowledge:'#0ea5e9', search_soul:'#8b5cf6',
+  save_memory:'#ec4899', remember:'#ec4899',
+  answer:'#a855f7', synthesize:'#34d399',
+  bash:'#eab308', write:'#7c3aed', write_plan:'#6d28d9',
+  read:'#10b981', glob:'#34d399', grep:'#6ee7b7', edit:'#f59e0b',
+  plan:'#818cf8', planner:'#818cf8',
+  default:'#475569',
+};
+function tc(t){ return TOOL_COLOR[(t||'').toLowerCase()] || TOOL_COLOR.default; }
+
+const NODE_TYPE_COLOR = {
+  soul:'#a78bfa', policy:'#a78bfa', user:'#34d399', project:'#f59e0b',
+  fact:'#60a5fa', concept:'#38bdf8', entity:'#818cf8', skill:'#f472b6',
+  system:'#94a3b8', session:'#64748b', preference:'#a3e635',
+};
+function ntc(t){ return NODE_TYPE_COLOR[t] || '#475569'; }
+
+// ── Status badge ───────────────────────────────────────────────────────────────
 function StatusBadge({ running, mock, llmReady }) {
-  if (!running) return (
-    <span className="tag bg-red-900 text-red-300">Offline</span>
-  );
-  if (mock) return (
-    <span className="tag bg-yellow-900 text-yellow-300">Mock mode</span>
-  );
+  if (!running) return <span className="tag bg-red-900/60 text-red-300">Offline</span>;
+  if (mock)     return <span className="tag bg-yellow-900/60 text-yellow-300">Mock mode</span>;
   if (!llmReady) return (
-    <span className="tag bg-red-900 text-red-300 flex items-center gap-1">
+    <span className="tag bg-red-900/60 text-red-300 flex items-center gap-1">
       <span className="w-2 h-2 rounded-full bg-red-400 inline-block"></span>
-      AI model unavailable
+      Model unavailable
     </span>
   );
   return (
-    <span className="tag bg-emerald-900 text-emerald-300 flex items-center gap-1">
+    <span className="tag bg-emerald-900/60 text-emerald-300 flex items-center gap-1">
       <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse inline-block"></span>
       Running
     </span>
   );
 }
 
-const KIND_STYLE = {
-  tool:   { dot: 'bg-indigo-400',  text: 'text-indigo-300',  label: 'Tool'    },
-  bash:   { dot: 'bg-yellow-400',  text: 'text-yellow-300',  label: 'Bash'    },
-  answer: { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'Answer'  },
-  write:  { dot: 'bg-violet-400',  text: 'text-violet-300',  label: 'Write'   },
-  error:  { dot: 'bg-red-400',     text: 'text-red-300',     label: 'Error'   },
-  stage:  { dot: 'bg-sky-400',     text: 'text-sky-300',     label: 'Stage'   },
-  llm:    { dot: 'bg-amber-400',   text: 'text-amber-300',   label: 'LLM'     },
-  plan:   { dot: 'bg-purple-400',  text: 'text-purple-300',  label: 'Plan'    },
-};
-
-const STAGE_COLORS = {
-  plan:         'text-indigo-400',
-  synthesize:   'text-emerald-400',
-  execute:      'text-green-400',
-  retry:        'text-amber-400',
-  replan:       'text-orange-400',
-};
-
-// ── Pipeline tree ─────────────────────────────────────────────────────────────
-
-const TOOL_COLORS = {
-  web_search:       '#06b6d4',
-  websearch:        '#06b6d4',
-  webfetch:         '#0891b2',
-  search_soul:      '#8b5cf6',
-  search_memory:    '#0ea5e9',
-  search_knowledge: '#0ea5e9',
-  save_memory:      '#ec4899',
-  remember:         '#ec4899',
-  answer:           '#a855f7',
-  bash:             '#eab308',
-  write:            '#7c3aed',
-  write_plan:       '#6d28d9',
-  read:             '#10b981',
-  glob:             '#34d399',
-  grep:             '#6ee7b7',
-  edit:             '#f59e0b',
-  default:          '#64748b',
-};
-function toolColor(t) { return TOOL_COLORS[(t||'').toLowerCase()] || TOOL_COLORS.default; }
-
-function Dot({ status }) {
-  const cls = { pending:'dot-pending', running:'dot-running', done:'dot-done', failed:'dot-failed' }[status] || 'dot-pending';
-  return <span className={`status-dot ${cls}`} />;
-}
-
-function DetailPanel({ node, onClose }) {
-  if (!node) return null;
+// ── Stat card ──────────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub, color = 'text-emerald-400' }) {
   return (
-    <div className="detail-panel mt-2">
-      <div className="flex justify-between items-center mb-2">
-        <span style={{ color: toolColor(node.type || node.id) }}>{node.label || node.type || node.id}</span>
-        <button onClick={onClose} className="text-slate-600 hover:text-slate-300">✕</button>
-      </div>
-      {node.input  && <div className="mb-1"><span className="text-slate-500">▶ in  </span>{node.input}</div>}
-      {node.output && <div><span className="text-slate-500">◀ out </span>{node.output}</div>}
-      {!node.input && !node.output && <span className="text-slate-600 italic">no data yet</span>}
+    <div className="card p-4 flex flex-col gap-1">
+      <span className="text-slate-500 text-xs uppercase tracking-widest">{label}</span>
+      <span className={`stat-val ${color}`}>{value}</span>
+      {sub && <span className="text-slate-600 text-xs">{sub}</span>}
     </div>
   );
 }
 
-// A leaf step row inside a sub-task
-function StepRow({ step, selected, onSelect }) {
-  const isWrite = step.type === 'write' || step.type === 'write_plan';
-  return (
-    <div className={`tree-node mt-1 flex flex-col ${selected ? 'selected' : ''} status-${step.status}`}
-         onClick={e => { e.stopPropagation(); onSelect(); }}>
-      <div className="flex items-center gap-1.5">
-        <Dot status={step.status} />
-        <span className="type-badge" style={{ color: toolColor(step.type) }}>{step.type}</span>
-        {step.input && (
-          <span className="text-slate-400 text-xs truncate" style={{ maxWidth:'220px' }}>
-            {step.input}
-          </span>
-        )}
-        {step.status === 'done' && step.output && isWrite && (
-          <span className="text-slate-600 text-xs ml-auto">{step.output.slice(0,40)}</span>
-        )}
-      </div>
-      {selected && <DetailPanel node={{ ...step, label: step.type }} onClose={onSelect} />}
-    </div>
-  );
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// FLOWCHART  (active task — left pane)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// A sub-task node — collapsible, shows its steps as full stage cards
-function SubTaskNode({ sub, taskIdx, selectedKey, onSelect }) {
-  const [open, setOpen] = useState(sub.status === 'running' || sub.status === 'pending');
+const FC_W = 160, FC_H = 40, FC_GAP_X = 60, FC_GAP_Y = 20, FC_PAD = 24;
 
-  React.useEffect(() => {
-    if (sub.status === 'running') setOpen(true);
-  }, [sub.status]);
+function buildFlowNodes(task) {
+  // Flatten task tree into a list of positioned SVG nodes
+  const nodes = [];
+  const edges = [];
+  let y = FC_PAD;
+  const cx = FC_W / 2 + FC_PAD;
 
-  return (
-    <div className="mt-1">
-      <div className={`tree-node flex items-center gap-1.5 status-${sub.status}`}
-           onClick={e => { e.stopPropagation(); setOpen(o => !o); }}>
-        <span className={`chevron ${open ? 'open' : ''}`}>›</span>
-        <Dot status={sub.status} />
-        <span className="text-slate-300 text-xs truncate flex-1">{sub.text}</span>
-        <span className="text-slate-600 text-xs ml-1">
-          {sub.steps ? sub.steps.length : 0} step{sub.steps && sub.steps.length !== 1 ? 's' : ''}
-        </span>
-      </div>
-      {open && (
-        <div className="tree-indent">
-          {sub.steps && sub.steps.length > 0
-            ? sub.steps.map((step, si) => {
-                const sk = `step-${taskIdx}-${si}`;
-                return (
-                  <SectionNode key={sk} id={sk}
-                    label={step.type}
-                    status={step.status}
-                    input={step.input}
-                    output={step.output}
-                    accentColor={toolColor(step.type)}
-                    selectedKey={selectedKey}
-                    onSelect={onSelect} />
-                );
-              })
-            : sub.status === 'pending' && (
-                <span className="text-slate-600 text-xs italic">waiting…</span>
-              )
-          }
-        </div>
-      )}
-    </div>
-  );
-}
+  function addNode(id, label, status, type) {
+    nodes.push({ id, label: label.slice(0, 22), status, type, x: FC_PAD, y, cx, cy: y + FC_H/2 });
+    y += FC_H + FC_GAP_Y;
+    return id;
+  }
+  function addEdge(a, b) { edges.push({ from: a, to: b }); }
 
-// Top-level section node (Extractor, Planner, Synthesizer) and reused for sub-task steps
-function SectionNode({ id, label, status, input, output, children, selectedKey, onSelect, defaultOpen = false, accentColor }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const myKey = id;
-  const selected = selectedKey === myKey;
-  const hasChildren = children && React.Children.count(children) > 0;
+  const tree = task.tree || {};
+  const planner = tree.planner || { status: 'pending', sub_tasks: [] };
+  const synth   = tree.synthesizer || { status: 'pending' };
 
-  React.useEffect(() => {
-    if (status === 'running') setOpen(true);
-  }, [status]);
+  const startId = addNode('start', task.user_message?.slice(0,24) || 'Task', 'done', 'start');
+  const planId  = addNode('plan', 'Plan', planner.status, 'plan');
+  addEdge(startId, planId);
 
-  // Re-open when defaultOpen flips to true after mount.
-  // Handles the race where sub_tasks arrive after the component already mounted
-  // with defaultOpen=false (polling caught the task before planning finished).
-  React.useEffect(() => {
-    if (defaultOpen) setOpen(true);
-  }, [defaultOpen]);
+  let lastId = planId;
 
-  const labelStyle = accentColor ? { color: accentColor } : {};
-
-  return (
-    <div className="mb-1">
-      <div className={`tree-node flex flex-col ${selected ? 'selected' : ''} status-${status}`}>
-        <div className="flex items-center gap-1.5"
-             onClick={() => {
-               if (hasChildren) setOpen(o => !o);
-               onSelect(myKey);
-             }}>
-          {hasChildren
-            ? <span className={`chevron ${open ? 'open' : ''}`}>›</span>
-            : <span style={{width:'14px'}} />}
-          <Dot status={status} />
-          <span className="text-xs font-semibold" style={{ color: accentColor || '#cbd5e1', ...labelStyle }}>{label}</span>
-          {output && !open && (
-            <span className="text-slate-500 text-xs ml-2 truncate flex-1" style={{ maxWidth:'280px' }}>
-              {output}
-            </span>
-          )}
-          {!output && input && !open && (
-            <span className="text-slate-600 text-xs ml-2 truncate flex-1" style={{ maxWidth:'280px' }}>
-              {input}
-            </span>
-          )}
-        </div>
-        {selected && !hasChildren && (
-          <DetailPanel node={{ label, input, output, type: id }} onClose={() => onSelect(myKey)} />
-        )}
-      </div>
-      {open && hasChildren && (
-        <div className="tree-indent">{children}</div>
-      )}
-    </div>
-  );
-}
-
-function PipelineTree({ task }) {
-  const [selectedKey, setSelectedKey] = useState(null);
-
-  const tree      = task.tree || {};
-  const planner   = tree.planner    || { status: 'pending', output: '', sub_tasks: [] };
-  const consol    = tree.synthesizer|| { status: 'pending', input: '', output: '' };
-
-  const elapsed = task.finished_at
-    ? `${task.finished_at - task.started_at}s`
-    : `${Math.round(Date.now()/1000) - task.started_at}s`;
-
-  function handleSelect(key) {
-    setSelectedKey(prev => prev === key ? null : key);
+  const subs = planner.sub_tasks || [];
+  if (subs.length === 1) {
+    (subs[0].steps || []).forEach((s, i) => {
+      const sid = `step-${i}`;
+      addNode(sid, s.type + (s.input ? ': ' + s.input.slice(0,14) : ''), s.status, s.type);
+      addEdge(lastId, sid);
+      lastId = sid;
+    });
+  } else {
+    subs.forEach((sub, ti) => {
+      const subId = `sub-${ti}`;
+      addNode(subId, sub.text?.slice(0,22) || `Sub-task ${ti+1}`, sub.status, 'subtask');
+      addEdge(lastId, subId);
+      let subLast = subId;
+      (sub.steps || []).forEach((s, si) => {
+        const sid = `sub-${ti}-step-${si}`;
+        addNode(sid, s.type + (s.input ? ': '+s.input.slice(0,12) : ''), s.status, s.type);
+        addEdge(subLast, sid);
+        subLast = sid;
+      });
+      lastId = subLast;
+    });
   }
 
+  const synthId = addNode('synth', 'Synthesize', synth.status, 'synthesize');
+  addEdge(lastId, synthId);
+
+  const totalH = y + FC_PAD;
+  return { nodes, edges, totalH };
+}
+
+function statusFill(status) {
+  if (status === 'running') return '#15382a';
+  if (status === 'done')    return '#1a1d3a';
+  if (status === 'failed')  return '#2a1515';
+  return '#12152a';
+}
+function statusStroke(status) {
+  if (status === 'running') return '#22c55e';
+  if (status === 'done')    return '#6366f1';
+  if (status === 'failed')  return '#ef4444';
+  return '#2d3148';
+}
+
+function Flowchart({ task }) {
+  const [sel, setSel] = useState(null);
+  const { nodes, edges, totalH } = useMemo(() => buildFlowNodes(task), [task]);
+  const svgW = FC_W + FC_PAD * 2 + FC_GAP_X;
+
   return (
-    <div className="card rounded-xl p-4 mb-4">
-      {/* Task header */}
-      <div className="flex items-center justify-between mb-3 gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          {task.status === 'running' && (
-            <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse flex-shrink-0"></span>
-          )}
-          <span className="text-slate-200 text-sm font-semibold truncate">{task.user_message}</span>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <span className={`text-xs ${task.status === 'running' ? 'text-emerald-400' : task.status === 'failed' ? 'text-red-400' : 'text-slate-400'}`}>
-            {task.status}
-          </span>
-          <span className="text-slate-600 text-xs">{elapsed}</span>
-          {task.session && <span className="text-slate-700 text-xs font-mono">{task.session}</span>}
-        </div>
-      </div>
+    <div className="overflow-y-auto" style={{ height: '100%' }}>
+      <svg width={svgW} height={totalH} style={{ display: 'block', margin: '0 auto' }}>
+        <defs>
+          <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#2d3148" />
+          </marker>
+          <marker id="arr-run" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#22c55e88" />
+          </marker>
+        </defs>
 
-      {/* Tree body — Extractor is internal; show Plan → steps → Synthesize */}
-      <div>
-        {/* Plan + sub-tasks.
-            Single sub-task: skip the redundant sub-task label row and render
-            its steps directly under Plan (avoids showing the same text 3×).
-            Multiple sub-tasks: show each sub-task as a collapsible row. */}
-        <SectionNode id="planner" label="Plan" status={planner.status}
-          input="" output={planner.output}
-          accentColor="#818cf8"
-          selectedKey={selectedKey} onSelect={handleSelect}
-          defaultOpen={planner.sub_tasks && planner.sub_tasks.length > 0}>
-          {planner.sub_tasks && planner.sub_tasks.length === 1
-            ? (() => {
-                const steps = planner.sub_tasks[0].steps || [];
-                if (steps.length > 0) {
-                  return steps.map((step, si) => {
-                    const sk = `step-0-${si}`;
-                    return (
-                      <SectionNode key={sk} id={sk}
-                        label={step.type} status={step.status}
-                        input={step.input} output={step.output}
-                        accentColor={toolColor(step.type)}
-                        selectedKey={selectedKey} onSelect={handleSelect} />
-                    );
-                  });
-                }
-                // Direct answer — no tool steps, but show the goal so Plan has visible content
-                return (
-                  <div className="tree-indent">
-                    <span className="text-slate-500 text-xs italic pl-1">
-                      {planner.sub_tasks[0].text || 'direct answer'}
-                    </span>
-                  </div>
-                );
-              })()
-            : (planner.sub_tasks || []).map((sub, ti) => (
-                <SubTaskNode key={ti} sub={sub} taskIdx={ti}
-                  selectedKey={selectedKey} onSelect={handleSelect} />
-              ))
-          }
-        </SectionNode>
+        {/* Edges */}
+        {edges.map((e, i) => {
+          const from = nodes.find(n => n.id === e.from);
+          const to   = nodes.find(n => n.id === e.to);
+          if (!from || !to) return null;
+          const x1 = from.cx, y1 = from.y + FC_H;
+          const x2 = to.cx,   y2 = to.y;
+          const mid = (y1 + y2) / 2;
+          const running = to.status === 'running';
+          return (
+            <path key={i}
+              d={`M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`}
+              fill="none"
+              stroke={running ? '#22c55e44' : '#2d3148'}
+              strokeWidth={running ? 2 : 1.5}
+              markerEnd={running ? 'url(#arr-run)' : 'url(#arr)'}
+              strokeDasharray={running ? '4 3' : 'none'}
+            />
+          );
+        })}
 
-        {/* Synthesize */}
-        <SectionNode id="synthesizer" label="Synthesize" status={consol.status}
-          input={consol.input} output={consol.output}
-          accentColor="#34d399"
-          selectedKey={selectedKey} onSelect={handleSelect} />
-      </div>
-
+        {/* Nodes */}
+        {nodes.map(n => {
+          const isSelected = sel === n.id;
+          const color = n.id === 'start' ? '#f59e0b' : n.id === 'synth' ? '#34d399' : n.id === 'plan' ? '#818cf8' : tc(n.type);
+          return (
+            <g key={n.id} className="fc-node" onClick={() => setSel(sel === n.id ? null : n.id)}>
+              <rect
+                x={n.x} y={n.y} width={FC_W} height={FC_H} rx={7}
+                fill={statusFill(n.status)}
+                stroke={isSelected ? color : statusStroke(n.status)}
+                strokeWidth={isSelected ? 2 : 1.5}
+              />
+              {/* Status dot */}
+              <circle cx={n.x + 13} cy={n.cy} r={4}
+                fill={n.status === 'running' ? '#22c55e' : n.status === 'done' ? '#6366f1' : n.status === 'failed' ? '#ef4444' : '#374151'}>
+                {n.status === 'running' && (
+                  <animate attributeName="opacity" values="1;0.3;1" dur="1.2s" repeatCount="indefinite" />
+                )}
+              </circle>
+              {/* Type accent bar */}
+              <rect x={n.x + 24} y={n.y + 6} width={3} height={FC_H - 12} rx={1.5} fill={color} opacity={0.7} />
+              {/* Label */}
+              <text x={n.x + 34} y={n.cy + 1}
+                fontSize={10} fill="#cbd5e1" dominantBaseline="middle"
+                style={{ userSelect: 'none', fontFamily: 'JetBrains Mono, monospace' }}>
+                {n.label}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 }
 
-function TaskPanel() {
-  const [tasks, setTasks] = useState([]);
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY GRAPH  (right pane) — simple force-directed via d3-lite in pure JS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function useForceLayout(nodes, edges, w, h) {
+  // Minimal force simulation: spring + repulsion, no d3 dependency
+  const posRef = useRef({});
+  const [positions, setPositions] = useState({});
 
   useEffect(() => {
-    const poll = async () => {
-      try {
-        const r = await fetch('/api/tasks');
-        if (r.ok) {
-          const d = await r.json();
-          setTasks(d.tasks || []);
+    if (!nodes.length) return;
+
+    // Initialise positions (random if new node)
+    const pos = {};
+    nodes.forEach(n => {
+      pos[n.id] = posRef.current[n.id] || {
+        x: w/2 + (Math.random()-0.5)*w*0.7,
+        y: h/2 + (Math.random()-0.5)*h*0.7,
+        vx: 0, vy: 0,
+      };
+    });
+
+    const edgeMap = {};
+    edges.forEach(e => {
+      if (!edgeMap[e.source]) edgeMap[e.source] = [];
+      if (!edgeMap[e.target]) edgeMap[e.target] = [];
+      edgeMap[e.source].push(e.target);
+      edgeMap[e.target].push(e.source);
+    });
+
+    let frame = 0;
+    const SIM_STEPS = 80;
+    const SPRING_LEN = 80, SPRING_K = 0.04;
+    const REPULSE = 1200, DAMP = 0.82, BOUND = 0.12;
+
+    function tick() {
+      if (frame++ >= SIM_STEPS) {
+        posRef.current = pos;
+        setPositions({...pos});
+        return;
+      }
+      const ids = Object.keys(pos);
+      // Repulsion
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i+1; j < ids.length; j++) {
+          const a = pos[ids[i]], b = pos[ids[j]];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const d2 = dx*dx + dy*dy + 1;
+          const f = REPULSE / d2;
+          a.vx += f*dx; a.vy += f*dy;
+          b.vx -= f*dx; b.vy -= f*dy;
         }
-      } catch (_) {}
-    };
-    poll();
-    const id = setInterval(poll, 2000);
-    return () => clearInterval(id);
-  }, []);
+      }
+      // Springs
+      edges.forEach(e => {
+        const a = pos[e.source], b = pos[e.target];
+        if (!a || !b) return;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.sqrt(dx*dx + dy*dy) || 1;
+        const f = (d - SPRING_LEN) * SPRING_K;
+        a.vx += f*dx/d; a.vy += f*dy/d;
+        b.vx -= f*dx/d; b.vy -= f*dy/d;
+      });
+      // Centre gravity
+      ids.forEach(id => {
+        const p = pos[id];
+        p.vx += (w/2 - p.x) * BOUND;
+        p.vy += (h/2 - p.y) * BOUND;
+        p.vx *= DAMP; p.vy *= DAMP;
+        p.x += p.vx; p.y += p.vy;
+        p.x = Math.max(16, Math.min(w-16, p.x));
+        p.y = Math.max(16, Math.min(h-16, p.y));
+      });
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }, [nodes.length, edges.length]);
 
-  if (tasks.length === 0) return null;
+  return positions;
+}
 
-  const running   = tasks.find(t => t.status === 'running');
-  const completed = tasks.find(t => t.status !== 'running');
+function MemoryGraph({ nodes, edges, w, h }) {
+  const [hover, setHover] = useState(null);
+  const positions = useForceLayout(nodes, edges, w, h);
+
+  if (!nodes.length) return (
+    <div className="flex items-center justify-center h-full text-slate-600 text-xs text-center p-4">
+      No graph nodes yet.<br/>Send a few messages to start building memory.
+    </div>
+  );
 
   return (
-    <div className="mb-6 flex flex-col gap-4">
-      {running && (
-        <div>
-          <h2 className="text-slate-400 text-xs uppercase tracking-widest mb-3">Running task</h2>
-          <PipelineTree task={running} />
-        </div>
-      )}
-      {completed && (
-        <div>
-          <h2 className="text-slate-400 text-xs uppercase tracking-widest mb-3">Last completed</h2>
-          <PipelineTree task={completed} />
-        </div>
-      )}
+    <div style={{ position:'relative', width:w, height:h, overflow:'hidden' }}>
+      <svg width={w} height={h} style={{ position:'absolute', inset:0 }}>
+        {/* Edges */}
+        {edges.map((e, i) => {
+          const a = positions[e.source], b = positions[e.target];
+          if (!a || !b) return null;
+          return (
+            <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+              stroke="#1e2235" strokeWidth={1} />
+          );
+        })}
+        {/* Nodes */}
+        {nodes.map(n => {
+          const p = positions[n.id];
+          if (!p) return null;
+          const color = ntc(n.type);
+          const isHov = hover === n.id;
+          return (
+            <g key={n.id} className="mg-node"
+               onMouseEnter={() => setHover(n.id)}
+               onMouseLeave={() => setHover(null)}>
+              <circle cx={p.x} cy={p.y} r={isHov ? 8 : 5}
+                fill={color} fillOpacity={0.85}
+                stroke={isHov ? '#fff' : color}
+                strokeWidth={isHov ? 1.5 : 0.5} />
+            </g>
+          );
+        })}
+      </svg>
+
+      {/* Hover tooltip */}
+      {hover && (() => {
+        const n = nodes.find(x => x.id === hover);
+        const p = positions[hover];
+        if (!n || !p) return null;
+        const left = p.x + 12 > w - 180 ? p.x - 190 : p.x + 12;
+        const top  = Math.min(p.y - 10, h - 80);
+        return (
+          <div style={{ position:'absolute', left, top,
+                        background:'#1a1d2e', border:`1px solid ${ntc(n.type)}44`,
+                        borderRadius:8, padding:'8px 10px', maxWidth:180,
+                        pointerEvents:'none', zIndex:10 }}>
+            <div className="text-xs font-semibold" style={{ color: ntc(n.type) }}>{n.label}</div>
+            <div className="text-xs text-slate-500 mt-0.5">{n.type}</div>
+            {n.summary && <div className="text-xs text-slate-400 mt-1 leading-relaxed">{n.summary}</div>}
+          </div>
+        );
+      })()}
+
+      {/* Legend */}
+      <div style={{ position:'absolute', bottom:8, left:8,
+                    background:'#0a0c14cc', borderRadius:6, padding:'6px 8px',
+                    display:'flex', flexWrap:'wrap', gap:'6px 12px', maxWidth: w-16 }}>
+        {Object.entries(NODE_TYPE_COLOR).map(([t, c]) => (
+          <span key={t} style={{ display:'flex', alignItems:'center', gap:4, fontSize:9, color:'#64748b' }}>
+            <span style={{ width:7, height:7, borderRadius:'50%', background:c, display:'inline-block' }} />
+            {t}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
 
-function ElapsedBadge({ ms }) {
-  if (!ms) return null;
-  const txt = ms >= 1000 ? `${(ms/1000).toFixed(1)}s` : `${ms}ms`;
-  return <span className="text-slate-600 text-xs ml-2">{txt}</span>;
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// LAST COMPLETED  (compact pipeline tree)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function StepList({ steps }) {
-  if (!steps || steps.length === 0) return null;
+function StepPill({ step }) {
+  const color = tc(step.type);
   return (
-    <div className="mt-2 ml-4 border-l border-slate-700 pl-3 space-y-0.5">
-      {steps.map((s, i) => (
-        <div key={i} className="flex items-center gap-2 text-xs">
-          <span className="text-slate-600">{i+1}.</span>
-          <span className="text-indigo-400 font-mono">[{s.type || s.tool}]</span>
-          <span className="text-slate-400 truncate">{s.text || s.input || ''}</span>
-        </div>
-      ))}
+    <div className="flex items-center gap-1.5 py-1 px-2 rounded"
+         style={{ background:'#0d0f1c', border:`1px solid ${color}22` }}>
+      <span style={{ width:6, height:6, borderRadius:'50%', background:color, flexShrink:0 }} />
+      <span className="text-xs font-mono" style={{ color }}>{step.type}</span>
+      {step.input && <span className="text-slate-500 text-xs truncate" style={{maxWidth:200}}>{step.input}</span>}
+      {step.status === 'failed' && <span className="text-red-400 text-xs ml-auto">✗</span>}
+      {step.status === 'done'   && <span className="text-indigo-400 text-xs ml-auto">✓</span>}
     </div>
   );
 }
+
+function CompletedTask({ task }) {
+  const tree = task.tree || {};
+  const planner = tree.planner || { sub_tasks: [] };
+  const synth   = tree.synthesizer || {};
+  const elapsed = task.finished_at ? task.finished_at - task.started_at : null;
+  const allSteps = (planner.sub_tasks || []).flatMap(s => s.steps || []);
+
+  return (
+    <div className="card p-4">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${task.status === 'failed' ? 'bg-red-500' : 'bg-indigo-500'}`} />
+          <span className="text-slate-200 text-sm font-semibold truncate">{task.user_message}</span>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0 text-xs">
+          {elapsed != null && <span className="text-slate-500">{elapsed}s</span>}
+          <span className={task.status === 'failed' ? 'text-red-400' : 'text-indigo-400'}>{task.status}</span>
+          {task.session && <span className="text-slate-700 font-mono">{task.session.slice(0,8)}</span>}
+        </div>
+      </div>
+
+      {/* Step pills */}
+      {allSteps.length > 0 && (
+        <div className="flex flex-col gap-1 mb-3">
+          {allSteps.map((s, i) => <StepPill key={i} step={s} />)}
+        </div>
+      )}
+
+      {/* Answer preview */}
+      {synth.output && (
+        <div className="rounded-lg p-3 text-xs text-slate-300 leading-relaxed"
+             style={{ background:'#0d0f1c', border:'1px solid #1e2235',
+                      maxHeight:120, overflowY:'auto', whiteSpace:'pre-wrap' }}>
+          {synth.output}
+        </div>
+      )}
+
+      {/* Stats row */}
+      <div className="flex items-center gap-4 mt-3 text-xs text-slate-600">
+        <span>{allSteps.length} step{allSteps.length !== 1 ? 's' : ''}</span>
+        {(planner.sub_tasks||[]).length > 1 &&
+          <span>{planner.sub_tasks.length} sub-tasks</span>}
+        {task.started_at && <span>{new Date(task.started_at*1000).toLocaleTimeString()}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AGENT ACTIVITY  (improved)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const KIND_STYLE = {
+  tool:   { dot:'bg-indigo-400',  text:'text-indigo-300',  label:'Tool'   },
+  bash:   { dot:'bg-yellow-400',  text:'text-yellow-300',  label:'Bash'   },
+  answer: { dot:'bg-emerald-400', text:'text-emerald-300', label:'Answer' },
+  write:  { dot:'bg-violet-400',  text:'text-violet-300',  label:'Write'  },
+  error:  { dot:'bg-red-400',     text:'text-red-300',     label:'Error'  },
+  stage:  { dot:'bg-sky-400',     text:'text-sky-300',     label:'Stage'  },
+  llm:    { dot:'bg-amber-400',   text:'text-amber-300',   label:'LLM'    },
+  plan:   { dot:'bg-purple-400',  text:'text-purple-300',  label:'Plan'   },
+};
 
 function EventRow({ r }) {
   const [open, setOpen] = useState(false);
   const s = KIND_STYLE[r.kind] || KIND_STYLE.tool;
   const d = r.data || {};
 
-  // ── Stage event ────────────────────────────────────────────────────────────
-  if (r.kind === 'stage') {
-    const stageKey = d.stage || r.label;
-    const stageColor = STAGE_COLORS[stageKey] || 'text-slate-300';
-    return (
-      <div className="flex items-center gap-3 py-1.5 border-b border-slate-800/50 text-xs">
-        <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
-        <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
-        <span className={`font-mono font-semibold ${stageColor}`}>▶ {r.label}</span>
-        {d.step && <span className="text-slate-600">step {d.step}/{d.budget}</span>}
-        {d.soul && <span className="text-slate-500 ml-1">[{d.soul}]</span>}
-      </div>
-    );
-  }
+  const actionColor = {
+    bash:'#eab308', answer:'#34d399', synthesize:'#34d399',
+    plan:'#818cf8', search:'#06b6d4', web_search:'#06b6d4',
+    write:'#7c3aed', read:'#10b981',
+  }[d.action] || '#cbd5e1';
 
-  // ── LLM decision event ─────────────────────────────────────────────────────
-  if (r.kind === 'llm') {
-    const actionColor = d.action === 'bash' ? 'text-yellow-300'
-      : d.action === 'answer' || d.action === 'synthesize' ? 'text-emerald-300'
-      : d.action === 'plan' ? 'text-purple-300'
-      : 'text-amber-300';
-    const hasDetail = d.result || d.answer_preview || d.steps;
-    return (
-      <div className="py-1.5 border-b border-slate-800 text-xs">
-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => hasDetail && setOpen(o => !o)}>
-          <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
-          <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
-          <span className={`font-mono font-semibold ${actionColor}`}>{d.action || r.label}</span>
-          {d.tool && d.tool !== d.action && <span className="text-slate-500">→ {d.tool}</span>}
-          {d.input && <span className="text-slate-400 truncate max-w-xs">{d.input}</span>}
-          <ElapsedBadge ms={d.elapsed_ms} />
-          {hasDetail && <span className="text-slate-600 ml-auto">{open ? '▲' : '▼'}</span>}
-        </div>
-        {open && (d.result || d.answer_preview) && (
-          <div className="mt-1.5 ml-[76px] bg-slate-900 rounded p-2 text-slate-300 font-mono whitespace-pre-wrap text-xs max-h-40 overflow-y-auto">
-            {d.result || d.answer_preview}
-          </div>
-        )}
-        {open && d.steps && <div className="ml-[76px]"><StepList steps={d.steps} /></div>}
-      </div>
-    );
-  }
+  const hasDetail = d.result || d.answer_preview || d.steps;
 
-  // ── Plan event ─────────────────────────────────────────────────────────────
-  if (r.kind === 'plan') {
-    return (
-      <div className="py-1.5 border-b border-slate-800 text-xs">
-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setOpen(o => !o)}>
-          <span className="text-slate-600 w-16 shrink-0">{timeAgo(r.ts)}</span>
-          <span className={`w-2 h-2 rounded-full shrink-0 ${s.dot}`}></span>
-          <span className="font-mono font-semibold text-purple-300">{r.label}</span>
-          {d.step_count && <span className="text-slate-500">{d.step_count} steps</span>}
-          {d.steps && <span className="text-slate-600 ml-auto">{open ? '▲' : '▼'}</span>}
-        </div>
-        {open && d.steps && <div className="ml-[76px] mt-1"><StepList steps={d.steps} /></div>}
-      </div>
-    );
-  }
-
-  // ── Default ────────────────────────────────────────────────────────────────
   return (
-    <div className="flex items-start gap-3 py-2 border-b border-slate-800 text-sm">
-      <span className="text-slate-500 w-16 shrink-0 pt-0.5">{timeAgo(r.ts)}</span>
-      <span className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${s.dot}`}></span>
-      <div className="flex-1 min-w-0">
-        <span className={`font-mono font-semibold ${s.text}`}>{r.label}</span>
-        {r.detail && <span className="text-slate-400 ml-2 truncate block text-xs">{r.detail}</span>}
+    <div className="ev-row py-2 text-xs">
+      <div className="flex items-center gap-2 cursor-pointer px-3"
+           onClick={() => hasDetail && setOpen(o => !o)}>
+        <span className="text-slate-700 w-14 shrink-0 tabular-nums">{timeAgo(r.ts)}</span>
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
+        <span className="font-mono font-semibold" style={{ color: actionColor, minWidth: 80 }}>
+          {d.action || r.label}
+        </span>
+        {d.tool && d.tool !== d.action &&
+          <span className="text-slate-500">→ <span style={{color: tc(d.tool)}}>{d.tool}</span></span>}
+        {d.input && <span className="text-slate-500 truncate flex-1" style={{maxWidth:220}}>{d.input}</span>}
+        {d.elapsed_ms && <span className="text-slate-700 ml-auto shrink-0">{elapsedFmt(d.elapsed_ms)}</span>}
+        {hasDetail && <span className="text-slate-700 shrink-0 ml-1">{open ? '▲' : '▼'}</span>}
       </div>
-      {r.session && <span className="text-slate-600 text-xs shrink-0">{r.session}</span>}
+      {open && (d.result || d.answer_preview) && (
+        <div className="mx-3 mt-1.5 rounded p-2 text-slate-300 font-mono text-xs max-h-36 overflow-y-auto"
+             style={{background:'#0d0f1c', whiteSpace:'pre-wrap'}}>
+          {d.result || d.answer_preview}
+        </div>
+      )}
+      {open && d.steps && (
+        <div className="mx-3 mt-1 space-y-0.5">
+          {d.steps.map((st,i) => (
+            <div key={i} className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="text-slate-700">{i+1}.</span>
+              <span className="font-mono" style={{color: tc(st.type||st.tool)}}>[{st.type||st.tool}]</span>
+              <span className="truncate">{st.text||st.input||''}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-const ALL_KINDS = ['stage', 'llm', 'plan', 'tool', 'bash', 'write', 'answer', 'error'];
+const ALL_KINDS = ['stage','llm','plan','tool','bash','write','answer','error'];
 
 function ActivityPanel({ events }) {
-  const [filter, setFilter] = useState(null); // null = all
+  const [filter, setFilter] = useState(null);
 
-  if (!events || events.length === 0) return (
-    <div className="card rounded-xl p-5 text-slate-500 text-sm text-center">
-      No activity yet — send a message through Claude Code to see agent steps here.
+  if (!events?.length) return (
+    <div className="card p-5 text-slate-600 text-xs text-center">
+      No activity yet — send a message to see agent steps here.
     </div>
   );
 
   const visible = filter ? events.filter(e => e.kind === filter) : events;
+  const counts = {};
+  for (const e of events) counts[e.kind] = (counts[e.kind] || 0) + 1;
 
-  // Group by session, preserving insertion order
+  // Group by session
   const groups = [];
   const seen = {};
   for (const r of visible) {
@@ -533,141 +580,204 @@ function ActivityPanel({ events }) {
     seen[key].push(r);
   }
 
-  // Count per kind for filter badges
-  const counts = {};
-  for (const e of events) counts[e.kind] = (counts[e.kind] || 0) + 1;
-
   return (
-    <div className="card rounded-xl p-5">
-      {/* Header + filter bar */}
-      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <h2 className="text-slate-400 text-xs uppercase tracking-widest">Agent activity</h2>
+    <div className="card overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800/60 flex-wrap gap-2">
+        <span className="text-slate-400 text-xs uppercase tracking-widest">Agent Activity</span>
         <div className="flex items-center gap-1 flex-wrap">
-          <button
-            onClick={() => setFilter(null)}
-            className={`px-2 py-0.5 rounded text-xs font-mono border transition-colors ${
-              filter === null
-                ? 'bg-slate-600 border-slate-500 text-slate-100'
-                : 'border-slate-700 text-slate-500 hover:text-slate-300'
-            }`}
-          >all</button>
+          <button onClick={() => setFilter(null)}
+            className={`px-2 py-0.5 rounded text-xs border transition-colors ${
+              filter === null ? 'bg-slate-700 border-slate-500 text-white' : 'border-slate-800 text-slate-600 hover:text-slate-300'
+            }`}>all</button>
           {ALL_KINDS.filter(k => counts[k]).map(k => {
-            const s = KIND_STYLE[k] || KIND_STYLE.tool;
+            const st = KIND_STYLE[k] || KIND_STYLE.tool;
             return (
-              <button key={k}
-                onClick={() => setFilter(filter === k ? null : k)}
-                className={`px-2 py-0.5 rounded text-xs font-mono border transition-colors ${
-                  filter === k
-                    ? 'bg-slate-700 border-slate-500 text-slate-100'
-                    : 'border-slate-700 text-slate-600 hover:text-slate-300'
-                }`}
-              >
-                <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${s.dot}`}></span>
-                {k} <span className="text-slate-600">({counts[k]})</span>
+              <button key={k} onClick={() => setFilter(filter === k ? null : k)}
+                className={`px-2 py-0.5 rounded text-xs border transition-colors ${
+                  filter === k ? 'bg-slate-700 border-slate-500 text-white' : 'border-slate-800 text-slate-600 hover:text-slate-300'
+                }`}>
+                <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${st.dot}`} />
+                {k}<span className="text-slate-700 ml-0.5">({counts[k]})</span>
               </button>
             );
           })}
         </div>
       </div>
 
-      {/* Event groups */}
-      {groups.length === 0 && (
-        <div className="text-slate-600 text-xs text-center py-4">No {filter} events yet.</div>
-      )}
-      {groups.map(g => (
-        <div key={g.key} className="mb-4 last:mb-0">
-          <div className="text-slate-700 text-xs font-mono mb-1 border-b border-slate-800 pb-1">
-            session {g.key}
+      <div className="overflow-y-auto" style={{maxHeight: 360}}>
+        {groups.map(g => (
+          <div key={g.key}>
+            <div className="px-3 py-1.5 text-slate-700 text-xs font-mono border-b border-slate-800/40"
+                 style={{background:'#0d0f1c'}}>
+              session {g.key.slice(0,12)}
+            </div>
+            {g.events.map((r, i) => <EventRow key={i} r={r} />)}
           </div>
-          {g.events.map((r, i) => <EventRow key={i} r={r} />)}
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function App() {
   const [status, setStatus] = useState(null);
-  const [error, setError] = useState(null);
+  const [tasks,  setTasks]  = useState([]);
+  const [graph,  setGraph]  = useState({ nodes: [], edges: [] });
+  const [error,  setError]  = useState(null);
   const [lastFetch, setLastFetch] = useState(null);
+  const [paneH,  setPaneH]  = useState(500);
+  const paneRef = useRef(null);
 
-  const fetch_status = useCallback(async () => {
+  // Adaptive pane height
+  useEffect(() => {
+    const obs = new ResizeObserver(entries => {
+      for (const e of entries) setPaneH(Math.max(350, e.contentRect.height - 20));
+    });
+    if (paneRef.current) obs.observe(paneRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  const fetchAll = useCallback(async () => {
     try {
-      const r = await fetch('/api/status');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = await r.json();
-      setStatus(d);
+      const [sr, tr, gr] = await Promise.all([
+        fetch('/api/status'),
+        fetch('/api/tasks'),
+        fetch('/api/graph'),
+      ]);
+      if (sr.ok) { const d = await sr.json(); setStatus(d); }
+      if (tr.ok) { const d = await tr.json(); setTasks(d.tasks || []); }
+      if (gr.ok) { const d = await gr.json(); setGraph(d); }
       setError(null);
       setLastFetch(Date.now());
-    } catch (e) {
+    } catch(e) {
       setError(e.message);
-      setStatus(null);
     }
   }, []);
 
   useEffect(() => {
-    fetch_status();
-    const id = setInterval(fetch_status, 5000);
+    fetchAll();
+    const id = setInterval(fetchAll, 3000);
     return () => clearInterval(id);
-  }, [fetch_status]);
+  }, [fetchAll]);
+
+  const running   = tasks.find(t => t.status === 'running');
+  const completed = tasks.find(t => t.status !== 'running');
 
   return (
-    <div className="max-w-4xl mx-auto">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+    <div className="min-h-screen p-5 flex flex-col gap-5 max-w-screen-xl mx-auto">
+
+      {/* ── Header ─────────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <img src="/assets/sisyphean-transparent.png" alt="Sisyphean" className="w-10 h-10 object-contain" />
-          <h1 className="text-xl font-semibold text-slate-100">Sisyphean Engine</h1>
+          <img src="/assets/sisyphean-transparent.png" alt="" className="w-9 h-9 object-contain" />
+          <h1 className="text-lg font-semibold text-slate-100 tracking-tight">Sisyphean Engine</h1>
         </div>
         <div className="flex items-center gap-3">
-          {status && <StatusBadge running={true} mock={status.mock} llmReady={status.llm_ready} />}
-          {error && <StatusBadge running={false} />}
+          {status && <StatusBadge running mock={status.mock} llmReady={status.llm_ready} />}
+          {error   && <StatusBadge running={false} />}
           {lastFetch && (
-            <span className="text-slate-600 text-xs">
-              updated {new Date(lastFetch).toLocaleTimeString()}
+            <span className="text-slate-700 text-xs">
+              {new Date(lastFetch).toLocaleTimeString()}
             </span>
           )}
         </div>
       </div>
 
       {error && (
-        <div className="card rounded-xl p-4 mb-6 border-red-800 text-red-400 text-sm">
-          Engine unreachable — {error}. Retrying every 5s.
+        <div className="card p-4 border-red-900/60 text-red-400 text-sm">
+          Engine unreachable — {error}. Retrying…
         </div>
       )}
 
       {status && (
         <>
-          {/* Stat grid */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-            <StatCard label="Uptime" value={formatUptime(status.uptime_seconds)} />
-            <StatCard label="Requests" value={status.requests_total} color="text-indigo-400" />
-            <StatCard label="Graph nodes" value={status.graph_nodes} color="text-violet-400" />
-            <StatCard label="Artifacts" value={status.artifacts} color="text-sky-400" />
+          {/* ── Stats ──────────────────────────────────────────────── */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <StatCard label="Uptime"      value={formatUptime(status.uptime_seconds)} />
+            <StatCard label="Requests"    value={status.requests_total} color="text-indigo-400" />
+            <StatCard label="Graph nodes" value={status.graph_nodes}    color="text-violet-400" />
+            <StatCard label="Artifacts"   value={status.artifacts}      color="text-sky-400" />
           </div>
 
-          {/* Model + workspace */}
-          <div className="card rounded-xl p-5 mb-6 grid md:grid-cols-2 gap-4">
+          {/* ── Model + workspace ─────────────────────────────────── */}
+          <div className="card p-4 grid md:grid-cols-2 gap-4">
             <div>
-              <span className="text-slate-400 text-xs uppercase tracking-widest">Model</span>
-              <p className="text-slate-200 mt-1 text-sm font-mono">{status.model}</p>
+              <span className="text-slate-500 text-xs uppercase tracking-widest">Model</span>
+              <p className="text-slate-200 mt-1 text-sm font-mono truncate">{status.model}</p>
             </div>
             <div>
-              <span className="text-slate-400 text-xs uppercase tracking-widest">Workspace</span>
+              <span className="text-slate-500 text-xs uppercase tracking-widest">Workspace</span>
               <p className="text-slate-200 mt-1 text-sm font-mono truncate">{status.workspace}</p>
             </div>
           </div>
 
-          {/* Latest task flowchart */}
-          <TaskPanel />
+          {/* ── Active task: flowchart + memory graph ──────────────── */}
+          {running && (
+            <div>
+              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Active task</div>
+              <div ref={paneRef} className="card overflow-hidden"
+                   style={{ display:'grid', gridTemplateColumns:'1fr 1fr', minHeight:400 }}>
 
-          {/* Agent activity */}
-          <ActivityPanel events={status.recent || []} />
+                {/* Left — flowchart */}
+                <div className="border-r border-slate-800/60 flex flex-col"
+                     style={{ height: paneH }}>
+                  <div className="px-4 py-2 border-b border-slate-800/40 flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse" />
+                    <span className="text-slate-300 text-xs font-semibold truncate flex-1">
+                      {running.user_message}
+                    </span>
+                    <span className="text-slate-600 text-xs">
+                      {Math.round(Date.now()/1000 - running.started_at)}s
+                    </span>
+                  </div>
+                  <div style={{ flex:1, overflow:'hidden', padding:'12px 8px' }}>
+                    <Flowchart task={running} />
+                  </div>
+                </div>
+
+                {/* Right — memory graph */}
+                <div className="flex flex-col" style={{ height: paneH }}>
+                  <div className="px-4 py-2 border-b border-slate-800/40">
+                    <span className="text-slate-500 text-xs uppercase tracking-widest">
+                      Memory Graph · {graph.nodes.length} nodes
+                    </span>
+                  </div>
+                  <div style={{ flex:1, overflow:'hidden', position:'relative' }}>
+                    <MemoryGraph
+                      nodes={graph.nodes}
+                      edges={graph.edges}
+                      w={Math.floor((window.innerWidth - 80) / 2) || 500}
+                      h={paneH - 40}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Last completed ─────────────────────────────────────── */}
+          {completed && (
+            <div>
+              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Last completed</div>
+              <CompletedTask task={completed} />
+            </div>
+          )}
+
+          {/* ── Agent activity ─────────────────────────────────────── */}
+          <div>
+            <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Agent Activity</div>
+            <ActivityPanel events={status.recent || []} />
+          </div>
         </>
       )}
 
       {!status && !error && (
-        <div className="text-slate-500 text-sm text-center py-20">Loading…</div>
+        <div className="text-slate-600 text-sm text-center py-24">Loading…</div>
       )}
     </div>
   );

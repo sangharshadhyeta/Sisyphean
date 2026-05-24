@@ -52,7 +52,10 @@ async def synthesize(
     parts: list[str] = []
 
     if context:
-        parts.append(f"Context:\n{context[:600]}")
+        # 1500 chars to fit memory sections (soul policy, user knowledge, self-concept)
+        # plus relevant history. Memory is placed first in synthesis_ctx so it's
+        # never truncated when the combined context is long.
+        parts.append(f"Context:\n{context[:1500]}")
 
     parts.append(f"User: {query[:200]}")
 

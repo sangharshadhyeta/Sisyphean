@@ -157,10 +157,20 @@ def _tool_names(r):
 # ---------------------------------------------------------------------------
 
 def _sim_bash_real(block):
-    """Execute Bash tool_use blocks for real (python -c only; mkdir simulated)."""
+    """Execute Bash tool_use blocks for real — runs echo>file, python scripts, python -c.
+
+    Handles the full write-then-run pattern:
+      echo "..." > calc.py   → actually writes the file to disk
+      python calc.py         → actually runs the script
+      python -c '...'        → directly executes
+      mkdir ...              → simulated (no side effects)
+      ls                     → actually runs
+    """
+    import re as _re
     cmd = block.get("input", {}).get("command", "")
-    # Only execute python -c expression evaluation — safe, no side effects
-    if cmd.strip().startswith("python") and "-c" in cmd:
+
+    # Run any python command (python -c, python file.py, python3 file.py)
+    if _re.match(r"python3?\s", cmd.strip()):
         try:
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=10
@@ -170,12 +180,64 @@ def _sim_bash_real(block):
             return out
         except Exception as e:
             return f"Error: {e}"
+
+    # echo "..." > file — actually write the file so subsequent python runs work
+    m = _re.match(r'echo\s+["\']?(.*?)["\']?\s*>\s*(\S+)', cmd, _re.DOTALL)
+    if m:
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=10
+            )
+            out = (result.stdout + result.stderr).strip()
+            print(f"      [bash] {_s(cmd, 60)} -> (wrote file)")
+            return out
+        except Exception as e:
+            return f"Error: {e}"
+
+    # cat <<EOF > file — heredoc file write
+    if ">>" in cmd or ">" in cmd:
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=10
+            )
+            out = (result.stdout + result.stderr).strip()
+            print(f"      [bash] {_s(cmd, 60)} -> (wrote file)")
+            return out
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ls — actually run so the model sees what files exist
+    if cmd.strip() in ("ls", "ls -1", "ls -la", "ls -l", "dir") or cmd.strip().startswith("ls "):
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=5
+            )
+            out = (result.stdout + result.stderr).strip()
+            print(f"      [bash] {_s(cmd, 40)} -> {_s(out, 60)}")
+            return out
+        except Exception as e:
+            return f"Error: {e}"
+
     # mkdir / folder creation — simulate success
     if any(k in cmd.lower() for k in ("mkdir", "md ")):
+        try:
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
         print(f"      [bash] {_s(cmd, 80)} -> (simulated ok)")
-        return ""  # success (empty stdout)
-    print(f"      [bash] {_s(cmd, 80)} -> (not executed)")
-    return ""
+        return ""
+
+    # Everything else — actually run it
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=10
+        )
+        out = (result.stdout + result.stderr).strip()
+        print(f"      [bash] {_s(cmd, 80)} -> {_s(out, 40)}")
+        return out
+    except Exception as e:
+        print(f"      [bash] {_s(cmd, 80)} -> (not executed)")
+        return ""
 
 
 def _sim_mkdir(block):

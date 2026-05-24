@@ -50,18 +50,84 @@ ASSISTANT: {asst_msg}
 Return ONLY a JSON object:
 {{
   "facts": [
-    {{"label": "short unique name", "content": "specific fact (1-2 sentences)", "type": "fact|concept|project|preference"}}
+    {{"label": "short unique name", "content": "specific fact (1-2 sentences)", "type": "<pick ONE: fact | concept | project | preference>"}}
   ],
   "artifacts": [
-    {{"type": "code|file|decision|output", "summary": "what it is in <15 words", "content": "key content or path"}}
+    {{"type": "<pick ONE: code | file | decision | output>", "summary": "what it is in <15 words", "content": "key content or path"}}
   ]
 }}
+
+Type guide for facts — pick the single best fit:
+  fact        — a specific thing that is true (name, version, date, result)
+  concept     — a reusable idea, pattern, or explanation
+  project     — something being built or worked on
+  preference  — how the user wants things done
 
 Rules:
 - Only include genuinely NEW, specific information not already obvious.
 - Omit greetings, filler, or generic statements.
 - Return empty lists if nothing notable.
 - Return valid JSON only, no explanation."""
+
+# Valid node types the extractor may write — enforced in code as a hard allowlist.
+# Any composite or unknown type the model produces is normalised to "fact".
+_VALID_FACT_TYPES = frozenset({"fact", "concept", "project", "preference", "entity", "skill"})
+
+
+def _normalise_type(raw: str) -> str:
+    """Map any LLM-output type string to a single valid type.
+
+    Handles model mistakes like "fact|concept", "fact|concept|project|preference",
+    or leading/trailing whitespace.  Falls back to "fact" if nothing matches.
+    """
+    raw = (raw or "").strip().lower()
+    if raw in _VALID_FACT_TYPES:
+        return raw
+    # Model wrote a pipe- or comma-separated composite — take first valid token
+    for part in raw.replace(",", "|").split("|"):
+        part = part.strip()
+        if part in _VALID_FACT_TYPES:
+            return part
+    return "fact"
+
+
+def _jaccard(a: str, b: str) -> float:
+    """Token-level Jaccard similarity between two strings."""
+    ta = set(a.lower().split())
+    tb = set(b.lower().split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _find_similar_node(graph, label: str, content: str, threshold: float = 0.75) -> str | None:
+    """Return the name of an existing graph node similar to *label*, or None.
+
+    Similarity is computed as token-level Jaccard on the node name.  When label
+    similarity is moderate (≥ 0.5) the content is also compared — two facts
+    about the same topic but stated differently still count as duplicates if
+    their content overlaps substantially.
+    """
+    try:
+        candidates = graph.search(label, top_k=5)
+        for node in candidates:
+            existing_name = node.get("name", "")
+            if not existing_name:
+                continue
+            # Exact match — let upsert_node handle it
+            if existing_name.lower().strip() == label.lower().strip():
+                return existing_name
+            label_sim = _jaccard(label, existing_name)
+            if label_sim >= threshold:
+                return existing_name
+            # Moderate label overlap: check content too
+            if label_sim >= 0.5:
+                content_sim = _jaccard(content, node.get("summary", ""))
+                if content_sim >= 0.6:
+                    return existing_name
+    except Exception:
+        pass
+    return None
 
 
 class MemoryExtractor:
@@ -143,13 +209,32 @@ class MemoryExtractor:
             for item in data.get("facts", []):
                 label = (item.get("label") or "").strip()
                 content = (item.get("content") or "").strip()
-                ftype = item.get("type", "fact")
+                ftype = _normalise_type(item.get("type", "fact"))
                 if not label or not content:
                     continue
-                # upsert_node is idempotent: merges if node already exists,
-                # creates if not. Replaces old find_by_label/update_node/add_node
-                # trio that used UUID keys incompatible with retrieval.py's search().
-                kg.upsert_node(label, ftype, summary=content)
+
+                # ── Fuzzy dedup ───────────────────────────────────────────────
+                # Exact-name match is already handled by upsert_node's key lookup.
+                # Also check for near-duplicate labels (Jaccard ≥ 0.75) so the
+                # same fact stated slightly differently enriches the existing node
+                # instead of creating a separate one.
+                existing_name = _find_similar_node(kg, label, content)
+                if existing_name and existing_name.lower().strip() != label.lower().strip():
+                    # Enrich: append new content only if not already captured
+                    existing_node = kg.get_node(existing_name) or {}
+                    existing_summary = existing_node.get("summary", "")
+                    if content.lower()[:50] not in existing_summary.lower():
+                        merged = f"{existing_summary} | {content}"[:500]
+                    else:
+                        merged = existing_summary
+                    kg.upsert_node(existing_name, ftype, summary=merged)
+                    logger.debug(
+                        "extractor: merged %r → existing node %r",
+                        label[:40], existing_name[:40],
+                    )
+                else:
+                    # Exact match or new node — upsert handles both
+                    kg.upsert_node(label, ftype, summary=content)
                 saved_facts += 1
 
             for item in data.get("artifacts", []):

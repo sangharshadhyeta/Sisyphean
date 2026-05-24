@@ -71,6 +71,7 @@ class DreamResult:
     session_bytes_freed: int = 0
     budget_rows_trimmed: int = 0
     inner_self_updated: bool = False
+    skills_discovered: int = 0
     errors: list[str] | None = None
 
     def log_summary(self) -> None:
@@ -85,6 +86,8 @@ class DreamResult:
             self.session_bytes_freed // 1024,
             self.budget_rows_trimmed,
         )
+        if self.skills_discovered:
+            logger.info("dream: promoted %d new skill(s) from task history", self.skills_discovered)
         if self.errors:
             for err in self.errors:
                 logger.warning("dream: %s", err)
@@ -143,6 +146,24 @@ async def run_dream(
         except Exception as exc:
             logger.error("dream: memorise pass failed: %s", exc, exc_info=True)
             result.errors = (result.errors or []) + [f"memorise: {exc}"]
+
+    # ── Skill discovery pass ──────────────────────────────────────────────────
+    # Mines task_log.md for completed programs that should become reusable skills.
+    # Runs after memorise (so graph is fresh) and before cleanup.
+    if memorise:
+        try:
+            from engine.config import load_config
+            _cfg = load_config()
+            _workspace = Path(_cfg.workspace) if hasattr(_cfg, "workspace") else Path("workspace")
+            from engine.memory.graph import knowledge_graph
+            if not dry_run:
+                discovered = await _discover_skills(client, knowledge_graph, _workspace)
+                result.skills_discovered = discovered
+            else:
+                logger.info("dream: --dry-run — skipping skill discovery")
+        except Exception as exc:
+            logger.warning("dream: skill discovery pass failed: %s", exc)
+            result.errors = (result.errors or []) + [f"skill_discovery: {exc}"]
 
     # ── Cleanup pass ──────────────────────────────────────────────────────────
     if cleanup:
@@ -335,3 +356,294 @@ async def _update_inner_self(client) -> bool:
         "dream: inner_self.md updated from %d new reflection(s)", len(new_entries)
     )
     return True
+
+
+# ── Skill discovery pass ──────────────────────────────────────────────────────
+
+_SKILL_SEEN_FILE = "skill_discoveries_seen.txt"
+
+# Extensions we consider promotable to skills (exclude test files / temp outputs)
+_PROMOTABLE_EXTS = frozenset({".py", ".sh", ".js", ".ts"})
+_SKIP_PREFIXES   = ("test_", "_skill_", "hello", "marker", "calc", "counter",
+                    "squares", "fib", "hasher")   # common test/demo files
+
+_RUNBOOK_SYSTEM = """\
+Write a concise skill runbook in markdown. Be direct and specific.
+
+Format:
+## When to use
+One sentence describing the type of task this skill handles.
+
+## Approach
+Two to four sentences on the implementation strategy.
+
+## Key steps
+Numbered list of the main steps. Keep each step short.
+
+## Caveats
+One or two lines on edge cases or limitations. Skip if none.
+
+No introduction, no summary, no fluff. Under 200 words total."""
+
+
+def _task_to_skill_name(task_desc: str) -> str:
+    """Derive a hyphen-slug skill name from a task description."""
+    import re as _re
+    _STOP = {"the", "a", "an", "and", "or", "for", "to", "of", "in", "with",
+             "that", "this", "from", "into", "then", "run", "write", "create",
+             "make", "build", "get", "set", "let", "use"}
+    words = _re.findall(r"[a-z]+", task_desc.lower())
+    meaningful = [w for w in words if w not in _STOP and len(w) > 2][:6]
+    return "-".join(meaningful)[:50] or "unnamed-skill"
+
+
+def _parse_task_log(task_log_path: Path) -> list[dict]:
+    """Parse task_log.md into a list of task entries.
+
+    Each entry: {"ts": str, "task": str, "stages": [str], "files": [str]}
+    """
+    import re as _re
+    entries: list[dict] = []
+    if not task_log_path.exists():
+        return entries
+
+    current: dict | None = None
+    for line in task_log_path.read_text(encoding="utf-8").splitlines():
+        # New entry header: ## [2026-05-24 14:30] task description
+        m = _re.match(r"^##\s+\[([^\]]+)\]\s+(.+)$", line)
+        if m:
+            if current:
+                entries.append(current)
+            current = {"ts": m.group(1).strip(), "task": m.group(2).strip(),
+                       "stages": [], "files": [], "answer": ""}
+            continue
+        if current is None:
+            continue
+        # Stage bullet: - [type] goal (N steps)
+        if line.startswith("- ["):
+            current["stages"].append(line.lstrip("- ").strip())
+        # Files written line
+        elif line.startswith("Files written:"):
+            raw = line[len("Files written:"):].strip()
+            current["files"].extend(
+                f.strip() for f in raw.split(",") if f.strip()
+            )
+        elif line.startswith("Answer:"):
+            current["answer"] = line[len("Answer:"):].strip()
+
+    if current:
+        entries.append(current)
+    return entries
+
+
+async def _discover_skills(client, graph, workspace: Path) -> int:
+    """Mine task_log.md for programs worth promoting to reusable skills.
+
+    Strategy
+    --------
+    1. Parse workspace/task_log.md into task entries.
+    2. For each entry that wrote a promotable .py/.sh file:
+       a. Skip if we've already processed this task (seen marker).
+       b. Skip trivial demo files (test_, hello.py, calc.py, etc.).
+       c. Check if the same file appears in a LATER entry — if so, skip
+          this version (we'll process the latest one instead).
+       d. Read the file from workspace.
+       e. Use one cheap LLM call to write a structured runbook.
+       f. Upsert a skill node (text runbook + program code).
+    3. Update the seen marker so dream never re-processes.
+
+    Returns the number of new skills saved.
+    """
+    import re as _re
+    from engine.memory.skills import save_skill_program_to_graph
+
+    task_log = workspace / "task_log.md"
+    entries  = _parse_task_log(task_log)
+    if not entries:
+        return 0
+
+    # Load already-processed task timestamps
+    seen_path = workspace.parent / "memory" / _SKILL_SEEN_FILE
+    seen: set[str] = set()
+    if seen_path.exists():
+        seen = set(seen_path.read_text(encoding="utf-8").splitlines())
+
+    # Build a set of filenames that appear in LATER entries
+    # (so we skip older versions and only promote the latest)
+    all_later_files: set[str] = set()
+    for i, entry in enumerate(entries):
+        for later in entries[i + 1:]:
+            all_later_files.update(later["files"])
+
+    new_skills = 0
+    newly_seen: list[str] = []
+
+    for entry in entries:
+        ts   = entry["ts"]
+        task = entry["task"]
+
+        if ts in seen:
+            continue  # already processed
+
+        promotable_files = []
+        for fname in entry["files"]:
+            # Only promotable extensions
+            import os as _os
+            ext = _os.path.splitext(fname)[1].lower()
+            if ext not in _PROMOTABLE_EXTS:
+                continue
+            # Skip trivial demo/test files
+            base = _os.path.basename(fname).lower()
+            if any(base.startswith(p) for p in _SKIP_PREFIXES):
+                continue
+            # Skip if a later task also wrote this file (use latest version)
+            if base in {_os.path.basename(f).lower() for f in all_later_files}:
+                continue
+            # Resolve path: filename may be bare or absolute
+            candidates = [
+                workspace / fname,
+                workspace / _os.path.basename(fname),
+                Path(fname),
+            ]
+            for cand in candidates:
+                if cand.is_file():
+                    promotable_files.append((fname, cand))
+                    break
+
+        if not promotable_files:
+            newly_seen.append(ts)
+            continue
+
+        for fname, fpath in promotable_files:
+            try:
+                code = fpath.read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                logger.debug("skill discovery: could not read %s: %s", fpath, exc)
+                continue
+
+            if len(code) < 40:
+                continue  # too short to be a real skill
+
+            skill_name = _task_to_skill_name(task)
+            if not skill_name:
+                continue
+
+            # Check if a skill node already exists and is newer
+            existing = graph.get_node(skill_name) if graph else None
+            if existing and existing.get("status") == "accepted":
+                logger.debug("skill discovery: %r already accepted, skipping", skill_name)
+                continue
+
+            # ── Generalize hardcoded programs → parameterized (sys.argv) ─────────
+            # A program that only works with baked-in values is not a reusable skill.
+            # If the code lacks sys.argv / argparse, ask the LLM to refactor it so
+            # inputs are passed as command-line arguments.  Fall back to original if
+            # the refactor looks wrong (too short, syntax-only change, etc.).
+            _already_param = "sys.argv" in code or "argparse" in code
+            if not _already_param:
+                try:
+                    gen_prompt = (
+                        f"Refactor this Python program so it accepts inputs via "
+                        f"sys.argv instead of hardcoded values.\n"
+                        f"Task it solved: {task}\n\n"
+                        f"```python\n{code}\n```\n\n"
+                        f"Rules:\n"
+                        f"- Output ONLY valid Python code — no prose, no fences.\n"
+                        f"- Use sys.argv[1], sys.argv[2], … for every value that was "
+                        f"hardcoded.\n"
+                        f"- Add a usage comment at the top: # Usage: python <file> arg1 …\n"
+                        f"- Keep the program logic identical; only replace hardcoded "
+                        f"literals with sys.argv reads.\n"
+                        f"- If the program is already general (no meaningful inputs to "
+                        f"parameterize), return it unchanged.\n"
+                    )
+                    gen_r = await client.generate(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a Python refactoring assistant. "
+                                    "Output only valid Python code with no markdown fences."
+                                ),
+                            },
+                            {"role": "user", "content": gen_prompt},
+                        ],
+                        max_tokens=600,
+                        temperature=0.1,
+                        stream=False,
+                        thinking=False,
+                    )
+                    gen_code = (gen_r["choices"][0]["message"]["content"] or "").strip()
+                    # Strip any accidental markdown fences
+                    if gen_code.startswith("```"):
+                        gen_code = "\n".join(
+                            line for line in gen_code.splitlines()
+                            if not line.strip().startswith("```")
+                        ).strip()
+                    # Accept the refactor only if it looks non-trivial
+                    if gen_code and len(gen_code) >= len(code) // 2 and "sys.argv" in gen_code:
+                        code = gen_code
+                        logger.debug(
+                            "skill discovery: generalized %r to use sys.argv", skill_name
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "skill discovery: generalization failed for %r: %s", skill_name, exc
+                    )
+
+            # ── Generate runbook via LLM (cheap call, falls back to mechanical) ──
+            runbook = ""
+            try:
+                stage_lines = "\n".join(f"  {s}" for s in entry["stages"][:6])
+                prompt = (
+                    f"Task: {task}\n"
+                    f"Stages:\n{stage_lines}\n"
+                    f"File written: {fname}\n\n"
+                    f"Write the skill runbook for future reuse of this approach."
+                )
+                r = await client.generate(
+                    [
+                        {"role": "system", "content": _RUNBOOK_SYSTEM},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    max_tokens=350,
+                    temperature=0.2,
+                    stream=False,
+                    thinking=False,
+                )
+                runbook = (r["choices"][0]["message"]["content"] or "").strip()
+            except Exception as exc:
+                logger.debug("skill discovery: LLM runbook failed for %r: %s", skill_name, exc)
+
+            # Mechanical fallback: task + stages as plain text
+            if not runbook or len(runbook.split()) < 20:
+                stage_text = "\n".join(f"- {s}" for s in entry["stages"][:6])
+                runbook = f"## Goal\n{task}\n\n## Steps taken\n{stage_text}"
+
+            summary_line = task[:60].rstrip()
+            result_path = save_skill_program_to_graph(
+                skill_name=skill_name,
+                code=code,
+                graph=graph,
+                runbook=runbook,
+                summary=summary_line,
+            )
+            if result_path is not None or graph:  # graph upsert succeeded
+                new_skills += 1
+                logger.info(
+                    "dream: promoted skill %r from task %r (file: %s)",
+                    skill_name, task[:50], fname,
+                )
+
+        newly_seen.append(ts)
+
+    # Persist seen marker
+    if newly_seen:
+        seen.update(newly_seen)
+        try:
+            seen_path.parent.mkdir(parents=True, exist_ok=True)
+            seen_path.write_text("\n".join(sorted(seen)), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("skill discovery: could not write seen marker: %s", exc)
+
+    return new_skills

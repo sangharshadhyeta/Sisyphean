@@ -86,9 +86,9 @@ function StatusBadge({ running, mock, llmReady }) {
     <span className="tag bg-yellow-900 text-yellow-300">Mock mode</span>
   );
   if (!llmReady) return (
-    <span className="tag bg-yellow-900 text-yellow-300 flex items-center gap-1">
-      <span className="w-2 h-2 rounded-full bg-yellow-400 dot-pulse inline-block"></span>
-      LLM connecting…
+    <span className="tag bg-red-900 text-red-300 flex items-center gap-1">
+      <span className="w-2 h-2 rounded-full bg-red-400 inline-block"></span>
+      AI model unavailable
     </span>
   );
   return (

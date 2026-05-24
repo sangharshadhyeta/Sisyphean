@@ -243,6 +243,16 @@ class Memoriser:
             except Exception as exc:
                 logger.debug("memorise: NER pass failed (%s): %s", session_id, exc)
 
+        # ── Build session timeline node ───────────────────────────────────────
+        # Creates a 'session' node for this conversation and wires it into the
+        # chronological chain anchored at 'session_timeline'.
+        # Injected into context when the user asks "what did we do recently?"
+        # or "when did we last work on X?"
+        try:
+            _build_timeline_node(session_id, events, facts_saved + ner_saved, kg)
+        except Exception as exc:
+            logger.debug("memorise: timeline node failed (%s): %s", session_id, exc)
+
         logger.debug(
             "memorise: session %s → %d facts, %d NER",
             session_id, facts_saved, ner_saved,
@@ -282,6 +292,95 @@ class Memoriser:
                 kg.upsert_node(label, ftype, summary=content, sources=["dream:memorise"])
                 saved += 1
         return saved
+
+
+# ── Session timeline builder ──────────────────────────────────────────────────
+
+def _build_timeline_node(session_id: str, events: list[dict], facts_count: int, kg) -> None:
+    """Create / upsert a 'session' graph node and wire it into the timeline.
+
+    Structure produced
+    ------------------
+    session_timeline  (type=timeline)
+        │ contains
+        ▼
+    session:{date}:{id8}  (type=session)   ◄── summary: date + first user msg + tools
+        │ precedes
+        ▼
+    session:{date}:{id8}  (type=session)   ← next session (linked later)
+
+    The serial 'precedes' chain is built by finding the most recent existing
+    session node and pointing it at the new one.  On first run the timeline
+    root is the only anchor.
+    """
+    from datetime import datetime, timezone
+
+    # ── Derive metadata from events ───────────────────────────────────────────
+    first_ts: str = ""
+    first_user: str = ""
+    tools_used: list[str] = []
+    for evt in events:
+        etype = evt.get("type", "")
+        data  = evt.get("data", {})
+        if not first_ts and evt.get("ts"):
+            first_ts = evt["ts"]
+        if not first_user and etype == "user_message":
+            first_user = data.get("content", "").strip()
+        if etype == "tool_call":
+            name = data.get("name", "")
+            if name and name not in tools_used:
+                tools_used.append(name)
+
+    # Date from first event timestamp (fallback: today)
+    if first_ts:
+        try:
+            date_str = datetime.fromisoformat(first_ts).strftime("%Y-%m-%d")
+        except ValueError:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    else:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    short_id  = session_id[:8]
+    node_name = f"session:{date_str}:{short_id}"
+
+    tools_str = ", ".join(tools_used[:6]) if tools_used else "none"
+    summary   = (
+        f"{date_str} | {first_user[:120] or '(no message)'} "
+        f"| tools: {tools_str} | facts extracted: {facts_count}"
+    )
+
+    # ── Upsert this session node ──────────────────────────────────────────────
+    kg.upsert_node(node_name, "session", summary=summary,
+                   sources=[f"session:{session_id}"])
+
+    # ── Ensure timeline root exists ───────────────────────────────────────────
+    _TL = "session_timeline"
+    if not kg.get_node(_TL):
+        kg.upsert_node(
+            _TL, "timeline",
+            summary=(
+                "Chronological history of all Sisyphean sessions. "
+                "Each session node links outward to what was done in that conversation. "
+                "Follow 'precedes' edges to navigate the timeline."
+            ),
+        )
+
+    # ── timeline → session ────────────────────────────────────────────────────
+    kg.upsert_edge(_TL, "contains", node_name)
+
+    # ── Find the most recent session node and chain it ────────────────────────
+    # All session nodes are sorted by name (date is first so lexicographic = chrono).
+    session_nodes = sorted(
+        [n for n in kg.all_nodes(node_type="session")
+         if n.get("name", "").startswith("session:") and n.get("name") != node_name],
+        key=lambda n: n.get("name", ""),
+    )
+    if session_nodes:
+        prev_name = session_nodes[-1].get("name", "")  # lexically last = most recent
+        if prev_name and prev_name < node_name:
+            kg.upsert_edge(prev_name, "precedes", node_name)
+
+    logger.debug("memorise: timeline node %r (%d tools, %d facts)", node_name, len(tools_used), facts_count)
 
 
 # ── Result type ───────────────────────────────────────────────────────────────

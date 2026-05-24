@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from engine.llm.client import LlamaClient
-    from .graph import KnowledgeGraph
+    from .graph import GraphStore
     from .store import ArtifactStore
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class MemoryInjector:
 
     def __init__(
         self,
-        graph: KnowledgeGraph,
+        graph: "GraphStore",
         store: ArtifactStore,
         token_budget: int = 1500,
         top_n_nodes: int = 5,
@@ -60,42 +60,96 @@ class MemoryInjector:
         # ── 1. Engine policy ─────────────────────────────────────────────────
         policy_nodes = self.graph.all_nodes(node_type="policy") or self.graph.all_nodes(node_type="soul")
         if policy_nodes and remaining > 50:
-            text = "### Engine Policy\n" + "\n".join(n["content"] for n in policy_nodes)
+            text = "### Engine Policy\n" + "\n".join(
+                n.get("summary") or n.get("content", "") for n in policy_nodes
+            )
+            text, remaining = _fit(text, remaining)
+            if text:
+                sections.append(text)
+
+        # ── 1b. System info (OS, shell, Python version) ───────────────────────
+        # Written by app.py on every startup via graph.upsert_node("System", "system", …).
+        # Placed right after policy so the model always knows which OS it's on and
+        # which commands to use — critical for bash step planning.
+        system_nodes = self.graph.all_nodes(node_type="system")
+        if system_nodes and remaining > 30:
+            text = "### System\n" + "\n".join(
+                n.get("summary") or n.get("content", "") for n in system_nodes
+            )
             text, remaining = _fit(text, remaining)
             if text:
                 sections.append(text)
 
         # ── 2. User knowledge ────────────────────────────────────────────────
         user_nodes = self.graph.all_nodes(node_type="user")
-        user_nodes = [n for n in user_nodes if n.get("content", "").strip() and
-                      "to be filled" not in n["content"]]
+        user_nodes = [n for n in user_nodes
+                      if (n.get("summary") or n.get("content", "")).strip()
+                      and "to be filled" not in (n.get("summary") or n.get("content", ""))]
         if user_nodes and remaining > 50:
-            text = "### User\n" + "\n".join(n["content"] for n in user_nodes)
+            text = "### User\n" + "\n".join(
+                n.get("summary") or n.get("content", "") for n in user_nodes
+            )
             text, remaining = _fit(text, remaining)
             if text:
                 sections.append(text)
 
         # ── 3. Active project ────────────────────────────────────────────────
+        # Only show project nodes touched in the last 14 days — prevents old
+        # projects (e.g. "Climate Impact Calculator") from bleeding into
+        # unrelated current sessions.
+        import time as _time
+        _cutoff = _time.time() - 14 * 86400
         proj_nodes = self.graph.all_nodes(node_type="project")
-        proj_nodes = [n for n in proj_nodes if n.get("content", "").strip() and
-                      "to be filled" not in n["content"]]
+        proj_nodes = [n for n in proj_nodes
+                      if (n.get("summary") or n.get("content", "")).strip()
+                      and "to be filled" not in (n.get("summary") or n.get("content", ""))
+                      and n.get("last_seen", 0) >= _cutoff]
         if proj_nodes and remaining > 50:
             text = "### Current Project\n" + "\n".join(
-                f"**{n['label']}**: {n['content']}" for n in proj_nodes[:2]
+                f"**{n.get('name') or n.get('label', '?')}**: "
+                f"{n.get('summary') or n.get('content', '')}"
+                for n in proj_nodes[:2]
             )
             text, remaining = _fit(text, remaining)
             if text:
                 sections.append(text)
 
-        # ── 4. Relevant facts / concepts (query-matched, old KnowledgeGraph) ────
+        # ── 3b. Recent session timeline ──────────────────────────────────────
+        # Surface recent sessions when the user asks temporal questions:
+        # "what did we do last time?", "when did we work on X?", etc.
+        # Only injects if the message contains temporal keywords OR if the
+        # graph has session nodes (dream cycle has run at least once).
+        _temporal_kws = {"last", "yesterday", "recent", "before", "when", "did", "history", "session", "timeline", "previously", "ago", "worked"}
+        if remaining > 60 and any(w in message.lower() for w in _temporal_kws):
+            session_nodes = sorted(
+                self.graph.all_nodes(node_type="session"),
+                key=lambda n: n.get("name", ""),
+                reverse=True,   # most recent first
+            )[:3]
+            if session_nodes:
+                lines = [
+                    f"- {n.get('summary', n.get('name','?'))[:200]}"
+                    for n in session_nodes
+                ]
+                text = "### Recent Sessions\n" + "\n".join(lines)
+                text, remaining = _fit(text, remaining)
+                if text:
+                    sections.append(text)
+
+        # ── 4. Relevant facts / concepts ─────────────────────────────────────
         if remaining > 80:
             hits = self.graph.search(
                 message,
                 top_n=self.top_n_nodes,
-                node_types=["fact", "concept", "project"],
+                node_types=["fact", "concept", "project", "entity", "session"],
             )
             if hits:
-                lines = [f"- [{h['type']}] **{h['label']}**: {h['content'][:200]}" for h in hits]
+                lines = [
+                    f"- [{h.get('type','?')}] "
+                    f"**{h.get('name') or h.get('label','?')}**: "
+                    f"{(h.get('summary') or h.get('content',''))[:200]}"
+                    for h in hits
+                ]
                 text = "### Relevant Context\n" + "\n".join(lines)
                 text, remaining = _fit(text, remaining)
                 if text:
@@ -130,8 +184,14 @@ class MemoryInjector:
         if not sections:
             return ""
 
-        header = "---\n## Memory\n"
-        footer = "\n---"
+        # Authoritative framing — tells the model this is persistent self-knowledge,
+        # not something the user just said. Mirrors Hermes Agent's memory block framing.
+        header = (
+            "[Persistent Memory — authoritative facts about yourself and your work. "
+            "These are NOT from the current conversation. "
+            "Use them to answer with self-awareness and continuity.]\n"
+        )
+        footer = "\n[/Persistent Memory]"
         return header + "\n\n".join(sections) + footer
 
 

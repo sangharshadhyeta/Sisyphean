@@ -11,7 +11,11 @@ from __future__ import annotations
 import time as _time
 
 # ---------------------------------------------------------------------------
-# Static system prompt — never modified at runtime so KV cache stays warm
+# Static system prompt — no OS-specific content here.
+# Shell / OS details are injected at runtime from the "### System" memory
+# section (written by app.py on startup via graph.upsert_node("System", ...)).
+# Keeping this prompt OS-agnostic means it never needs to change when the
+# machine or OS changes, and the KV cache stays warm across all sessions.
 # ---------------------------------------------------------------------------
 
 SYSTEM = """\
@@ -25,16 +29,9 @@ Capabilities: file system, shell commands, web search, persistent memory, PC con
 Never say "I can't" when bash + web search could handle it. If you don't know, search.
 Do not write [SEARCH: ...] or similar meta-instructions in replies.
 
-Shell: PowerShell on Windows (win32). Use PowerShell syntax for all commands.
-- List files: Get-ChildItem or ls (aliased). Create dirs: New-Item -ItemType Directory or mkdir.
-- Use backslashes in Windows paths or $env:VAR for environment variables.
-- Do NOT use Linux-only commands (grep, find, chmod, ln, cat /dev/null, etc.).
-- Path separator: backslash. Home: $env:USERPROFILE.
-- Running commands: execute every shell command directly as-is. \
-Only prepend `python` when the target file ends in `.py` (e.g. `python script.py`). \
-All other executables — system tools, CLIs, diagnostics — run without any prefix.
-- Live system state (status, hardware, processes, GPU, network) comes from running shell \
-commands, not from web search.
+Shell: use the commands appropriate for your OS (check the System section in your memory).
+Live machine state always comes from running shell commands — never from web search.
+Run executables directly as-is; prepend the interpreter only for script files (e.g. python script.py).\
 """
 
 # ---------------------------------------------------------------------------
@@ -45,7 +42,7 @@ commands, not from web search.
 def dynamic_context(workspace: str = "", task_goal: str = "", step_n: int = 0, budget: int = 0) -> str:
     parts = [f"Date: {_time.strftime('%Y-%m-%d %H:%M')}"]
     if workspace:
-        parts.append(f"Workspace: {workspace}")
+        parts.append(f"Workspace (write ALL task files here): {workspace}")
     if task_goal:
         parts.append(f"Goal: {task_goal}")
     if budget:

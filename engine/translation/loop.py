@@ -65,6 +65,7 @@ class TranslationLoop:
             prefs_path=_prefs_path,
             knowledge_graph=knowledge_graph,
             workspace=workspace,
+            budget_tracker=budget_tracker,
         )
 
     async def process(
@@ -72,7 +73,7 @@ class TranslationLoop:
         user_message: str,
         raw_history: list[dict],
         available_tools: list[dict],
-        memory_context: str = "",     # kept for signature compat
+        memory_context: str = "",
         system_context: str = "",
     ) -> LoopResponse:
         """Delegate to the core pipeline."""
@@ -93,6 +94,7 @@ class TranslationLoop:
             raw_history=raw_history,
             available_tools=available_tools,
             system_context=system_context,
+            memory_ctx=memory_context,
         )
 
     async def _direct(

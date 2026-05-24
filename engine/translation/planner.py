@@ -143,14 +143,34 @@ def parse_format_response(content: str) -> dict | None:
 # Stage type inference
 # ---------------------------------------------------------------------------
 
+_STEP_NUMBER_RE = re.compile(
+    r'^(?:step\s*\d+\s*[:.)]\s*|\d+\s*[:.)]\s*)',
+    re.IGNORECASE,
+)
+
+
 def infer_stage_type(step_text: str) -> str:
     """Classify a plain-English step into a stage type.
 
     Priority: save_memory > research > verify > write_doc > write_code
-    Research wins when a step mentions both search and write — the intent
-    is to gather information, not produce a file.
+
+    Numbered prefixes ("STEP2:", "Step 1.", "2)") are stripped before
+    classification so bare label artefacts never route to web_search.
+    Unknown / empty steps default to "direct" instead of "research" —
+    an unclassifiable step should not trigger a random web search.
     """
-    s = step_text.lower()
+    # Strip "STEP2", "Step 1:", "2." etc. — model sometimes emits these
+    clean = _STEP_NUMBER_RE.sub("", step_text).strip()
+    s = clean.lower()
+
+    if not s:
+        return "direct"
+    # Skill steps are always "direct" — run_skill converts to bash in _execute;
+    # read_skill is an internal graph lookup. Neither should trigger web_search.
+    if s.startswith("run skill:") or s.startswith("run_skill:") or s.startswith("run skill "):
+        return "direct"
+    if s.startswith("read skill:") or s.startswith("read_skill:") or s.startswith("read skill "):
+        return "direct"
     if s.startswith("save:") or s.startswith("save_memory:") or s.startswith("save_memory "):
         return "save_memory"
     if any(k in s for k in _RESEARCH_KW):
@@ -161,7 +181,7 @@ def infer_stage_type(step_text: str) -> str:
         return "write_doc"
     if any(k in s for k in _CODE_KW):
         return "write_code"
-    return "research"
+    return "direct"   # unknown → answer directly, never random websearch
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +395,24 @@ _INTERNAL_TOOLS = [
     ("direct",        "answer directly without any tool call — use for greetings, thanks, simple chat, capability questions"),
     ("web_search",    "search the web for any factual or current information"),
     ("search_memory", "look up previously saved facts or research from past sessions"),
+    ("write_plan",    "write a file section-by-section with verify-and-retry — "
+                      "use ONLY for files the user explicitly asked to keep: programs, modules, documents, reports. "
+                      "Input format: write_plan:FILENAME|GOAL  (pipe-separated filename and task description)"),
+    # ── Skill tools (progressive disclosure) ────────────────────────────────
+    # read_skill / run_skill are shown only when the skill index is non-empty.
+    # save_skill / save_skill_program are always available so the model can
+    # capture new approaches even before any skills exist.
+    ("save_skill",         "save a reusable text approach after solving a non-trivial problem — "
+                           "save_skill:SKILL-NAME|step-by-step runbook that worked. "
+                           "Skip for greetings, trivial math, single bash commands."),
+    ("save_skill_program", "save the actual program code as a reusable skill — "
+                           "save_skill_program:SKILL-NAME|complete-program-code. "
+                           "Use when you just wrote a script the user will likely want again."),
 ]
 _INTERNAL_TOOL_NAMES = frozenset(t[0] for t in _INTERNAL_TOOLS)
 
 
-def _build_plan_system(outer_tools: list[dict]) -> str:
+def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
     """Build the plan system prompt from harness-provided tools + internal tools."""
     lines = ["Pick the right tool and write its exact input. Use pipe | to chain steps.\n"]
     lines.append("Available tools:")
@@ -390,6 +423,16 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
             lines.append(f"  {name} — {desc}")
     for name, desc in _INTERNAL_TOOLS:
         lines.append(f"  {name} — {desc}")
+    # read_skill / run_skill only shown when relevant skills exist (Layer 2/3 disclosure)
+    if skill_index:
+        lines.append(
+            "  read_skill — load the full step-by-step runbook for a known skill — "
+            "read_skill:SKILL-NAME"
+        )
+        lines.append(
+            "  run_skill  — execute a skill's saved program directly (skips re-implementation) — "
+            "run_skill:SKILL-NAME"
+        )
     lines += [
         "",
         "Use 'direct' for: hi, hello, thanks, what can you do, are you alive, simple social exchanges.",
@@ -400,6 +443,17 @@ def _build_plan_system(outer_tools: list[dict]) -> str:
         "Complex multi-part tasks MUST use 3+ steps — use pipe-separated steps for each action.",
         'Single step: {"steps": "toolname:input"}',
         'Multiple steps: {"steps": "toolname:input | toolname:input | toolname:input"}',
+        "",
+        "TEMPORARY vs PERMANENT files:",
+        "  bash — for one-off utility scripts the agent needs to compute something (calc.py,",
+        "         quick test script). These are ephemeral: write, run, discard.",
+        "  write_plan — for files the USER explicitly asked to create and keep: a Python",
+        "         module, a PDF extractor program, a report, an essay. These are permanent.",
+        "         Format: write_plan:FILENAME|TASK DESCRIPTION",
+        "         Example: write_plan:fibonacci.py|Write a Fibonacci number generator with tests",
+        "",
+        "WORKSPACE: When using bash to create or run files, always use the full absolute",
+        "  workspace path given in the task message — never bare relative filenames like calc.py.",
     ]
     return "\n".join(lines)
 
@@ -549,34 +603,53 @@ _THINK_DECOMPOSE_SYSTEM = """\
 You are a task router. Output ONLY valid JSON: {"outcome": "...", "steps": "..."}
 
 STEP FORMATS:
-  steps=""                        answer directly from knowledge, no tool
-  steps="Run COMMAND"             run that exact shell command
-  steps="Search TOPIC KEYWORDS"   web search, replace TOPIC KEYWORDS with real words
-  steps="Write FILENAME"          create a file
-  steps="Save: FACT"              save what user said to remember
-  steps="STEP1 | STEP2"           pipe for multi-step tasks
+  steps=""                   answer directly — no tool needed
+  steps="Search KEYWORDS"    web search — write real search terms
+  steps="Run COMMAND"        run a shell command
+  steps="Write FILENAME"     create a code or document file
+  steps="Save: FACT"         persist a fact to memory
+  steps="STEP1 | STEP2"      chain multiple steps with a pipe
 
 ROUTING RULES:
 
-steps="" for: greetings, thanks, social replies, capability questions,
-  stable facts (capitals, definitions, history, math you answer in steps below).
-  NEVER use Search for these.
+steps="" ONLY for pure social/conversational replies that need no factual lookup,
+  no computation, and no file: greetings (hi/hello/hey), acknowledgements (ok/thanks),
+  capability questions (what can you do?), existential questions (are you alive?).
+  Do NOT use steps="" for any factual question or arithmetic — those always need a tool.
 
-steps="Run python -c 'print(EXPRESSION)'" for ALL arithmetic.
-  Write the Python EXPRESSION, not the pre-computed answer.
-  Use only built-in operators — no imports (math, etc.) in -c mode.
-  Example: "square root of 144" → Run python -c 'print(144**0.5)'
-  Example: "15 times 7" → Run python -c 'print(15*7)'
-  Example: "2+2" → Run python -c 'print(2+2)'
+steps="Search KEYWORDS" for ANY question with a factual answer: capitals, people,
+  history, definitions, events, versions, how-to procedures, prices, commands.
+  Search even when the answer seems obvious — small models hallucinate. Always prefer
+  a real answer from the web over a confident guess.
 
-steps="Run COMMAND" for live system state (CPU, RAM, GPU, disk, processes),
-  installing packages, running or testing existing code files.
+steps="Run COMMAND" for TEMPORARY scratch work: one-off checks, quick computations,
+  utility scripts the agent needs to verify a result. Write to a file, run it,
+  done. Use a descriptive filename. Always use the full workspace path in the command.
+  Example: steps="Run echo 'import sys; print(int(sys.argv[1])+int(sys.argv[2]))' > WORKSPACE/add.py | Run python WORKSPACE/add.py 5 3"
 
-steps="Search KEYWORDS" ONLY for live/changing data: today's news, current
-  prices, latest software versions, recent events. Replace KEYWORDS with the
-  actual search terms — never output the word KEYWORDS literally.
+steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to create
+  and keep: Python programs, modules, extractors, full applications, documents,
+  essays, reports. These go through the incremental write+verify pipeline.
+  Use a descriptive filename that matches the deliverable.
+  WORKSPACE RULE: The workspace path is given in the prompt. ALL files MUST live
+  inside that workspace directory — never use a bare filename.
+  PARAMETERIZE: any program written for reuse MUST accept inputs via sys.argv (or
+  argparse), never hardcoded values. Task "sum 5 and 3" → write sum.py that reads
+  sys.argv[1] and sys.argv[2], then Run python WORKSPACE/sum.py 5 3.
+  Programs with baked-in constants are one-offs; programs that read sys.argv are skills.
 
-steps="Save: FACT" ONLY when user says remember / save / note / keep in mind.
+steps="Run COMMAND" only for running already-existing files or installing
+  packages with a known manager (pip install X, npm install Y).
+
+steps="Save: FACT" only when the user says: remember / save / note / keep in mind.
+
+SKILL-FIRST — check before planning new stages:
+If "Relevant skills" are listed below the task, scan them first.
+  • skill tagged [runnable] → plan a single step: "Run skill:SKILL-NAME"
+    (this re-executes the saved program; no web search, no write pipeline needed)
+  • text-only skill (no [runnable] tag) → plan "Read skill:SKILL-NAME" as first step,
+    then only add Search / Write steps for gaps the runbook does not cover
+Only fall through to full search/write planning when NO skill matches this task type.
 """
 
 
@@ -585,6 +658,8 @@ async def think_decompose(
     client,
     context: str = "",
     soul_section: str = "",
+    workspace: str = "",
+    skill_index: str = "",
 ) -> tuple[str, list[dict]]:
     """LLM planning call that decomposes the task into stages.
 
@@ -603,12 +678,21 @@ async def think_decompose(
     The LLM decides routing — greetings, social replies, capability questions
     all return steps="" (direct) based on the prompt instructions.
     No regex pre-filters: the model owns the routing decision.
+
+    skill_index: compact bullet list from get_skill_index() — tells the model
+    which skills it already has for this task so it can plan a read_skill step
+    instead of rediscovering from scratch.
     """
     prompt = f"Task: {query[:300]}"
+    if workspace:
+        prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:
         prompt += f"\nContext:\n{context[:300]}"
     if soul_section:
         prompt += f"\nPersonality guidance:\n{soul_section[:150]}"
+    # Layer 1 — inject compact skill index so model can plan read_skill steps
+    if skill_index:
+        prompt += f"\nRelevant skills (use read_skill:NAME for full runbook):\n{skill_index}"
 
     try:
         result = await client.generate(
@@ -662,25 +746,36 @@ async def plan_task(
     context: str = "",
     soul_section: str = "",
     user_prefs: str = "",
+    workspace: str = "",
+    skill_index: str = "",
 ) -> list[dict]:
     """Plan a single task → list of {tool, input} steps.
 
     One LLM call with the available tools listed. The model picks the right
     tool and provides the input — no regex pre-filters, no conditional routing.
+
+    skill_index: compact bullet list from get_skill_index() — injected into
+    the prompt so the model can choose read_skill:NAME instead of web_search
+    when it already has a runbook for this type of task.
     """
     logger.debug("plan_task: LLM planning call for %r", task[:60])
     prompt = f"Task: {task[:200]}"
+    if workspace:
+        prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:
         prompt += f"\nContext:\n{context[:400]}"
     if soul_section:
         prompt += f"\nPersonality guidance:\n{soul_section[:200]}"
     if user_prefs:
         prompt += f"\nUser preferences:\n{user_prefs[:150]}"
+    # Layer 1 — compact skill index so model can plan read_skill or save_skill steps
+    if skill_index:
+        prompt += f"\nRelevant skills (read_skill:NAME for full runbook):\n{skill_index}"
 
     try:
         result = await client.generate(
             [
-                {"role": "system", "content": _build_plan_system(outer_tools)},
+                {"role": "system", "content": _build_plan_system(outer_tools, skill_index=skill_index)},
                 {"role": "user",   "content": prompt},
             ],
             temperature=0.1,

@@ -3,10 +3,11 @@
 Entry point: run_write_step(client, instruction, workspace, file_path="") -> StageResult
 
 For each item in the manifest:
-  1. Build a focused write prompt (goal + done items + file tail + this item)
+  1. Build a focused write prompt (goal + done items + progressive context + this item)
+     Context hierarchy: CLAUDE.md → exact section → relevant lines → continuation point
   2. Call LLM → raw text output
   3. Snapshot file → append output → verify
-  4. If previously-complete items regressed, rollback to snapshot and retry
+  4. Rollback on char-ratio regression (file shrank >20%) or anchor regression
   5. On completion, move to next item
 
 Returns StageResult with progress summary.
@@ -14,19 +15,23 @@ Returns StageResult with progress summary.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Literal
 
 from .manifest import SubtaskItem, SubtaskManifest
 from engine.translation.subtask import planner as _planner
 from engine.translation.subtask import verifier as _verifier
+from engine.translation.subtask.line_search import (
+    find_section,
+    find_continuation_point,
+    search_relevant,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_ITEM_RETRIES = 2
 MAX_WRITE_ITERATIONS = 20   # hard cap on total outer-loop iterations
-_FILE_TAIL_LINES = 25
+_MAX_CTX_CHARS = 6_000      # max chars injected as file context (~1500 tokens)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -66,12 +71,54 @@ def _write_file(path: str, content: str, append: bool) -> None:
         f.write(content)
 
 
-def _file_tail(path: str, n: int = _FILE_TAIL_LINES) -> str:
-    content = _read_file(path)
-    if not content:
-        return ""
-    lines = content.splitlines()
-    return "\n".join(lines[-n:] if len(lines) > n else lines)
+def _read_for_context(path: str, item_title: str, file_type: str, workspace: str = "") -> str:
+    """4-step progressive disclosure — most specific context first.
+
+    1. CLAUDE.md in workspace root — project-level notes relevant to this item
+    2. find_section   — exact section/function in the target file matching item_title
+    3. search_relevant — goal-relevant lines scattered through the file
+    4. find_continuation_point — last header → EOF (natural append point)
+
+    Returns a pre-labelled context string ready for LLM injection.
+    Caps at _MAX_CTX_CHARS to avoid context overflow.
+    """
+    parts: list[str] = []
+
+    # Step 1: project notes (CLAUDE.md in workspace root)
+    if workspace:
+        claude_md = Path(workspace) / "CLAUDE.md"
+        if claude_md.is_file():
+            ws_ctx = search_relevant(item_title, [claude_md], context_lines=1, max_results=3)
+            if ws_ctx:
+                logger.debug("[ctx] CLAUDE.md hit  item=%r  chars=%d", item_title[:40], len(ws_ctx))
+                parts.append(f"[CLAUDE.md]\n{ws_ctx}")
+            else:
+                logger.debug("[ctx] CLAUDE.md miss  item=%r", item_title[:40])
+
+    # Step 2: exact section/function in the target file
+    section = find_section(path, item_title, file_type)
+    if section:
+        logger.debug("[ctx] find_section hit  item=%r  chars=%d", item_title[:40], len(section))
+        parts.append(f"[{Path(path).name} — {item_title}]\n{section}")
+        ctx = "\n\n".join(parts)
+        return ctx[:_MAX_CTX_CHARS] + "\n...[truncated]" if len(ctx) > _MAX_CTX_CHARS else ctx
+
+    # Step 3: goal-relevant lines scattered through the file
+    rel = search_relevant(item_title, [path], context_lines=2)
+    if rel:
+        logger.debug("[ctx] search_relevant hit  item=%r  chars=%d", item_title[:40], len(rel))
+        parts.append(f"[{Path(path).name}]\n{rel}")
+        ctx = "\n\n".join(parts)
+        return ctx[:_MAX_CTX_CHARS] + "\n...[truncated]" if len(ctx) > _MAX_CTX_CHARS else ctx
+
+    # Step 4: last section → EOF (natural continuation point)
+    cont = find_continuation_point(path, file_type)
+    if cont:
+        logger.debug("[ctx] continuation fallback  item=%r  chars=%d", item_title[:40], len(cont))
+        parts.append(f"[{Path(path).name}]\n{cont}")
+
+    ctx = "\n\n".join(parts)
+    return ctx[:_MAX_CTX_CHARS] + "\n...[truncated]" if len(ctx) > _MAX_CTX_CHARS else ctx
 
 
 def _infer_output_path(stage_goal: str, file_type: Literal["doc", "code"], workspace: str) -> str:
@@ -98,6 +145,7 @@ def _build_write_prompt(
     error_hint: str = "",
     done_summary: str = "",
     context: str = "",
+    workspace: str = "",
 ) -> str:
     if attempt > 0:
         # Retry: show verifier gap analysis
@@ -108,16 +156,13 @@ def _build_write_prompt(
             prompt += f"\n\nNote from last attempt: {error_hint}"
         return prompt
 
-    # First attempt: show goal, accumulated done-summary, file tail, what to write next
+    # First attempt: 4-step progressive context + goal + what to write next
     done = [it for it in manifest.items if it.status == "complete"]
     done_str = ", ".join(it.title for it in done) or "none yet"
 
-    tail = _file_tail(manifest.file_path)
-    file_state = (
-        f"Current file tail ({manifest.file_path}):\n{tail}"
-        if tail
-        else f"[{manifest.file_path} — empty, start fresh]"
-    )
+    # Progressive disclosure: CLAUDE.md → exact section → relevant lines → continuation
+    ctx_str = _read_for_context(manifest.file_path, item.title, manifest.file_type, workspace)
+    file_state = ctx_str if ctx_str else f"[{manifest.file_path} — empty, start fresh]"
 
     if manifest.file_type == "code":
         marker_hint = f"Start with exactly: def {item.anchor}( (or class {item.anchor}:)\n"
@@ -152,6 +197,7 @@ async def _write_item(
     client: Any,
     done_summary: str = "",
     context: str = "",
+    workspace: str = "",
 ) -> bool:
     """Write one item with up to MAX_ITEM_RETRIES retries. Returns True if complete.
 
@@ -172,6 +218,7 @@ async def _write_item(
         prompt = _build_write_prompt(
             item, manifest, attempt, error_hint, done_summary,
             context=context if attempt == 0 else "",
+            workspace=workspace if attempt == 0 else "",
         )
         error_hint = ""
 
@@ -224,6 +271,23 @@ async def _write_item(
         # Verify
         fc = _read_file(manifest.file_path)
         diff = _verifier.run(manifest, fc)
+
+        # Rollback if file shrank by more than 20% (char-ratio regression guard)
+        if snapshot and len(fc) < len(snapshot) * 0.8:
+            logger.warning(
+                "[subtask] char-ratio regression  item=%r attempt=%d  before=%d  after=%d — rolling back",
+                item.title[:40], attempt, len(snapshot), len(fc),
+            )
+            try:
+                Path(manifest.file_path).write_text(snapshot, encoding="utf-8")
+                _verifier.run(manifest, snapshot)
+            except OSError as exc:
+                logger.error("[subtask] rollback failed: %s", exc)
+            error_hint = (
+                f"Your output caused the file to shrink from {len(snapshot)} to {len(fc)} chars. "
+                f"Append only — do not overwrite or delete earlier content."
+            )
+            continue
 
         # Rollback if previously-complete items regressed
         regressed_anchors = {it.anchor for it in diff.regressed} & prev_complete
@@ -315,7 +379,7 @@ async def run_write_step(
         _iteration += 1
 
         item = manifest.current_item
-        success = await _write_item(item, manifest, client, done_summary=done_summary, context=context)
+        success = await _write_item(item, manifest, client, done_summary=done_summary, context=context, workspace=workspace)
 
         status_word = "written" if success else "partial"
         content_hint = f" — {item.summary[:60]}" if item.summary else ""

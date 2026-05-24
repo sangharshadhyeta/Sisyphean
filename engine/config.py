@@ -110,6 +110,10 @@ class SearchConfig(BaseModel):
     timeout: float = 15.0
 
 
+class DebugConfig(BaseModel):
+    dump_requests: bool = False  # write last_request.json on every fresh request
+
+
 class Config(BaseModel):
     llm: LLMConfig
     embedding: EmbeddingConfig = EmbeddingConfig()
@@ -117,6 +121,7 @@ class Config(BaseModel):
     memory: MemoryConfig = MemoryConfig()
     permissions: PermissionsConfig = PermissionsConfig()
     search: SearchConfig = SearchConfig()
+    debug: DebugConfig = DebugConfig()
     mock: bool = False
     workspace: str = "./workspace"
 

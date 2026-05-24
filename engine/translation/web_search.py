@@ -1,19 +1,17 @@
-"""Web search for Sisyphean.
+"""Web search for Sisyphean — internal fallback path only.
 
-Four-tier search with automatic fallback:
-  1. SearXNG  — private, multi-engine. Requires local instance.
+Two-tier search for standalone / graph-first mode:
+  1. SearXNG  — private, self-hosted, multi-engine. Requires local instance.
                Set `search.searxng_url` in config.yaml to enable.
   2. Jina AI  — free-tier AI-powered search (s.jina.ai). Returns clean,
                AI-processed content. No API key required for basic use.
                Results are marked is_ai_synthesized=True.
-  3. DuckDuckGo package (ddgs / duckduckgo_search) — full results, no API key.
-               Install: pip install duckduckgo-search
-  4. DuckDuckGo Instant Answers API — pure httpx fallback, no extra package.
-               Limited to abstract + related topics.
 
-When running under Claude Code, the outer WebSearch tool is preferred over
-this module for real-time results. This module handles the internal search
-path (standalone mode, or when graph-first check triggers before the outer tool).
+When running under Claude Code, the pipeline delegates web_search to Claude
+Code's own WebSearch outer tool (see pipeline.py lines ~934-936).  This
+module is only reached in standalone mode or when the outer tool is absent.
+DuckDuckGo has been removed — it blocks automated requests and adds no value
+over Jina for the standalone case.
 """
 from __future__ import annotations
 
@@ -62,12 +60,15 @@ def _get_search_config():
 async def search(query: str, max_results: int = 5) -> list[SearchResult]:
     """Search the web and return results as SearchResult objects.
 
-    Falls through four tiers automatically.  Returns [] only if all
-    tiers fail (e.g. no network, all services down).
+    Two-tier fallback for standalone / internal mode.  Returns [] if both
+    tiers fail (no SearXNG configured and Jina unreachable).
 
     Jina AI (tier 2) returns AI-processed results marked with
     is_ai_synthesized=True — the synthesizer can skip its LLM call
     when all results carry this flag.
+
+    Under Claude Code, this function is bypassed: the pipeline delegates
+    web_search to Claude Code's own WebSearch outer tool instead.
     """
     if not query or not query.strip():
         return []
@@ -76,7 +77,7 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
     n = max_results or cfg_max
     timeout = cfg_timeout
 
-    # ── Tier 1: SearXNG ──────────────────────────────────────────────────────
+    # ── Tier 1: SearXNG (self-hosted, private) ───────────────────────────────
     if searxng_url:
         results = await _search_searxng(query, searxng_url, n, timeout)
         if results:
@@ -90,18 +91,6 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
         logger.info("web_search: Jina ok  query=%r  results=%d", query[:50], len(results))
         return results
     logger.debug("web_search: Jina miss  query=%r", query[:50])
-
-    # ── Tier 3: DuckDuckGo package (ddgs / duckduckgo_search) ────────────────
-    results = await _search_ddg_package(query, n)
-    if results:
-        logger.info("web_search: DDG package ok  query=%r  results=%d", query[:50], len(results))
-        return results
-
-    # ── Tier 4: DuckDuckGo Instant Answers API (pure httpx) ──────────────────
-    results = await _search_ddg_instant(query, n, timeout)
-    if results:
-        logger.info("web_search: DDG instant ok  query=%r  results=%d", query[:50], len(results))
-        return results
 
     logger.warning("web_search: all tiers failed  query=%r", query[:50])
     return []
@@ -184,78 +173,6 @@ async def _search_jina(
             source="jina",
             is_ai_synthesized=True,
         ))
-
-    return results
-
-
-async def _search_ddg_package(query: str, n: int) -> list[SearchResult]:
-    """Use ddgs or duckduckgo_search package for full web results."""
-    import asyncio
-    try:
-        def _sync_search():
-            # ddgs is the maintained fork; fall back to the original package name
-            try:
-                from ddgs import DDGS  # type: ignore[import]
-            except ImportError:
-                from duckduckgo_search import DDGS  # type: ignore[import]
-            results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=n):
-                    results.append(SearchResult(
-                        title=r.get("title", ""),
-                        url=r.get("href", ""),
-                        snippet=r.get("body", "")[:500],
-                    ))
-            return results
-        # Run the blocking DDGS call in a thread pool to avoid blocking the event loop
-        return await asyncio.get_event_loop().run_in_executor(None, _sync_search)
-    except Exception as exc:
-        logger.debug("_search_ddg_package failed: %s", exc)
-        return []
-
-
-async def _search_ddg_instant(
-    query: str, n: int, timeout: float
-) -> list[SearchResult]:
-    """DuckDuckGo Instant Answers API — no package required."""
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            resp = await http.get(
-                "https://api.duckduckgo.com/",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "no_html": "1",
-                    "skip_disambig": "1",
-                },
-                headers={"User-Agent": "Sisyphean/1.0"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        logger.debug("_search_ddg_instant failed: %s", exc)
-        return []
-
-    results: list[SearchResult] = []
-
-    abstract = data.get("AbstractText", "")
-    if abstract:
-        results.append(SearchResult(
-            title=data.get("Heading", query),
-            url=data.get("AbstractURL", ""),
-            snippet=abstract[:500],
-        ))
-
-    for topic in data.get("RelatedTopics", []):
-        if isinstance(topic, dict) and topic.get("Text"):
-            results.append(SearchResult(
-                title=topic.get("Text", "")[:80],
-                url=topic.get("FirstURL", ""),
-                snippet=topic.get("Text", "")[:500],
-            ))
-        if len(results) >= n:
-            break
 
     return results
 

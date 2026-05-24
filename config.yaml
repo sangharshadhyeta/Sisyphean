@@ -23,7 +23,7 @@ llm:
   #   Groq        https://console.groq.com   gemma2-9b-it
   #   Google AI   https://aistudio.google.com gemini-2.0-flash-lite
   external_api:
-    enabled: false
+    enabled: true
     base_url: "http://192.168.29.37:8081/v1"
     api_key: "local"
     model: "gemma-4-E4B-it-Q8_0.gguf"
@@ -58,6 +58,12 @@ memory:
   top_n_artifacts: 3                 # artifact store results per query
   embedding_model: null              # keyword search only — no HuggingFace download
 
+search:
+  searxng_url: "http://localhost:8888"   # local SearXNG instance — set to "" to disable
+
 mock: false
 
 workspace: ./workspace
+
+debug:
+  dump_requests: false   # set true to write last_request.json for each fresh request

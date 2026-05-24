@@ -8,6 +8,10 @@ echo  +===========================================+
 echo  ^|   Sisyphean Engine  --  Install/Update   ^|
 echo  +===========================================+
 echo.
+echo  NOTE: If you are using BirdClaw, run BirdClaw's install.bat instead.
+echo  It installs Sisyphean automatically as part of the full stack
+echo  (BirdClaw + Sisyphean + SearXNG).  This script is for standalone use.
+echo.
 
 :: ── Check Python ──────────────────────────────────────────────────────────────
 python --version >nul 2>&1

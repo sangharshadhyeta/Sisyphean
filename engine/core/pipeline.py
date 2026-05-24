@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform as _platform
 import re
 import time as _time
 import uuid
@@ -26,6 +27,11 @@ from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
 from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command
+from engine.memory.skills import (
+    get_skill_index, get_skill_runbook, get_skill_program,
+    get_skill_script_path, save_skill_to_disk, save_skill_program_to_graph,
+)
+from engine.translation.prompts import STAGE_BUDGETS
 from engine.translation.web_search import search as _web_search, fetch as _web_fetch_page, format_results
 import engine.task_tracker as _tracker
 from engine.activity import log_event as _log
@@ -138,14 +144,16 @@ IF the search returned nothing useful OR off-topic results:
       → reformulate with the correct OS context (e.g. add "Windows" or "Linux")
     - Result about a different meaning of the query?
       → narrow with the specific domain or context
-    - Task is about THIS machine's current state (processes, CPU, memory, disk,
-      system status, uptime, network) → plan a bash step, do NOT search the web
     - If a better query is genuinely needed → plan web_search with the improved query
+
+IF the search returned system diagnostic commands (systeminfo, tasklist, Get-ComputerInfo,
+  top, ps, df, etc.) — copy the EXACT command from the result and plan a bash step.
+  Always pick the command for the OS that appears in the search result context.
 
 RULES (enforce strictly):
   - NEVER output the exact same search query that was just run — always reformulate
   - A query that already ran once must not appear again in your steps
-  - For machine/system state queries: always bash, never web_search
+  - Copy commands VERBATIM from search results — never invent or paraphrase commands
 
 Reply as JSON: {"steps": "toolname:exact input | toolname:exact input"}
 
@@ -302,12 +310,14 @@ class Pipeline:
         prefs_path: Path,
         knowledge_graph=None,
         workspace: str = "",
+        budget_tracker=None,
     ) -> None:
         self.client  = client
         self.soul_path  = policy_path  # kept as soul_path internally for compatibility
         self.prefs_path = prefs_path
         self.graph   = knowledge_graph
         self.workspace = workspace
+        self.budget_tracker = budget_tracker
         self.recall  = Recall(graph=knowledge_graph, workspace=workspace or ".")
 
     async def process(
@@ -316,6 +326,7 @@ class Pipeline:
         raw_history: list[dict],
         available_tools: list[dict],
         system_context: str = "",
+        memory_ctx: str = "",
     ) -> LoopResponse:
         """Entry point. Handles fresh requests and tool_result continuations."""
 
@@ -364,16 +375,27 @@ class Pipeline:
         # to per-task execution — no duplicate planning call.
         bc_plan = _extract_birdclaw_plan(raw_history)
 
+        # Gather recall context — pure Python, no LLM call.
+        # Returns ≤100 words from relevant history turns + graph + mentioned files.
+        recall_ctx = self.recall.gather(user_message, raw_history)
+
+        recent_turns_text = _format_history(raw_history[-4:])   # last 2 user+asst pairs
+
         return await self._start(user_message, available_tools, session_id=session_id,
                                  history_text=history_text, project_ctx=project_ctx,
-                                 project_dir=project_dir, bc_plan=bc_plan)
+                                 project_dir=project_dir, bc_plan=bc_plan,
+                                 recall_ctx=recall_ctx, memory_ctx=memory_ctx,
+                                 recent_turns_text=recent_turns_text)
 
     # ── Fresh request ─────────────────────────────────────────────────────────
 
     async def _start(self, query: str, available_tools: list[dict], session_id: str = "",
                      history_text: str = "", project_ctx: str = "",
                      project_dir: str = "",
-                     bc_plan: "tuple[str, list[dict]] | None" = None) -> LoopResponse:
+                     bc_plan: "tuple[str, list[dict]] | None" = None,
+                     recall_ctx: str = "",
+                     memory_ctx: str = "",
+                     recent_turns_text: str = "") -> LoopResponse:
         from engine.policy.router import load_user_prefs
         from engine.soul.router import parse_soul_sections, match_soul_section
 
@@ -390,6 +412,14 @@ class Pipeline:
         user_prefs   = load_user_prefs(self.prefs_path)
 
         logger.info("pipeline.start: query=%r history=%d chars", query[:60], len(history_text))
+
+        # ── Skill index — compact list of relevant skills for this query ──────
+        # Layer 1 of progressive disclosure: name + 60-char summary per match.
+        # Injected into think_decompose + plan_task so the model sees "I have a
+        # skill for this" without loading any full runbook token cost.
+        skill_index = get_skill_index(query, self.graph) if self.graph else ""
+        if skill_index:
+            logger.debug("pipeline: skill index hit for %r", query[:40])
 
         # ── Stage 1: Extract top-level context before splitting ───────────────
         _tracker.tree_context_running(task_id, query)
@@ -418,6 +448,8 @@ class Pipeline:
                 query, self.client,
                 context=top_context,
                 soul_section=soul_section,
+                workspace=self.workspace,
+                skill_index=skill_index,
             )
             _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
             logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
@@ -459,12 +491,20 @@ class Pipeline:
             # Inject a live workspace snapshot so the planner can see what files
             # already exist before generating a write/edit plan.
             ws_snap = _workspace_snapshot(self.workspace) if self.workspace else ""
-            ws_block = f"[Workspace files]\n{ws_snap}" if ws_snap else ""
+            if ws_snap:
+                ws_block = f"[Workspace — write ALL task files here]\n{ws_snap}"
+            elif self.workspace:
+                ws_block = f"[Workspace — write ALL task files here: {self.workspace}]"
+            else:
+                ws_block = ""
 
             # Prepend the original query so plan_task always has the full user request,
             # even when the stage goal is a vague placeholder like "check system status".
             original_ctx = f"Original request: {query}" if task != query else ""
-            task_ctx = "\n\n".join(p for p in (original_ctx, task_history, graph_block, ws_block, project_ctx) if p)
+            # recall_ctx: ≤100-word summary from recent history + graph + files
+            # placed first so it's never truncated by downstream context limits
+            recall_block = f"[Recall]\n{recall_ctx}" if recall_ctx else ""
+            task_ctx = "\n\n".join(p for p in (recall_block, original_ctx, task_history, graph_block, ws_block, project_ctx) if p)
             all_extracted.append(task_history)
 
             if graph_recall:
@@ -478,9 +518,22 @@ class Pipeline:
             # can skip the LLM for well-understood stage types.
             stage_type = stage.get("type", "")
 
-            # verify stages execute commands — strip search tools so plan_task
-            # can't pick WebSearch even if the model is confused about the goal.
+            # Stage-type tool restriction — show only tools relevant to the stage.
+            # Reduces model confusion on small models (BirdClaw A2 principle).
+            _WRITE_TOOL_NAMES = frozenset({"write", "edit"})
+            _READ_TOOL_NAMES  = frozenset({"read", "glob", "grep"})
             if stage_type == "verify":
+                # Verify: bash only — no web search, no file writes
+                relevant_tools = [t for t in relevant_tools
+                                  if t.get("name", "").lower() not in
+                                  _WEB_TOOL_NAMES | _WRITE_TOOL_NAMES]
+            elif stage_type == "research":
+                # Research: web + file reads — no writes or bash
+                relevant_tools = [t for t in relevant_tools
+                                  if t.get("name", "").lower() not in
+                                  {"bash", "powershell"} | _WRITE_TOOL_NAMES]
+            elif stage_type in ("write_code", "write_doc", "edit"):
+                # Write/edit: bash + file tools — no web search
                 relevant_tools = [t for t in relevant_tools
                                   if t.get("name", "").lower() not in _WEB_TOOL_NAMES]
 
@@ -505,9 +558,8 @@ class Pipeline:
                         fact = fact[len(junk):].strip()
                 if self.graph and fact:
                     try:
-                        existing = self.graph.find_by_label(fact[:80], type="user")
-                        if not existing:
-                            self.graph.add_node(type="user", label=fact[:80], content=fact)
+                        _save_fact_to_graph(self.graph, fact)
+                        _write_pref_to_file(self.prefs_path, fact)
                         logger.info("pipeline: save_memory stage → stored %r", fact[:60])
                     except Exception as exc:
                         logger.warning("pipeline: save_memory stage failed: %s", exc)
@@ -530,12 +582,15 @@ class Pipeline:
                 else:
                     steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                             context=task_ctx, soul_section=soul_section,
-                                            user_prefs=user_prefs)
+                                            user_prefs=user_prefs, workspace=self.workspace,
+                                            skill_index=skill_index)
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                         context=task_ctx,
                                         soul_section=soul_section,
-                                        user_prefs=user_prefs)
+                                        user_prefs=user_prefs,
+                                        workspace=self.workspace,
+                                        skill_index=skill_index)
 
             # ── Websearch fallback — if plan is empty and no graph recall ──────
             if not steps and stage_type == "research" and not graph_recall:
@@ -564,7 +619,20 @@ class Pipeline:
             synthesis_history = all_extracted[0]
         else:
             synthesis_history = await extract_for_task(query, history_text, self.client)
-        synthesis_ctx = "\n\n".join(p for p in (synthesis_history, project_ctx) if p)
+
+        # ── Recent turns — always included, Jaccard-independent ───────────────
+        # extract_for_task() filters by lexical similarity; follow-up questions
+        # ("based on this, do you think you are alive?") have near-zero overlap
+        # with the previous turn's topic ("meaning of life") so the context gets
+        # dropped even though it's essential.  Always include the last 2 turns
+        # verbatim so conversational continuity is never broken by the filter.
+        recent_turns = recent_turns_text   # last 2 user+asst pairs (computed in process())
+
+        # memory_ctx first — soul policy, user knowledge, self-concept.
+        # recent_turns second — takes precedence over Jaccard-filtered history.
+        synthesis_ctx = "\n\n".join(
+            p for p in (memory_ctx, recent_turns, synthesis_history, project_ctx) if p
+        )
 
         state = PipelineState(
             query=query,
@@ -806,22 +874,46 @@ class Pipeline:
         while state.current_task_idx < len(state.sub_tasks):
             sub = state.sub_tasks[state.current_task_idx]
             steps = sub.get("steps", [])
+            stage_type = sub.get("type", "")
+            # Per-stage budget: hard cap on internal step count.  Falls back to 12
+            # for unknown stage types.  External tool calls (bash, write, read…) that
+            # return as tool_use blocks don't count — they exit _execute() immediately
+            # and re-enter via _continue().  This cap prevents a single stuck
+            # research / verify stage from consuming context indefinitely.
+            _stage_budget = STAGE_BUDGETS.get(stage_type, 12)
+            _consec_search_fail = 0   # reset per task; drives research loop guard
 
             while state.current_step_idx < len(steps):
+                # ── Per-stage budget cap ──────────────────────────────────────
+                # Second line of defence after the research loop guard.
+                if state.current_step_idx >= _stage_budget:
+                    logger.warning(
+                        "pipeline: stage budget exhausted (%d/%d) for %s stage %r "
+                        "— proceeding to synthesis",
+                        state.current_step_idx, _stage_budget,
+                        stage_type, sub["task"][:60],
+                    )
+                    _log("stage", "budget-cap",
+                         f"{stage_type} hit {_stage_budget}-step cap",
+                         session_id=state.task_id,
+                         data={"stage": "budget-cap", "stage_type": stage_type,
+                               "budget": _stage_budget, "task": sub["task"][:80]})
+                    break
+
                 step = steps[state.current_step_idx]
                 tool  = step.get("tool", "").strip().lower()
                 inp   = step.get("input", "").strip()
 
-                # ── Graph-first: check knowledge graph before any web search ────
-                # If the graph already has research relevant to this query,
-                # use it directly and skip the web search entirely.
-                # This applies to both the internal web_search and the outer
-                # WebSearch upgrade — the graph check happens before either.
+                # ── Graph-first: warm path ────────────────────────────────────
+                # Serve from graph if available. Recency scoring ranks fresh nodes
+                # higher — no time-gate. If model judged memory stale/partial and
+                # re-plans a web_search, that request reaches here, runs, and
+                # upserts the node with fresh data (targeted enrichment).
                 if tool in ("web_search", "websearch") and self.graph:
                     mem = _search_graph(inp, self.graph)
                     if mem and len(mem.strip()) > 40:
                         logger.info(
-                            "pipeline: graph-first hit for web_search %r — skipping web, using graph",
+                            "pipeline: graph warm hit for %r — serving from memory",
                             inp[:50],
                         )
                         result = {
@@ -838,15 +930,11 @@ class Pipeline:
                         state.current_step_idx += 1
                         continue
 
-                # ── Smart upgrade: use Claude Code's WebSearch/WebFetch if available ─
-                if tool == "web_search" and "websearch" in outer_tool_names:
-                    tool = "websearch"
-                    step["tool"] = "websearch"
-                elif tool in ("web_fetch", "fetch_url") and "webfetch" in outer_tool_names:
-                    tool = "webfetch"
-                    step["tool"] = "webfetch"
-
                 # ── Normalise shell-like tool names to "bash" ────────────────
+                # Note: web_search and web_fetch are always handled internally
+                # (SearXNG → Jina). We do NOT promote them to outer tools even
+                # when Claude Code offers websearch/webfetch — Claude Code's
+                # built-in search does not work with a custom API provider.
                 # Small models sometimes plan "shell", "terminal", "cmd", "mkdir",
                 # "run", "execute" instead of "bash". Map them so the outer-tool
                 # dispatch fires correctly instead of silently skipping the step.
@@ -858,6 +946,35 @@ class Pipeline:
                     logger.info("pipeline: normalising tool %r → bash", tool)
                     tool = "bash"
                     step["tool"] = "bash"
+
+                # ── run_skill → resolve stored program → convert to bash ────
+                # Layer 3: the model chose to re-execute a previously built
+                # program instead of re-planning from scratch.
+                # 1. Look up program in graph.
+                # 2. Ensure it exists on disk (write if missing).
+                # 3. Substitute this step with bash execution of the script.
+                # If the skill has no program, fall through to _run_internal
+                # which returns a "not found" result and lets synthesis explain.
+                if tool == "run_skill":
+                    _prog = get_skill_program(inp, self.graph)
+                    if _prog:
+                        _script = get_skill_script_path(inp)
+                        # Write to disk if missing or stale
+                        if not _script.exists():
+                            _script = save_skill_to_disk(inp, _prog) or _script
+                        if _script and _script.exists():
+                            _cmd = f"python {_script}"
+                            logger.info(
+                                "pipeline: run_skill %r → bash: %s", inp[:40], _cmd
+                            )
+                            step["tool"]  = "bash"
+                            step["input"] = _cmd
+                            tool = "bash"
+                            inp  = _cmd
+                            # Fall through — bash is an outer tool and will be dispatched below
+                        else:
+                            logger.warning("pipeline: run_skill %r — could not write script", inp[:40])
+                            # Fall through to _run_internal for graceful "not found" response
 
                 # ── direct — skip all steps, synthesizer answers from query ──
                 # Used for greetings, thanks, simple questions where no tool
@@ -872,6 +989,23 @@ class Pipeline:
                 # Runs the subtask planner to get items, then yields to _execute
                 # which emits one Write outer-tool per item via _write_plan_next_item.
                 if tool == "write_plan":
+                    # Parse "FILENAME|TASK DESCRIPTION" from inp if the model
+                    # used the write_plan:file|goal format.  Populate step fields
+                    # so _start_write_plan has file_path, file_type and input.
+                    if "|" in inp and not step.get("file_path"):
+                        _wp_file, _, _wp_task = inp.partition("|")
+                        _wp_file = _wp_file.strip()
+                        _wp_task = _wp_task.strip() or inp
+                        if _wp_file:
+                            # Resolve to workspace
+                            if self.workspace and not os.path.isabs(_wp_file):
+                                _wp_file = os.path.join(self.workspace, _wp_file)
+                            _ext = os.path.splitext(_wp_file)[1].lower()
+                            step["file_path"] = _wp_file
+                            step["input"]     = _wp_task
+                            step["file_type"] = "code" if _ext in (".py", ".js", ".ts", ".rb", ".go", ".rs") else "doc"
+                            step["run_after"] = step["file_type"] == "code"
+                            inp = _wp_task
                     return await self._start_write_plan(step, state)
 
                 # ── Outer tool → return tool_use to Claude Code ───────────────
@@ -912,7 +1046,11 @@ class Pipeline:
                     tool_id = f"toolu_{uuid.uuid4().hex[:16]}"
                     cl = canonical.lower()
                     if cl == "bash":
-                        tool_input = {"command": _normalize_python_c(inp)}
+                        cmd = _normalize_python_c(inp)
+                        # Safety net: if cmd writes/runs relative files, cd to workspace first
+                        if self.workspace:
+                            cmd = _apply_workspace_to_cmd(cmd, self.workspace)
+                        tool_input = {"command": cmd}
                     elif cl == "write":
                         file_path = step.get("file_path") or inp[:120]
                         if not file_path or not file_path.strip():
@@ -1075,6 +1213,18 @@ class Pipeline:
                 )
                 logger.info("pipeline: internal tool=%s quality=%s → %s",
                             tool, quality, summary[:60])
+
+                # ── Persist research to notes.md ──────────────────────────────
+                # Mirrors BirdClaw_Old: every informational tool result is
+                # appended to notes.md so the write phase can reference what
+                # was found, and so results persist across Claude Code turns.
+                if tool in _INFO_TOOLS and quality in ("good", "weak") and self.workspace:
+                    _npath = _notes_path(self.workspace)
+                    _append_to_notes(
+                        _npath, tool, inp,
+                        result.get("result", ""),
+                        task_id=state.task_id,
+                    )
                 _log("llm", f"{tool} → {quality}", summary[:120], session_id=state.task_id,
                      data={"action": tool, "input": inp[:120], "result": summary[:200],
                            "quality": quality, "elapsed_ms": elapsed_ms})
@@ -1083,6 +1233,34 @@ class Pipeline:
                 # The search result IS the reasoning — replace any pre-guessed
                 # follow-up steps with steps derived from what was actually found.
                 if tool in _INFO_TOOLS:
+                    # Track consecutive failures for the research loop guard.
+                    # Reset on any non-empty result (even weak) so a single bad
+                    # step between two good ones doesn't trip the guard.
+                    if quality in ("empty", "error"):
+                        _consec_search_fail += 1
+                    else:
+                        _consec_search_fail = 0
+
+                    # ── Research loop guard ───────────────────────────────────
+                    # _replan_after_search() can schedule more web_search steps
+                    # even after a failure, creating an infinite search loop.
+                    # After 2 consecutive empty/error results on this task,
+                    # stop replanning and fall through to synthesis with what
+                    # was gathered so far.
+                    if _consec_search_fail >= 2:
+                        logger.warning(
+                            "pipeline: research loop guard — %d consecutive search "
+                            "failures on task %r; skipping replan, proceeding to synthesis",
+                            _consec_search_fail, sub["task"][:60],
+                        )
+                        _log("stage", "loop-guard",
+                             f"stopped after {_consec_search_fail} consecutive failures",
+                             session_id=state.task_id,
+                             data={"stage": "loop-guard", "task": sub["task"][:80],
+                                   "fail_count": _consec_search_fail, "last_tool": tool})
+                        state.current_step_idx += 1
+                        break  # exit step loop for this task → synthesis
+
                     found = result.get("result", "")
                     remaining = len(steps) - state.current_step_idx - 1
                     if found and remaining > 0:
@@ -1119,6 +1297,12 @@ class Pipeline:
 
             # Task done — move to next
             _tracker.tree_subtask_done(state.task_id, state.current_task_idx)
+            # Log actual step count for P75 budget learning.
+            # current_step_idx == steps taken (0-based index ≈ count at task end).
+            if self.budget_tracker and stage_type and state.current_step_idx > 0:
+                self.budget_tracker.log(
+                    stage_type, state.current_step_idx, sub.get("task", "")
+                )
             state.current_task_idx += 1
             state.current_step_idx = 0
 
@@ -1153,6 +1337,17 @@ class Pipeline:
         elapsed_ms = int((_time.time() - t0) * 1000)
         _tracker.tree_synthesizer_done(state.task_id, answer[:200])
         _tracker.finish_task(state.task_id, "done")
+
+        # ── Write task log (mirrors BirdClaw_Old's BIRDCLAW.md post-task write) ─
+        _write_task_log(
+            workspace=self.workspace,
+            task_id=state.task_id,
+            query=state.query,
+            sub_tasks=state.sub_tasks,
+            files_written=state.files_written,
+            answer_preview=answer[:200],
+        )
+
         _log("llm", "synthesize → answer", answer[:120], session_id=state.task_id,
              data={"action": "synthesize", "answer_preview": answer[:300], "elapsed_ms": elapsed_ms})
         _log("answer", "answer", answer[:120], session_id=state.task_id,
@@ -1420,12 +1615,41 @@ class Pipeline:
                 pass
 
         # ── Build a focused prompt for this one item ──────────────────────────
-        tail_lines = current_content.splitlines()[-20:] if current_content else []
-        tail = "\n".join(tail_lines)
-        file_state = (
-            f"Current file tail:\n{tail}"
-            if tail else f"[{os.path.basename(file_path)} — empty, start fresh]"
+        # 4-step progressive disclosure: CLAUDE.md → exact section →
+        # relevant lines → continuation point (last header → EOF fallback).
+        from engine.translation.subtask.line_search import (
+            find_section as _find_section,
+            find_continuation_point as _find_continuation,
+            search_relevant as _search_relevant,
         )
+
+        def _build_file_state(fp: str, item_title: str, ftype: str, ws: str) -> str:
+            parts: list[str] = []
+            # Step 1: CLAUDE.md in workspace root
+            if ws:
+                _cmd = Path(ws) / "CLAUDE.md"
+                if _cmd.is_file():
+                    _ws_ctx = _search_relevant(item_title, [_cmd], context_lines=1, max_results=3)
+                    if _ws_ctx:
+                        parts.append(f"[CLAUDE.md]\n{_ws_ctx}")
+            # Step 2: exact section in the file
+            _sec = _find_section(fp, item_title, ftype)
+            if _sec:
+                parts.append(f"[{os.path.basename(fp)} — {item_title}]\n{_sec}")
+                return "\n\n".join(parts)
+            # Step 3: relevant lines scattered through the file
+            _rel = _search_relevant(item_title, [fp], context_lines=2)
+            if _rel:
+                parts.append(f"[{os.path.basename(fp)}]\n{_rel}")
+                return "\n\n".join(parts)
+            # Step 4: last section → EOF
+            _cont = _find_continuation(fp, ftype)
+            if _cont:
+                parts.append(f"[{os.path.basename(fp)}]\n{_cont}")
+            return "\n\n".join(parts)
+
+        _ctx_str = _build_file_state(file_path, title, file_type, self.workspace) if file_path else ""
+        file_state = _ctx_str if _ctx_str else f"[{os.path.basename(file_path)} — empty, start fresh]"
 
         if file_type == "code":
             anchor_hint = f"Your content MUST start with exactly: def {anchor}( or class {anchor}:"
@@ -1437,14 +1661,40 @@ class Pipeline:
         done_items = [it["title"] for it in state.wp_items[:state.wp_idx]]
         done_str = ", ".join(done_items) or "none yet"
 
-        # ── Inject conversation context — prior turns inform the writing ──────
+        # ── Inject conversation context + session research notes ─────────────
         # For code files: do NOT inject synthesis_ctx — it may contain essay/doc
         # context from prior conversation turns (section headings, "Introduction",
         # "Conclusion" etc.) that causes the model to generate functions with those names.
+        # Instead inject recent bash output (ls, tests, etc.) so the model knows
+        # what files already exist in the workspace before writing.
         if file_type == "code":
-            conv_ctx = ""
+            recent_bash = [
+                r for r in state.results
+                if r.get("tool") == "bash" and r.get("result", "").strip()
+            ]
+            if recent_bash:
+                bash_lines = "\n".join(
+                    f"$ {r['input']}\n{r['result'][:300]}" for r in recent_bash[-3:]
+                )
+                conv_ctx = f"[Recent shell output — shows what already exists]\n{bash_lines}"
+            else:
+                conv_ctx = ""
         else:
             conv_ctx = state.synthesis_ctx[:800].strip() if state.synthesis_ctx else ""
+            # Inject session research notes — web_search / web_fetch results
+            # written to notes.md during this session's research phase.
+            # Uses search_relevant so only the parts pertinent to this section
+            # are injected (BirdClaw_Old injected the last 2000 chars verbatim;
+            # we use term-matching to stay within context budget).
+            if self.workspace:
+                _nfile = _notes_path(self.workspace)
+                if _nfile and Path(_nfile).is_file():
+                    from engine.translation.subtask.line_search import search_relevant as _sr_notes
+                    _notes_ctx = _sr_notes(title, [_nfile], context_lines=2, max_results=6)
+                    if _notes_ctx:
+                        conv_ctx = (conv_ctx + "\n\n[Research notes for this section]\n" + _notes_ctx).strip()
+                        logger.debug("write_plan: injected %d chars from notes.md for item %r",
+                                     len(_notes_ctx), title[:40])
 
         prompt_parts = []
         if conv_ctx:
@@ -1784,23 +2034,33 @@ class Pipeline:
     # ── Research graph persistence ────────────────────────────────────────────
 
     async def _save_research_to_graph(self, query: str, result: str) -> None:
-        """Save web search result summary directly to the knowledge graph.
+        """Upsert a web search result into the knowledge graph.
 
-        No LLM call — raw result is stored as-is.  The dream cycle consolidates
-        and distils reusable knowledge during off-peak hours.
+        Creates a new research node on cold miss, or enriches (overwrites summary
+        + bumps last_seen) on a stale hit where the model chose to re-search.
+        No LLM call — the dream cycle consolidates and distils during off-peak hours.
         """
         if not self.graph or not result:
             return
         try:
             summary = result[:500].replace("\n", " ").strip()
+            node_name = query[:80]
+            existing = self.graph.get_node(node_name)
+            if existing:
+                logger.debug(
+                    "pipeline: enriching existing research node %r", node_name[:40]
+                )
+            else:
+                logger.debug(
+                    "pipeline: creating new research node %r", node_name[:40]
+                )
             self.graph.upsert_node(
-                name=query[:80],
+                name=node_name,
                 node_type="research",
                 summary=summary,
                 sources=["web_search"],
             )
             self.graph.save()
-            logger.debug("pipeline: saved search result to graph for %r", query[:40])
         except Exception as exc:
             logger.warning("pipeline: _save_research_to_graph failed: %s", exc)
 
@@ -1835,21 +2095,46 @@ class Pipeline:
             return {"tool": tool, "input": inp, "result": content, "summary": f"prefs: {content[:80]}"}
 
         if tool == "web_search":
-            # Check graph first — previous tasks may have already fetched this research.
-            # Graph stores web research results (node_type="research"), not answers.
+            # ── Graph/web synergy ─────────────────────────────────────────────
+            # Warm:  graph already has this research → serve directly, no web cost.
+            #        Recency scoring in graph.search() naturally ranks fresh nodes
+            #        higher — no time-gate needed here.
+            # Cold:  graph miss → full web search → upsert node (create or enrich).
+            # Stale: model sees graph content in memory injection and judges it
+            #        insufficient → it explicitly plans web_search → we run it
+            #        and upsert the node with fresh data (targeted enrichment).
             if self.graph:
                 mem = _search_graph(inp, self.graph)
                 if mem and len(mem.strip()) > 40:
-                    logger.info("pipeline: web_search → graph hit for %r", inp[:40])
+                    logger.info("pipeline: web_search → graph warm hit for %r", inp[:40])
                     return {"tool": "search_memory", "input": inp, "result": mem,
                             "summary": f"recalled: {mem[:120]}"}
-            # Nothing in graph — fetch from web
-            raw = []
+            # ── Multi-angle query expansion ───────────────────────────────────
+            # Fire 2 semantically varied queries to get broader, more grounded
+            # results — mirrors BirdClaw_Old's multi-angle search behaviour.
+            # The second query is generated by a cheap LLM call; falls back to
+            # the original if the call fails or produces nothing new.
+            queries = [inp]
             try:
-                raw = await _web_search(inp, max_results=4)
-                content = format_results(raw) if raw else "No results."
-            except Exception as exc:
-                content = f"Search failed: {exc}"
+                alt = await _expand_query(inp, self.client)
+                if alt and alt.lower().strip() != inp.lower().strip():
+                    queries.append(alt)
+                    logger.info("pipeline: web_search expanded %r → also %r", inp[:40], alt[:40])
+            except Exception:
+                pass   # expansion is best-effort
+
+            # Nothing in graph — fetch from web (all query angles combined)
+            raw = []
+            all_snippets: list[str] = []
+            for q in queries:
+                try:
+                    q_raw = await _web_search(q, max_results=3)
+                    if q_raw:
+                        raw.extend(q_raw)
+                        all_snippets.append(format_results(q_raw))
+                except Exception as exc:
+                    logger.debug("web_search angle %r failed: %s", q[:40], exc)
+            content = "\n\n".join(all_snippets) if all_snippets else "No results."
             # ── Auto-fetch page content when snippets are thin ────────────────
             # Jina AI tier (is_ai_synthesized=True) already returns rich content.
             # DDG / SearXNG tiers return short snippets (≤500 chars) that are
@@ -1906,14 +2191,105 @@ class Pipeline:
         if tool in ("save_memory", "remember"):
             if self.graph:
                 try:
-                    label = inp[:80]
-                    existing = self.graph.find_by_label(label, type="user")
-                    if not existing:
-                        self.graph.add_node(type="user", label=label, content=inp)
-                    logger.info("pipeline: save_memory → stored %r", label)
+                    _save_fact_to_graph(self.graph, inp)
+                    _write_pref_to_file(self.prefs_path, inp)
+                    logger.info("pipeline: save_memory → stored %r", inp[:60])
                 except Exception as exc:
                     logger.warning("pipeline: save_memory graph write failed: %s", exc)
             return {"tool": tool, "input": inp, "result": "saved", "summary": f"saved: {inp[:80]}"}
+
+        # ── Skill tools (progressive disclosure Layer 2) ──────────────────────
+
+        if tool == "read_skill":
+            # Layer 2: model requested the full runbook for a skill.
+            # Also reports whether a runnable program exists so the model can
+            # decide to use run_skill:NAME on the next task of the same type.
+            runbook = get_skill_runbook(inp, self.graph)
+            has_prog = bool(get_skill_program(inp, self.graph)) if self.graph else False
+            if runbook:
+                prog_note = "\n\n[This skill has a saved program — use run_skill:NAME to re-execute it directly.]" if has_prog else ""
+                full = runbook + prog_note
+                logger.info("pipeline: read_skill → loaded %r (%d chars)", inp[:40], len(runbook))
+                return {
+                    "tool": tool, "input": inp,
+                    "result": full,
+                    "summary": f"skill runbook: {runbook[:120]}",
+                }
+            logger.info("pipeline: read_skill → no skill found for %r", inp[:40])
+            return {
+                "tool": tool, "input": inp,
+                "result": f"(no skill found for '{inp}')",
+                "summary": f"skill not found: {inp[:60]}",
+            }
+
+        if tool == "save_skill":
+            # Persist a text runbook as a skill node.
+            # Input format:  SKILL-NAME|step-by-step runbook
+            # Summary = first 60 chars of runbook, or the name if no runbook.
+            skill_name = ""
+            runbook    = ""
+            if "|" in inp:
+                skill_name, _, runbook = inp.partition("|")
+                skill_name = skill_name.strip()
+                runbook    = runbook.strip()
+            else:
+                skill_name = inp.strip()
+            if self.graph and skill_name:
+                summary = (runbook[:60].rstrip() if runbook else skill_name[:60])
+                self.graph.upsert_node(
+                    name=skill_name,
+                    node_type="skill",
+                    summary=summary,
+                    content=runbook,
+                    sources=["pipeline"],
+                )
+                logger.info("pipeline: save_skill → saved %r (%d chars)", skill_name[:40], len(runbook))
+            return {
+                "tool": tool, "input": inp,
+                "result": "skill saved",
+                "summary": f"saved skill: {skill_name[:60]}",
+            }
+
+        if tool == "save_skill_program":
+            # Persist actual program code as a skill node + write to disk.
+            # Input format:  SKILL-NAME|complete program code
+            # Handles version tracking: old code moved to program_history.
+            # On subsequent calls for the same skill, increments version and
+            # preserves a snippet of the previous program for BirdClaw's dream cycle.
+            skill_name  = ""
+            code        = ""
+            if "|" in inp:
+                skill_name, _, code = inp.partition("|")
+                skill_name = skill_name.strip()
+                code       = code.strip()
+            else:
+                skill_name = inp.strip()
+            if self.graph and skill_name and code:
+                script_path = save_skill_program_to_graph(
+                    skill_name=skill_name,
+                    code=code,
+                    graph=self.graph,
+                )
+                path_note = f" at {script_path}" if script_path else ""
+                logger.info("pipeline: save_skill_program → saved %r%s", skill_name[:40], path_note)
+                return {
+                    "tool": tool, "input": inp,
+                    "result": f"skill program saved{path_note}",
+                    "summary": f"saved skill program: {skill_name[:60]}",
+                }
+            return {
+                "tool": tool, "input": inp,
+                "result": "(save_skill_program: missing name or code)",
+                "summary": "save_skill_program: no-op",
+            }
+
+        if tool == "run_skill":
+            # run_skill should have been converted to bash in _execute.
+            # If we reach here it means the skill has no program — return info.
+            runbook = get_skill_runbook(inp, self.graph) if self.graph else ""
+            msg = (f"Skill '{inp}' has no saved program. Runbook:\n{runbook}"
+                   if runbook else f"Skill '{inp}' not found.")
+            return {"tool": tool, "input": inp, "result": msg, "summary": msg[:100]}
 
         # Unknown tool — log and skip
         logger.warning("pipeline: unknown internal tool %r — skipping", tool)
@@ -1921,6 +2297,237 @@ class Pipeline:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _notes_path(workspace: str) -> str:
+    """Absolute path to the rolling session notes file."""
+    return str(Path(workspace) / "notes.md") if workspace else ""
+
+
+def _append_to_notes(notes_path: str, tool: str, inp: str, content: str,
+                     task_id: str = "") -> None:
+    """Append one tool result to notes.md so later steps (and write phases) can see it.
+
+    Called after every informational tool result (web_search, web_fetch,
+    search_memory).  The file accumulates during a session exactly like
+    BirdClaw_Old's per-task notes.md — a running log of what was found.
+    """
+    if not notes_path or not content or not content.strip():
+        return
+    try:
+        p = Path(notes_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tag   = f"[{task_id[:8]}] " if task_id else ""
+        snippet = content.strip()[:1500]
+        entry   = f"\n## {tag}[{tool}] {inp[:80]}\n{snippet}\n"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(entry)
+        logger.debug("notes.md: appended %d chars for %s(%r)", len(snippet), tool, inp[:40])
+    except OSError as exc:
+        logger.debug("notes.md append failed: %s", exc)
+
+
+def _write_task_log(workspace: str, task_id: str, query: str,
+                    sub_tasks: list[dict], files_written: list[str],
+                    answer_preview: str = "") -> None:
+    """Append a task-completion entry to task_log.md.
+
+    Mirrors BirdClaw_Old's BIRDCLAW.md post-task write.  Gives a permanent
+    audit trail of what Sisyphean did and what files it produced.
+    """
+    if not workspace:
+        return
+    try:
+        import time as _t2
+        p     = Path(workspace) / "task_log.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        ts    = _t2.strftime("%Y-%m-%d %H:%M")
+        lines = [f"\n## [{ts}] {query[:100]}"]
+        for sub in sub_tasks[:6]:
+            stype = sub.get("type", "?")
+            stask = sub.get("task", "")[:70]
+            nsteps = len(sub.get("steps", []))
+            lines.append(f"- [{stype}] {stask} ({nsteps} steps)")
+        if files_written:
+            names = ", ".join(Path(f).name for f in files_written[:6])
+            lines.append(f"Files written: {names}")
+        if answer_preview:
+            lines.append(f"Answer: {answer_preview[:200]}")
+        with p.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        logger.debug("task_log.md write failed: %s", exc)
+
+
+def _save_fact_to_graph(graph, fact: str) -> None:
+    """Upsert a remembered fact — merge into a related node when possible.
+
+    Strategy:
+      1. Extract content words from the new fact (4+ chars, not stop words).
+      2. Search existing 'user' nodes for ones sharing ≥2 content words.
+      3. If found: append the new fact to that node's summary (skip if duplicate).
+      4. If not found: create a new node keyed by the fact text.
+
+    This prevents the graph from filling with duplicate preference nodes
+    (e.g. "I prefer vim" and "I use vim for editing" → same node).
+    """
+    import re as _re
+
+    if not graph or not fact:
+        return
+    fact = fact.strip()
+
+    _STOP = {
+        "the", "and", "for", "with", "that", "this", "from", "into",
+        "you", "are", "was", "have", "has", "will", "can", "use", "used",
+        "using", "prefer", "like", "want", "need", "also", "just", "very",
+        "remember", "note", "save", "keep", "mind", "always", "never",
+        "all", "its", "own", "let", "get", "set", "put", "new", "old",
+    }
+
+    def _content_words(text: str) -> set[str]:
+        # 3-char minimum so short but meaningful tokens like "vim", "git",
+        # "css", "sql", "cpp" are included alongside longer words.
+        return {
+            w for w in _re.findall(r"[a-z0-9]+", text.lower())
+            if len(w) >= 3 and w not in _STOP
+        }
+
+    fact_words = _content_words(fact)
+
+    if fact_words:
+        try:
+            hits = graph.search(fact, limit=5, node_type="user")
+            for hit in hits:
+                node_words = _content_words(
+                    hit.get("name", "") + " " + hit.get("summary", "")
+                )
+                overlap = len(fact_words & node_words)
+                # threshold 1: any shared content word means same topic
+                # (e.g. both mention "vim", "python", "tabs" → same note)
+                if overlap >= 1:
+                    existing = hit.get("summary", "")
+                    # Already captured — just refresh last_seen
+                    if fact.lower()[:60] in existing.lower():
+                        graph.upsert_node(hit["name"], "user", summary=existing)
+                        logger.info("save_memory: already known, refreshed %r", hit["name"][:40])
+                        return
+                    # Merge: append new fact to existing node
+                    merged = f"{existing.rstrip('. ')}. {fact}".strip()[:500]
+                    graph.upsert_node(hit["name"], "user", summary=merged)
+                    logger.info("save_memory: merged %r into node %r (overlap=%d)",
+                                fact[:40], hit["name"][:40], overlap)
+                    return
+        except Exception as exc:
+            logger.debug("save_memory: graph search failed: %s", exc)
+
+    # No related node found — create a new one
+    graph.upsert_node(fact[:80], "user", summary=fact)
+    logger.info("save_memory: new node %r", fact[:60])
+
+
+def _write_pref_to_file(prefs_path, fact: str) -> None:
+    """Write-back: append a remembered fact to user_prefs.md so the file
+    stays in sync with the graph.
+
+    Skipped if the fact (normalised — stripped of trailing punctuation and
+    lowercased, first 60 chars) is already present in the file.
+    Creates the file and any missing parent directories.
+    """
+    if not prefs_path or not fact:
+        return
+    try:
+        _pp = Path(prefs_path)
+        existing = _pp.read_text(encoding="utf-8") if _pp.exists() else ""
+        # Normalise: strip trailing punctuation / whitespace before comparing
+        # so "I prefer tabs over spaces." doesn't duplicate "I prefer tabs over spaces"
+        fact_norm = fact.rstrip(".!?,;: ").lower()[:60]
+        # Also normalise each existing line the same way before checking
+        existing_norm = " ".join(
+            line.rstrip(".!?,;: ").lower() for line in existing.splitlines()
+        )
+        if fact_norm in existing_norm:
+            return  # already recorded (possibly with different punctuation)
+        _pp.parent.mkdir(parents=True, exist_ok=True)
+        with open(_pp, "a", encoding="utf-8") as _f:
+            _f.write(fact + "\n")
+        logger.info("_write_pref_to_file: appended %r to %s", fact[:50], _pp.name)
+    except Exception as exc:
+        logger.debug("_write_pref_to_file: skipped (%s)", exc)
+
+
+# Regex patterns used by _apply_workspace_to_cmd — compiled once at module load.
+_RELATIVE_FILE_WRITE = re.compile(
+    r'>\s*(?![/\\"])(?!\w+:)([^\s<>&|;,\'"()\r\n]+)',  # > relfile  (not abs path)
+)
+_RELATIVE_PY_RUN = re.compile(
+    r'\bpython\d*(?:\.exe)?\s+(?![/\\\-])(?!\w+:)(\S+\.py)\b',
+)
+
+# Commands that should NOT be wrapped — they don't need workspace context.
+_WORKSPACE_SKIP_RE = re.compile(
+    r'^(git |pip\d*\s|npm |conda |systeminfo|ipconfig|ifconfig|nvidia-|wmic |tasklist'
+    r'|Get-|Set-|New-|Remove-|Start-|Stop-|Invoke-|Test-|where |which |echo\s+\$)',
+    re.IGNORECASE,
+)
+
+
+def _apply_workspace_to_cmd(cmd: str, workspace: str) -> str:
+    """Safety net: if a bash command writes/runs a relative file, prefix with
+    ``cd "<workspace>" && `` so task-created scripts land in workspace/ rather
+    than the engine project root.
+
+    Only activates when:
+      • a workspace path is configured
+      • the command redirects output to a relative filename  (> calc.py)
+      • OR the command runs a relative Python script           (python calc.py)
+      • AND the command doesn't already reference the workspace path
+
+    Skips git, pip, system-info commands that are unaffected by CWD.
+    """
+    if not workspace or not cmd.strip():
+        return cmd
+    cmd = cmd.strip()
+
+    # Already contains the workspace path — nothing to do.
+    ws_norm = workspace.replace("\\", "/").lower()
+    if ws_norm in cmd.lower() or workspace.lower() in cmd.lower():
+        return cmd
+
+    # Skip infrastructure commands that don't write task files.
+    if _WORKSPACE_SKIP_RE.match(cmd):
+        return cmd
+
+    needs_cd = False
+
+    def _is_bare_relative(fname: str) -> bool:
+        """True only for bare filenames with no directory component (e.g. calc.py).
+        Returns False for absolute paths (C:/..., C:\\..., /...) or paths that
+        already contain a directory separator (workspace/calc.py, etc.).
+        """
+        if not fname:
+            return False
+        if re.match(r'^[a-zA-Z]:[/\\]|^[/\\]', fname):  # absolute
+            return False
+        if '/' in fname or '\\' in fname:  # already has directory component
+            return False
+        return True
+
+    # Output redirection to a bare filename?  (> calc.py, >> result.txt)
+    for m in _RELATIVE_FILE_WRITE.finditer(cmd):
+        if _is_bare_relative(m.group(1)):
+            needs_cd = True
+            break
+
+    # Running a bare .py filename?  (python calc.py)
+    if not needs_cd:
+        m = _RELATIVE_PY_RUN.search(cmd)
+        if m and _is_bare_relative(m.group(1)):
+            needs_cd = True
+
+    if needs_cd:
+        return f'cd "{workspace}" && {cmd}'
+    return cmd
+
 
 def _normalize_python_c(cmd: str) -> str:
     """Fix common model mistakes in `python -c '...'` commands.
@@ -1967,6 +2574,37 @@ def _extract_state(raw_history: list[dict]) -> PipelineState | None:
     return None
 
 
+async def _expand_query(query: str, client) -> str:
+    """Generate one semantically different reformulation of a search query.
+
+    Used by web_search to fire a second angle on the same topic — e.g.
+    "meaning of life" → "purpose and significance of human existence philosophy".
+    Returns "" on failure so the caller falls back to the original query only.
+    """
+    try:
+        result = await client.generate(
+            [{"role": "user", "content":
+                f"Rewrite this search query from a different angle to find complementary results.\n"
+                f"Original: {query}\n"
+                f"Output only the rewritten query — no explanation, no quotes."}],
+            max_tokens=40,
+            temperature=0.4,
+            stream=False,
+            thinking=False,
+        )
+        alt = (result["choices"][0]["message"]["content"] or "").strip().strip('"\'')
+        # Reject if too similar (>80% word overlap) or too long
+        orig_words = set(query.lower().split())
+        alt_words  = set(alt.lower().split())
+        if alt_words and orig_words:
+            overlap = len(orig_words & alt_words) / max(len(orig_words), len(alt_words))
+            if overlap < 0.8 and len(alt) < 120:
+                return alt
+    except Exception:
+        pass
+    return ""
+
+
 _BASH_FAIL_PREFIXES = (
     "[exit ",      # non-zero exit code from bash tool
     "[timeout",    # command timed out
@@ -1999,13 +2637,22 @@ def _is_bash_failure(result: str) -> bool:
     return False
 
 
-_BASH_CORRECT_SYSTEM = """\
-A shell command failed. Output ONLY a corrected JSON object: {"command": "<fixed shell command>"}
-Rules:
-- Fix the specific error shown — wrong path, missing module, syntax error, etc.
-- Keep the same intent as the original command.
-- Do not explain. Do not use markdown. Output only the JSON object.
-"""
+_OS_NAME = _platform.system()   # "Windows", "Linux", "Darwin" — set once at import
+
+_BASH_CORRECT_SYSTEM = (
+    "A shell command failed. Output ONLY a corrected JSON object: "
+    '{\"command\": \"<fixed shell command>\"}\n'
+    "Rules:\n"
+    f"- OS is {_OS_NAME}. Fix the command for this OS.\n"
+    "- If the error says 'is not recognized' or 'command not found', the command is\n"
+    f"  likely wrong for {_OS_NAME}. Replace it with the correct {_OS_NAME} equivalent.\n"
+    "  Windows examples: uptime→(Get-Date)-(gcim Win32_OperatingSystem).LastBootUpTime, "
+    "ls→Get-ChildItem, grep→Select-String, find→Get-ChildItem -Recurse.\n"
+    "- Fix the specific error — wrong path, missing module, syntax error, etc.\n"
+    "- Keep the same intent as the original command.\n"
+    "- Do not explain. Do not use markdown. Output only the JSON object."
+)
+
 
 async def _bash_correct(original_cmd: str, error: str, client) -> str:
     """Ask the LLM to produce a corrected command given the failure output.
@@ -2013,13 +2660,17 @@ async def _bash_correct(original_cmd: str, error: str, client) -> str:
     Returns the corrected command string, or "" if correction fails.
     """
     prompt = (
+        f"OS: {_OS_NAME}\n"
         f"Original command: {original_cmd[:300]}\n"
         f"Error output:\n{error[:400]}\n\n"
         "Output the corrected command as JSON."
     )
     try:
         result = await client.generate(
-            [{"role": "user", "content": prompt}],
+            [
+                {"role": "system", "content": _BASH_CORRECT_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
             max_tokens=128,
             temperature=0.0,
             stream=False,
@@ -2408,3 +3059,5 @@ def _search_graph(query: str, graph) -> str:
         return "\n".join(n.get("content", n.get("summary", ""))[:200] for n in nodes)
     except Exception:
         return ""
+
+

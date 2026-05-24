@@ -226,11 +226,12 @@ def test_tool_use_roundtrip():
             ok("Turn 1: tool has input dict", isinstance(tool_input, dict))
             print(f"     -> {tool_name}({json.dumps(tool_input)[:80]})")
 
-            # Check thinking block has SISYPHEAN_STATE (state persistence)
+            # Check thinking block has PIPELINE_STATE (state persistence)
             think_blocks = [b for b in content1 if b.get("type") == "thinking"]
-            state_blocks = [b for b in think_blocks if "SISYPHEAN_STATE:" in (b.get("thinking") or "")]
+            state_blocks = [b for b in think_blocks if "PIPELINE_STATE:" in (b.get("thinking") or "")
+                            or "SISYPHEAN_STATE:" in (b.get("thinking") or "")]
             ok(
-                "Turn 1: SISYPHEAN_STATE in thinking block",
+                "Turn 1: PIPELINE_STATE in thinking block",
                 len(state_blocks) > 0,
                 f"{len(think_blocks)} thinking blocks, {len(state_blocks)} with state",
             )

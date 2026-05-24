@@ -369,24 +369,70 @@ class GraphStore:
             return {"key": key, **dict(self._graph.nodes[key])}
         return None
 
-    def search(self, query: str, limit: int = 10, node_type: str | None = None) -> list[dict]:
+    def all_nodes(self, node_type: str | None = None) -> list[dict]:
+        """Return all nodes, optionally filtered by type. Mirrors KnowledgeGraph.all_nodes()."""
+        return [
+            {"key": key, **data}
+            for key, data in self._graph.nodes(data=True)
+            if node_type is None or data.get("type") == node_type
+        ]
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        top_n: int | None = None,           # alias for limit (injector compat)
+        node_type: str | None = None,
+        node_types: list[str] | None = None, # plural form used by injector
+    ) -> list[dict]:
         """Token-overlap search. Returns list of dicts with 'key' field."""
         import re
         def _tok(t: str) -> set[str]:
             return {w for w in re.findall(r"[a-z0-9]+", t.lower()) if len(w) > 2}
 
+        effective_limit = top_n if top_n is not None else limit
+        # node_types (plural) takes precedence over node_type (singular)
+        type_filter: set[str] | None = None
+        if node_types:
+            type_filter = set(node_types)
+        elif node_type:
+            type_filter = {node_type}
+
+        import time as _time
+        _now = _time.time()
+
         tokens = _tok(query)
         if not tokens:
             return []
-        scored: list[tuple[int, dict]] = []
+        scored: list[tuple[float, dict]] = []
         for key, data in self._graph.nodes(data=True):
-            if node_type and data.get("type") != node_type:
+            if type_filter and data.get("type") not in type_filter:
                 continue
-            score = len(tokens & (_tok(data.get("name", "")) | _tok(data.get("summary", ""))))
-            if score > 0:
-                scored.append((score, {"key": key, **data}))
+            token_score = len(
+                tokens & (_tok(data.get("name", "")) | _tok(data.get("summary", "")))
+            )
+            if token_score <= 0:
+                continue
+            # ── Recency bonus ─────────────────────────────────────────────────
+            # Nodes updated within the past 7 days get a bonus (max +1.0 today,
+            # linearly decaying to 0 at 7 days).  This prevents stale nodes from
+            # old sessions drowning out fresh research on related topics.
+            # last_seen may be a UNIX float or an ISO-8601 string — handle both.
+            last_seen_raw = data.get("last_seen", 0)
+            if isinstance(last_seen_raw, str):
+                try:
+                    from datetime import datetime, timezone
+                    last_seen = datetime.fromisoformat(last_seen_raw).timestamp()
+                except Exception:
+                    last_seen = 0
+            else:
+                last_seen = float(last_seen_raw) if last_seen_raw else 0
+            age_hours  = max(0, (_now - last_seen) / 3600) if last_seen else 9999
+            recency    = max(0.0, 1.0 - age_hours / (7 * 24))  # 0→1 within 7 days
+            score      = token_score + recency * 0.5
+            scored.append((score, {"key": key, **data}))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [d for _, d in scored[:limit]]
+        return [d for _, d in scored[:effective_limit]]
 
     def bfs(self, seeds: list[str], depth: int = 2) -> list[dict]:
         """BFS from seed names. Returns reachable nodes within depth with neighbour lists."""
@@ -465,6 +511,17 @@ knowledge_graph = GraphStore(_knowledge_graph_path())
 
 # ── Seed ─────────────────────────────────────────────────────────────────────
 
+def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
+    """Populate a fresh GraphStore with the engine policy and empty stubs."""
+    if graph.get_node("policy") or graph.get_node("soul"):
+        return  # already seeded
+    if policy_text:
+        graph.upsert_node("policy", "soul", summary=policy_text[:500], sources=["engine_policy.md"])
+    graph.upsert_node("user", "user", summary="User profile — to be filled in through conversation.")
+    graph.upsert_node("active_project", "project", summary="Current project — to be filled in.")
+    logger.info("GraphStore seeded with policy, user, and project nodes")
+
+
 def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:
     """Populate a fresh graph with the engine policy node and empty user/project stubs."""
     if graph.find_by_label("policy") or graph.find_by_label("soul"):
@@ -475,6 +532,72 @@ def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:
     graph.add_edge(user_id, proj_id, "works_on")
     graph.add_edge(user_id, policy_id, "guided_by")
     logger.info("Graph seeded with soul, user, and project nodes")
+
+
+def sync_personality_to_graph(
+    graph: GraphStore,
+    soul_path: "Path | None" = None,
+    prefs_path: "Path | None" = None,
+) -> None:
+    """Sync engine_policy.md and user_prefs.md into the knowledge graph.
+
+    Unlike seed_knowledge_graph this always updates existing nodes — no
+    'already seeded' guard — so edits to either file are picked up:
+      • immediately on the next startup
+      • mid-session without restart (app.py middleware checks mtime on
+        every /v1/messages request and calls this when either file changes)
+
+    Soul / personality:
+      Full engine_policy.md text → 'policy' node (type='soul').
+      The injector already concatenates all soul-type nodes into the
+      ### Engine Policy memory section; keeping it as a single node
+      avoids budget duplication.
+
+    User preferences:
+      Each non-blank, non-comment line of user_prefs.md → one 'user' node
+      keyed by the line text itself (same scheme as save_memory so both
+      pathways share nodes rather than creating duplicates).
+
+    Stubs for 'user' and 'active_project' are created only when missing.
+    """
+
+    # ── Soul / personality ────────────────────────────────────────────────────
+    if soul_path:
+        _sp = Path(soul_path)
+        if _sp.exists():
+            soul_text = _sp.read_text(encoding="utf-8")
+            graph.upsert_node(
+                "policy", "soul",
+                summary=soul_text[:600],
+                sources=[str(_sp)],
+            )
+            logger.info("sync_personality: policy node updated from %s", _sp.name)
+
+    # ── User preferences ──────────────────────────────────────────────────────
+    if prefs_path:
+        _pp = Path(prefs_path)
+        if _pp.exists():
+            count = 0
+            for line in _pp.read_text(encoding="utf-8").splitlines():
+                pref = line.strip()
+                if pref and not pref.startswith("#"):
+                    graph.upsert_node(
+                        pref[:80], "user",
+                        summary=pref,
+                        sources=[str(_pp)],
+                    )
+                    count += 1
+            if count:
+                logger.info("sync_personality: %d user prefs synced from %s",
+                            count, _pp.name)
+
+    # ── Stubs (create only if missing) ───────────────────────────────────────
+    if not graph.get_node("user"):
+        graph.upsert_node("user", "user",
+                          summary="User profile — to be filled in through conversation.")
+    if not graph.get_node("active_project"):
+        graph.upsert_node("active_project", "project",
+                          summary="Current project — to be filled in.")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

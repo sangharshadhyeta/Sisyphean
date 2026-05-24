@@ -35,10 +35,11 @@
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 4px; }
-    /* Flowchart node */
-    .fc-node { cursor: pointer; }
-    .fc-node rect { transition: filter .15s; }
-    .fc-node:hover rect { filter: brightness(1.3); }
+    /* Execution timeline */
+    .tl-ph  { transition: background .12s; }
+    .tl-ph:hover  { background: #141728 !important; }
+    .tl-sr  { transition: background .12s; }
+    .tl-sr:hover  { background: #0d0f1c !important; }
     /* Memory graph */
     .mg-node { cursor: pointer; }
     .mg-node circle { transition: r .15s; }
@@ -123,148 +124,285 @@ function StatCard({ label, value, sub, color = 'text-emerald-400' }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// FLOWCHART  (active task — left pane)
+// EXECUTION TIMELINE  (replaces flowchart — full step-by-step live feed)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const FC_W = 160, FC_H = 40, FC_GAP_X = 60, FC_GAP_Y = 20, FC_PAD = 24;
-
-function buildFlowNodes(task) {
-  // Flatten task tree into a list of positioned SVG nodes
-  const nodes = [];
-  const edges = [];
-  let y = FC_PAD;
-  const cx = FC_W / 2 + FC_PAD;
-
-  function addNode(id, label, status, type) {
-    nodes.push({ id, label: label.slice(0, 22), status, type, x: FC_PAD, y, cx, cy: y + FC_H/2 });
-    y += FC_H + FC_GAP_Y;
-    return id;
-  }
-  function addEdge(a, b) { edges.push({ from: a, to: b }); }
-
-  const tree = task.tree || {};
-  const planner = tree.planner || { status: 'pending', sub_tasks: [] };
-  const synth   = tree.synthesizer || { status: 'pending' };
-
-  const startId = addNode('start', task.user_message?.slice(0,24) || 'Task', 'done', 'start');
-  const planId  = addNode('plan', 'Plan', planner.status, 'plan');
-  addEdge(startId, planId);
-
-  let lastId = planId;
-
-  const subs = planner.sub_tasks || [];
-  if (subs.length === 1) {
-    (subs[0].steps || []).forEach((s, i) => {
-      const sid = `step-${i}`;
-      addNode(sid, s.type + (s.input ? ': ' + s.input.slice(0,14) : ''), s.status, s.type);
-      addEdge(lastId, sid);
-      lastId = sid;
-    });
-  } else {
-    subs.forEach((sub, ti) => {
-      const subId = `sub-${ti}`;
-      addNode(subId, sub.text?.slice(0,22) || `Sub-task ${ti+1}`, sub.status, 'subtask');
-      addEdge(lastId, subId);
-      let subLast = subId;
-      (sub.steps || []).forEach((s, si) => {
-        const sid = `sub-${ti}-step-${si}`;
-        addNode(sid, s.type + (s.input ? ': '+s.input.slice(0,12) : ''), s.status, s.type);
-        addEdge(subLast, sid);
-        subLast = sid;
-      });
-      lastId = subLast;
-    });
-  }
-
-  const synthId = addNode('synth', 'Synthesize', synth.status, 'synthesize');
-  addEdge(lastId, synthId);
-
-  const totalH = y + FC_PAD;
-  return { nodes, edges, totalH };
+// Live braille spinner
+function Spinner({ color='#22c55e' }) {
+  const F = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  const [i,setI] = useState(0);
+  useEffect(()=>{ const t=setInterval(()=>setI(x=>(x+1)%F.length),90); return ()=>clearInterval(t); },[]);
+  return <span style={{color,fontFamily:'JetBrains Mono,monospace'}}>{F[i]}</span>;
 }
 
-function statusFill(status) {
-  if (status === 'running') return '#15382a';
-  if (status === 'done')    return '#1a1d3a';
-  if (status === 'failed')  return '#2a1515';
-  return '#12152a';
-}
-function statusStroke(status) {
-  if (status === 'running') return '#22c55e';
-  if (status === 'done')    return '#6366f1';
-  if (status === 'failed')  return '#ef4444';
-  return '#2d3148';
+function SIcon({ status, size=12 }) {
+  if (status==='running') return <Spinner />;
+  if (status==='done')    return <span style={{color:'#6366f1',fontSize:size}}>✓</span>;
+  if (status==='failed')  return <span style={{color:'#ef4444',fontSize:size}}>✗</span>;
+  return <span style={{color:'#2d3148',fontSize:size}}>○</span>;
 }
 
-function Flowchart({ task }) {
-  const [sel, setSel] = useState(null);
-  const { nodes, edges, totalH } = useMemo(() => buildFlowNodes(task), [task]);
-  const svgW = FC_W + FC_PAD * 2 + FC_GAP_X;
+// Phase bar — header strip with left-border colour accent, optionally collapsible
+function PhaseBar({ label, status, color, detail, children }) {
+  const [open, setOpen] = useState(true);
+  const hasKids = children !== null && children !== undefined && children !== false;
+  return (
+    <div style={{marginBottom:8}}>
+      <div className="tl-ph" onClick={()=>hasKids&&setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderRadius:6,
+                background:'#0d0f1c',borderLeft:`3px solid ${color}`,
+                cursor:hasKids?'pointer':'default',userSelect:'none'}}>
+        <span style={{flexShrink:0,fontFamily:'monospace',width:14}}><SIcon status={status}/></span>
+        <span style={{color,fontWeight:700,fontSize:10,letterSpacing:1.2,
+                      textTransform:'uppercase',flexShrink:0}}>{label}</span>
+        {detail && <span style={{color:'#475569',fontSize:11,flex:1,overflow:'hidden',
+                                 textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{detail}</span>}
+        {hasKids && <span style={{color:'#374151',fontSize:9,marginLeft:'auto',flexShrink:0}}>
+          {open?'▾':'▸'}</span>}
+      </div>
+      {hasKids && open && <div style={{paddingLeft:14,paddingTop:4}}>{children}</div>}
+    </div>
+  );
+}
+
+// Single tool-call step: icon + tool name + args preview; click to expand input/output
+function StepRow({ step, replanBefore=false }) {
+  const [open, setOpen] = useState(false);
+  const col = tc(step.type||'');
+  const hasDetail = step.input || step.output;
+  const dur = (step.finished_at && step.started_at)
+    ? `${step.finished_at - step.started_at}s` : null;
 
   return (
-    <div className="overflow-y-auto" style={{ height: '100%' }}>
-      <svg width={svgW} height={totalH} style={{ display: 'block', margin: '0 auto' }}>
-        <defs>
-          <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="#2d3148" />
-          </marker>
-          <marker id="arr-run" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="#22c55e88" />
-          </marker>
-        </defs>
+    <>
+      {replanBefore && (
+        <div style={{display:'flex',alignItems:'center',gap:6,padding:'3px 8px',
+                     margin:'6px 0 4px',borderRadius:4,
+                     background:'#1c180a',border:'1px solid #eab30840'}}>
+          <span style={{color:'#eab308',fontSize:12}}>↩</span>
+          <span style={{color:'#92400e',fontSize:10,letterSpacing:.8,fontWeight:600}}>REPLANNED</span>
+        </div>
+      )}
+      <div className="tl-sr" onClick={()=>hasDetail&&setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'flex-start',gap:8,padding:'5px 8px',borderRadius:6,
+                background:open?'#0d0f1c':'transparent',
+                borderLeft:`2px solid ${col}55`,marginBottom:2,
+                cursor:hasDetail?'pointer':'default'}}>
+        <span style={{width:14,flexShrink:0,marginTop:1,fontFamily:'monospace'}}><SIcon status={step.status}/></span>
+        <span style={{color:col,fontWeight:600,fontSize:11,flexShrink:0,minWidth:74}}>{step.type}</span>
+        {step.input && (
+          <span style={{color:'#475569',fontSize:11,flex:1,overflow:'hidden',
+                        textOverflow:open?'clip':'ellipsis',
+                        whiteSpace:open?'pre-wrap':'nowrap',wordBreak:'break-all'}}>
+            {step.input}
+          </span>
+        )}
+        {dur && <span style={{color:'#374151',fontSize:10,flexShrink:0,paddingLeft:4}}>{dur}</span>}
+        {hasDetail && <span style={{color:'#374151',fontSize:9,flexShrink:0,paddingLeft:2}}>{open?'▴':'▾'}</span>}
+      </div>
+      {open && hasDetail && (
+        <div style={{marginLeft:22,marginBottom:6,background:'#0a0c14',borderRadius:6,
+                     border:'1px solid #1e2235',padding:'8px 10px'}}>
+          {step.input && (
+            <div style={{marginBottom:step.output?8:0}}>
+              <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
+                           fontWeight:600}}>INPUT</div>
+              <pre style={{color:'#94a3b8',fontSize:11,margin:0,whiteSpace:'pre-wrap',
+                           wordBreak:'break-all',maxHeight:140,overflowY:'auto',
+                           fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
+                {step.input}
+              </pre>
+            </div>
+          )}
+          {step.output && (
+            <div>
+              <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
+                           fontWeight:600}}>OUTPUT</div>
+              <pre style={{color:'#6ee7b7',fontSize:11,margin:0,whiteSpace:'pre-wrap',
+                           wordBreak:'break-all',maxHeight:160,overflowY:'auto',
+                           fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
+                {step.output}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
 
-        {/* Edges */}
-        {edges.map((e, i) => {
-          const from = nodes.find(n => n.id === e.from);
-          const to   = nodes.find(n => n.id === e.to);
-          if (!from || !to) return null;
-          const x1 = from.cx, y1 = from.y + FC_H;
-          const x2 = to.cx,   y2 = to.y;
-          const mid = (y1 + y2) / 2;
-          const running = to.status === 'running';
-          return (
-            <path key={i}
-              d={`M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`}
-              fill="none"
-              stroke={running ? '#22c55e44' : '#2d3148'}
-              strokeWidth={running ? 2 : 1.5}
-              markerEnd={running ? 'url(#arr-run)' : 'url(#arr)'}
-              strokeDasharray={running ? '4 3' : 'none'}
-            />
-          );
-        })}
+// Sub-task section (when planner split into multiple sub-tasks)
+const SUB_COLORS = ['#06b6d4','#34d399','#f59e0b','#a855f7','#f472b6','#60a5fa','#fb923c'];
 
-        {/* Nodes */}
-        {nodes.map(n => {
-          const isSelected = sel === n.id;
-          const color = n.id === 'start' ? '#f59e0b' : n.id === 'synth' ? '#34d399' : n.id === 'plan' ? '#818cf8' : tc(n.type);
-          return (
-            <g key={n.id} className="fc-node" onClick={() => setSel(sel === n.id ? null : n.id)}>
-              <rect
-                x={n.x} y={n.y} width={FC_W} height={FC_H} rx={7}
-                fill={statusFill(n.status)}
-                stroke={isSelected ? color : statusStroke(n.status)}
-                strokeWidth={isSelected ? 2 : 1.5}
-              />
-              {/* Status dot */}
-              <circle cx={n.x + 13} cy={n.cy} r={4}
-                fill={n.status === 'running' ? '#22c55e' : n.status === 'done' ? '#6366f1' : n.status === 'failed' ? '#ef4444' : '#374151'}>
-                {n.status === 'running' && (
-                  <animate attributeName="opacity" values="1;0.3;1" dur="1.2s" repeatCount="indefinite" />
-                )}
-              </circle>
-              {/* Type accent bar */}
-              <rect x={n.x + 24} y={n.y + 6} width={3} height={FC_H - 12} rx={1.5} fill={color} opacity={0.7} />
-              {/* Label */}
-              <text x={n.x + 34} y={n.cy + 1}
-                fontSize={10} fill="#cbd5e1" dominantBaseline="middle"
-                style={{ userSelect: 'none', fontFamily: 'JetBrains Mono, monospace' }}>
-                {n.label}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
+function SubTaskSection({ sub, idx }) {
+  const [open, setOpen] = useState(true);
+  const steps = sub.steps || [];
+  const col = SUB_COLORS[idx % SUB_COLORS.length];
+  return (
+    <div style={{marginBottom:8}}>
+      <div className="tl-ph" onClick={()=>setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'center',gap:8,padding:'5px 10px',borderRadius:6,
+                background:'#0f1221',borderLeft:`2px solid ${col}`,cursor:'pointer',
+                userSelect:'none',marginBottom:4}}>
+        <span style={{width:14,flexShrink:0,fontFamily:'monospace'}}><SIcon status={sub.status}/></span>
+        <span style={{color:col,fontSize:11,fontWeight:600,flexShrink:0}}>{idx+1}.</span>
+        <span style={{color:'#cbd5e1',fontSize:12,flex:1,overflow:'hidden',
+                      textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{sub.text}</span>
+        <span style={{color:'#374151',fontSize:9,flexShrink:0}}>{open?'▾':'▸'}</span>
+      </div>
+      {open && (
+        <div style={{paddingLeft:14}}>
+          {steps.length===0 && sub.status==='pending' && (
+            <div style={{color:'#374151',fontSize:11,padding:'3px 8px',fontStyle:'italic'}}>
+              Waiting to start…
+            </div>
+          )}
+          {steps.map((s,i) => {
+            const replanBefore = s.replan===true && (i===0 || !steps[i-1].replan);
+            return <StepRow key={i} step={s} replanBefore={replanBefore}/>;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Full execution timeline for one task — phases → steps → outputs, everything expandable
+function ExecutionTimeline({ task }) {
+  const tree    = task.tree    || {};
+  const ext     = tree.extractor   || {};
+  const planner = tree.planner     || {};
+  const synth   = tree.synthesizer || {};
+  const subs    = planner.sub_tasks || [];
+  const isSingle = subs.length === 1;
+  const now = Math.round(Date.now()/1000);
+  const elapsed = task.finished_at
+    ? `${task.finished_at - task.started_at}s`
+    : `${now - (task.started_at||now)}s`;
+
+  return (
+    <div style={{padding:'12px 16px',overflowY:'auto',height:'100%',boxSizing:'border-box'}}>
+
+      {/* ── Task prompt ────────────────────────────────────────────── */}
+      <div style={{marginBottom:14,paddingBottom:12,borderBottom:'1px solid #1a1d2e'}}>
+        <div style={{display:'flex',alignItems:'flex-start',gap:8}}>
+          <span className={task.status==='running'?'dot-pulse':''}
+            style={{width:8,height:8,borderRadius:'50%',flexShrink:0,marginTop:4,
+                    display:'inline-block',
+                    background:task.status==='running'?'#22c55e':
+                               task.status==='failed'?'#ef4444':'#6366f1'}}/>
+          <div style={{flex:1}}>
+            <div style={{color:'#e2e8f0',fontSize:13,fontWeight:600,lineHeight:1.5,marginBottom:2}}>
+              {task.user_message}
+            </div>
+            <div style={{color:'#374151',fontSize:10}}>
+              {elapsed} · session {task.session}
+              {task.status !== 'running' && (
+                <span style={{color: task.status==='done'?'#6366f1':'#ef4444',marginLeft:8,
+                              fontWeight:600,textTransform:'uppercase',fontSize:9}}>
+                  {task.status}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Context (memory extraction) ────────────────────────────── */}
+      {ext.status && ext.status !== 'pending' && (
+        <PhaseBar label="Context" status={ext.status} color="#0ea5e9"
+                  detail={ext.output || ext.input}/>
+      )}
+
+      {/* ── Plan ───────────────────────────────────────────────────── */}
+      {planner.status && planner.status !== 'pending' && (
+        !isSingle && subs.length > 0 ? (
+          <PhaseBar label="Plan" status={planner.status} color="#818cf8">
+            <div style={{paddingLeft:6,paddingTop:2,paddingBottom:4}}>
+              {subs.map((s,i) => (
+                <div key={i} style={{display:'flex',alignItems:'center',gap:6,
+                                     padding:'2px 0',fontSize:11}}>
+                  <span style={{color:'#374151',width:18,flexShrink:0,textAlign:'right'}}>{i+1}.</span>
+                  <span style={{flexShrink:0,fontFamily:'monospace',width:12}}><SIcon status={s.status} size={10}/></span>
+                  <span style={{color:'#64748b',overflow:'hidden',textOverflow:'ellipsis',
+                                whiteSpace:'nowrap',flex:1}}>{s.text}</span>
+                </div>
+              ))}
+            </div>
+          </PhaseBar>
+        ) : (
+          <PhaseBar label="Plan" status={planner.status} color="#818cf8"
+                    detail={subs[0]?.text || planner.output}/>
+        )
+      )}
+
+      {/* ── Execution steps ────────────────────────────────────────── */}
+      {subs.length > 0 && (
+        <div style={{marginBottom:8}}>
+          {isSingle ? (
+            // Single sub-task: steps shown directly, no extra nesting
+            (subs[0].steps||[]).length > 0 ? (
+              (subs[0].steps||[]).map((s,i) => {
+                const replanBefore = s.replan===true && (i===0||!subs[0].steps[i-1].replan);
+                return <StepRow key={i} step={s} replanBefore={replanBefore}/>;
+              })
+            ) : (
+              subs[0].status === 'pending' && (
+                <div style={{color:'#374151',fontSize:11,padding:'3px 8px',fontStyle:'italic'}}>
+                  Planning steps…
+                </div>
+              )
+            )
+          ) : (
+            subs.map((sub,i) => <SubTaskSection key={i} sub={sub} idx={i}/>)
+          )}
+        </div>
+      )}
+
+      {/* ── Synthesize ─────────────────────────────────────────────── */}
+      {synth.status && synth.status !== 'pending' && (
+        synth.output ? (
+          <PhaseBar label="Synthesize" status={synth.status} color="#a855f7"
+                    detail={synth.status==='running'?'Building answer…':null}>
+            <div style={{background:'#0d0f1c',borderRadius:6,padding:'10px 12px',
+                         border:'1px solid #1e2235',fontSize:12,color:'#cbd5e1',
+                         whiteSpace:'pre-wrap',maxHeight:200,overflowY:'auto',
+                         lineHeight:1.65,fontFamily:'JetBrains Mono,monospace'}}>
+              {synth.output}
+            </div>
+          </PhaseBar>
+        ) : (
+          <PhaseBar label="Synthesize" status={synth.status} color="#a855f7"
+                    detail={synth.status==='running'?'Building answer…':null}/>
+        )
+      )}
+
+      {/* ── Micro-loop (internal think/search/plan steps) ──────────── */}
+      {task.steps?.length > 0 && (
+        <PhaseBar label="Agent steps" status="done" color="#475569"
+                  detail={`${task.steps.length} internal step${task.steps.length!==1?'s':''}`}>
+          {task.steps.map((s,i) => (
+            <StepRow key={i} step={{
+              type: s.type||'step',
+              input: s.input||s.text||'',
+              output: s.output||'',
+              status: s.status||'done',
+              started_at: s.started_at,
+              finished_at: s.finished_at,
+            }}/>
+          ))}
+        </PhaseBar>
+      )}
+
+      {/* Empty state — task just started */}
+      {!ext.status && !planner.status && (
+        <div style={{display:'flex',alignItems:'center',gap:10,color:'#374151',
+                     fontSize:12,padding:'20px 8px'}}>
+          <Spinner color="#374151"/>
+          <span>Initialising…</span>
+        </div>
+      )}
+
     </div>
   );
 }
@@ -425,72 +563,7 @@ function MemoryGraph({ nodes, edges, w, h }) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LAST COMPLETED  (compact pipeline tree)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function StepPill({ step }) {
-  const color = tc(step.type);
-  return (
-    <div className="flex items-center gap-1.5 py-1 px-2 rounded"
-         style={{ background:'#0d0f1c', border:`1px solid ${color}22` }}>
-      <span style={{ width:6, height:6, borderRadius:'50%', background:color, flexShrink:0 }} />
-      <span className="text-xs font-mono" style={{ color }}>{step.type}</span>
-      {step.input && <span className="text-slate-500 text-xs truncate" style={{maxWidth:200}}>{step.input}</span>}
-      {step.status === 'failed' && <span className="text-red-400 text-xs ml-auto">✗</span>}
-      {step.status === 'done'   && <span className="text-indigo-400 text-xs ml-auto">✓</span>}
-    </div>
-  );
-}
-
-function CompletedTask({ task }) {
-  const tree = task.tree || {};
-  const planner = tree.planner || { sub_tasks: [] };
-  const synth   = tree.synthesizer || {};
-  const elapsed = task.finished_at ? task.finished_at - task.started_at : null;
-  const allSteps = (planner.sub_tasks || []).flatMap(s => s.steps || []);
-
-  return (
-    <div className="card p-4">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3 mb-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${task.status === 'failed' ? 'bg-red-500' : 'bg-indigo-500'}`} />
-          <span className="text-slate-200 text-sm font-semibold truncate">{task.user_message}</span>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0 text-xs">
-          {elapsed != null && <span className="text-slate-500">{elapsed}s</span>}
-          <span className={task.status === 'failed' ? 'text-red-400' : 'text-indigo-400'}>{task.status}</span>
-          {task.session && <span className="text-slate-700 font-mono">{task.session.slice(0,8)}</span>}
-        </div>
-      </div>
-
-      {/* Step pills */}
-      {allSteps.length > 0 && (
-        <div className="flex flex-col gap-1 mb-3">
-          {allSteps.map((s, i) => <StepPill key={i} step={s} />)}
-        </div>
-      )}
-
-      {/* Answer preview */}
-      {synth.output && (
-        <div className="rounded-lg p-3 text-xs text-slate-300 leading-relaxed"
-             style={{ background:'#0d0f1c', border:'1px solid #1e2235',
-                      maxHeight:120, overflowY:'auto', whiteSpace:'pre-wrap' }}>
-          {synth.output}
-        </div>
-      )}
-
-      {/* Stats row */}
-      <div className="flex items-center gap-4 mt-3 text-xs text-slate-600">
-        <span>{allSteps.length} step{allSteps.length !== 1 ? 's' : ''}</span>
-        {(planner.sub_tasks||[]).length > 1 &&
-          <span>{planner.sub_tasks.length} sub-tasks</span>}
-        {task.started_at && <span>{new Date(task.started_at*1000).toLocaleTimeString()}</span>}
-      </div>
-    </div>
-  );
-}
+// StepPill and CompletedTask removed — ExecutionTimeline supersedes them.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AGENT ACTIVITY  (improved)
@@ -757,51 +830,44 @@ function App() {
             </div>
           </div>
 
-          {/* ── Active task: flowchart + memory graph ──────────────── */}
+          {/* ── Active task: execution timeline + memory graph ────────── */}
           {running ? (
             <div>
-              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Active task</div>
+              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
+                Active task
+              </div>
               <div ref={paneRef} className="card overflow-hidden"
-                   style={{ display:'grid', gridTemplateColumns:'1fr 1fr', minHeight:420 }}>
-
-                {/* Left — flowchart */}
-                <div className="border-r border-slate-800/60 flex flex-col"
-                     style={{ height: paneH }}>
-                  <div className="px-4 py-2 border-b border-slate-800/40 flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse" />
-                    <span className="text-slate-300 text-xs font-semibold truncate flex-1">
-                      {running.user_message}
-                    </span>
-                    <span className="text-slate-600 text-xs">
-                      {Math.round(Date.now()/1000 - running.started_at)}s
-                    </span>
-                  </div>
-                  <div style={{ flex:1, overflow:'hidden', padding:'12px 8px' }}>
-                    <Flowchart task={running} />
-                  </div>
+                   style={{ display:'grid', gridTemplateColumns:'55fr 45fr', minHeight:480 }}>
+                {/* Left — live execution timeline */}
+                <div className="border-r border-slate-800/60"
+                     style={{ height: paneH, overflow:'hidden' }}>
+                  <ExecutionTimeline task={running}/>
                 </div>
-
-                {/* Right — memory graph (live, always fetched) */}
-                <MemoryGraphPane graph={graph} h={paneH} splitMode />
+                {/* Right — memory graph */}
+                <MemoryGraphPane graph={graph} h={paneH} splitMode/>
               </div>
             </div>
           ) : (
-            /* ── Memory graph (full-width when idle) ───────────────── */
+            /* ── Memory graph full-width when idle ──────────────────── */
             <div>
               <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
                 Memory Graph
               </div>
               <div ref={paneRef} className="card overflow-hidden">
-                <MemoryGraphPane graph={graph} h={Math.max(420, paneH)} splitMode={false} />
+                <MemoryGraphPane graph={graph} h={Math.max(420, paneH)} splitMode={false}/>
               </div>
             </div>
           )}
 
-          {/* ── Last completed ─────────────────────────────────────── */}
+          {/* ── Last completed task — always shown below ───────────── */}
           {completed && (
             <div>
-              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Last completed</div>
-              <CompletedTask task={completed} />
+              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
+                Last completed
+              </div>
+              <div className="card overflow-hidden" style={{ maxHeight: 600 }}>
+                <ExecutionTimeline task={completed}/>
+              </div>
             </div>
           )}
 

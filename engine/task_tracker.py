@@ -197,6 +197,7 @@ def tree_subtask_replanned(task_id: str, task_idx: int,
         subs[task_idx]["steps"].append({
             "type": s["tool"], "input": s["input"][:200],
             "output": "", "status": "pending", "ts": now,
+            "replan": True,   # mark so the dashboard can show a "↩ Replanned" divider
         })
 
 

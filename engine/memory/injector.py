@@ -103,7 +103,7 @@ class MemoryInjector:
         proj_nodes = [n for n in proj_nodes
                       if (n.get("summary") or n.get("content", "")).strip()
                       and "to be filled" not in (n.get("summary") or n.get("content", ""))
-                      and n.get("last_seen", 0) >= _cutoff]
+                      and float(n.get("last_seen", 0) or 0) >= _cutoff]
         if proj_nodes and remaining > 50:
             text = "### Current Project\n" + "\n".join(
                 f"**{n.get('name') or n.get('label', '?')}**: "

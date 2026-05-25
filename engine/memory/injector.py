@@ -144,12 +144,15 @@ class MemoryInjector:
                 node_types=["fact", "concept", "project", "entity", "session"],
             )
             if hits:
-                lines = [
-                    f"- [{h.get('type','?')}] "
-                    f"**{h.get('name') or h.get('label','?')}**: "
-                    f"{(h.get('summary') or h.get('content',''))[:200]}"
-                    for h in hits
-                ]
+                lines = []
+                for h in hits:
+                    via  = f"  *(via {h['_via']})*" if h.get("_via") else ""
+                    lines.append(
+                        f"- [{h.get('type','?')}] "
+                        f"**{h.get('name') or h.get('label','?')}**: "
+                        f"{(h.get('summary') or h.get('content',''))[:200]}"
+                        f"{via}"
+                    )
                 text = "### Relevant Context\n" + "\n".join(lines)
                 text, remaining = _fit(text, remaining)
                 if text:

@@ -3606,6 +3606,7 @@ def _inject_file_sigs_to_graph(file_path: str, graph) -> None:
             re.MULTILINE,
         )
         saved = 0
+        saved_labels: list[str] = []
         for m in _SIG_RE.finditer(content):
             sig = m.group(1).strip()
             if not (3 < len(sig) < 120):
@@ -3613,15 +3614,29 @@ def _inject_file_sigs_to_graph(file_path: str, graph) -> None:
             # Skip dunder methods — unlikely to be useful cross-file
             if sig.startswith("def __") and not sig.startswith("def __init__"):
                 continue
-            label   = sig
+            label       = sig
             content_str = f"{sig}  # {basename}"
-            graph.add_node(
-                type="skill",
-                label=label,
-                content=content_str,
+            graph.upsert_node(
+                label, "skill",
+                summary=content_str,
                 metadata={"file": basename, "kind": "code_sig"},
             )
+            # produced edge: file → skill sig (weight 1.0 each time it's saved)
+            try:
+                graph.upsert_edge(basename, "produced", label, weight=1.0)
+            except Exception:
+                pass
+            saved_labels.append(label)
             saved += 1
+
+        # related_to edges between all sigs in the same file (co-defined)
+        for i in range(len(saved_labels)):
+            for j in range(i + 1, len(saved_labels)):
+                try:
+                    graph.upsert_edge(saved_labels[i], "related_to", saved_labels[j], weight=0.5)
+                except Exception:
+                    pass
+
         if saved:
             logger.info("pipeline: saved %d sig(s) from %s to graph", saved, basename)
     except Exception as exc:

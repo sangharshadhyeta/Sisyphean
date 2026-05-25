@@ -385,7 +385,25 @@ class GraphStore:
         node_type: str | None = None,
         node_types: list[str] | None = None, # plural form used by injector
     ) -> list[dict]:
-        """Token-overlap search. Returns list of dicts with 'key' field."""
+        """Token-overlap search with edge-propagation bonus.
+
+        Two-phase retrieval:
+          1. Keyword phase  — token overlap + recency bonus on every node.
+          2. Propagation phase — weighted neighbours of the top keyword hits
+             receive a secondary score so structurally related nodes surface
+             even when their text doesn't match the query directly.
+
+             Example: query "python imports" matches fact:python-imports (score 2.4).
+             That node has a `related_to` edge (weight 2.0) to concept:module-system.
+             concept:module-system gets propagation score 0.3 × 2.0 = 0.6 and
+             rises to the top of the otherwise-unscored nodes.
+
+        Propagation scores are always < any real keyword hit (max ≈ 1.5 for a
+        weight-5 edge vs. minimum keyword score of 1.0 + recency), so direct
+        matches always rank first.
+
+        Returns list of dicts with 'key' field.
+        """
         import re
         def _tok(t: str) -> set[str]:
             return {w for w in re.findall(r"[a-z0-9]+", t.lower()) if len(w) > 2}
@@ -404,6 +422,8 @@ class GraphStore:
         tokens = _tok(query)
         if not tokens:
             return []
+
+        # ── Phase 1: keyword + recency scoring ────────────────────────────────
         scored: list[tuple[float, dict]] = []
         for key, data in self._graph.nodes(data=True):
             if type_filter and data.get("type") not in type_filter:
@@ -413,10 +433,7 @@ class GraphStore:
             )
             if token_score <= 0:
                 continue
-            # ── Recency bonus ─────────────────────────────────────────────────
-            # Nodes updated within the past 7 days get a bonus (max +1.0 today,
-            # linearly decaying to 0 at 7 days).  This prevents stale nodes from
-            # old sessions drowning out fresh research on related topics.
+            # Recency bonus: max +0.5 today, linearly decaying to 0 at 7 days.
             # last_seen may be a UNIX float or an ISO-8601 string — handle both.
             last_seen_raw = data.get("last_seen", 0)
             if isinstance(last_seen_raw, str):
@@ -427,10 +444,57 @@ class GraphStore:
                     last_seen = 0
             else:
                 last_seen = float(last_seen_raw) if last_seen_raw else 0
-            age_hours  = max(0, (_now - last_seen) / 3600) if last_seen else 9999
-            recency    = max(0.0, 1.0 - age_hours / (7 * 24))  # 0→1 within 7 days
-            score      = token_score + recency * 0.5
+            age_hours = max(0, (_now - last_seen) / 3600) if last_seen else 9999
+            recency   = max(0.0, 1.0 - age_hours / (7 * 24))
+            score     = token_score + recency * 0.5
             scored.append((score, {"key": key, **data}))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # ── Phase 2: edge-propagation bonus ───────────────────────────────────
+        # Take the top-3 keyword seeds and surface their weighted neighbours.
+        # Propagation score = _PROP_WEIGHT × edge_weight (capped at 5 to prevent
+        # runaway scores from very-high-weight edges accumulated over many sessions).
+        _PROP_WEIGHT = 0.3
+        _SEED_COUNT  = 3
+        _seen_keys   = {d["key"] for _, d in scored}
+
+        for _seed_score, seed in scored[:_SEED_COUNT]:
+            seed_key = seed["key"]
+            # Collect all immediate neighbours (outbound + inbound, 1 hop)
+            nbr_keys = (
+                list(self._graph.successors(seed_key)) +
+                list(self._graph.predecessors(seed_key))
+            )
+            for nbr_key in nbr_keys:
+                if nbr_key in _seen_keys:
+                    continue
+                if not self._graph.has_node(nbr_key):
+                    continue
+                nbr_data = dict(self._graph.nodes[nbr_key])
+                if type_filter and nbr_data.get("type") not in type_filter:
+                    continue
+                # Use the max weight of forward / backward edge; capture relation label
+                edge_w    = 0.0
+                via_label = ""
+                if self._graph.has_edge(seed_key, nbr_key):
+                    w = float(self._graph.edges[seed_key, nbr_key].get("weight", 1.0))
+                    if w > edge_w:
+                        edge_w    = w
+                        via_label = self._graph.edges[seed_key, nbr_key].get("relation", "")
+                if self._graph.has_edge(nbr_key, seed_key):
+                    w = float(self._graph.edges[nbr_key, seed_key].get("weight", 1.0))
+                    if w > edge_w:
+                        edge_w    = w
+                        via_label = self._graph.edges[nbr_key, seed_key].get("relation", "")
+                prop_score = _PROP_WEIGHT * min(edge_w, 5.0)
+                if prop_score > 0:
+                    # _via: relation label + seed name so the injector can show
+                    # "via related_to: python-imports" in the memory context
+                    via_str = f"{via_label}: {seed.get('name', seed_key)}" if via_label else seed.get("name", seed_key)
+                    scored.append((prop_score, {"key": nbr_key, "_via": via_str, **nbr_data}))
+                    _seen_keys.add(nbr_key)
+
         scored.sort(key=lambda x: x[0], reverse=True)
         return [d for _, d in scored[:effective_limit]]
 

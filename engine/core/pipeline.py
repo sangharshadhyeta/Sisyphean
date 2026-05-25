@@ -226,6 +226,7 @@ class PipelineState:
     wp_resume_ctx:  str = ""  # verifier resume context for the current retry
     # ── Bash retry state ──────────────────────────────────────────────────────
     bash_retry_count: int = 0  # consecutive bash failures on current step
+    last_bash_error:  str = ""  # traceback from most recent bash failure (cleared after fix edit)
 
     def to_json(self) -> str:
         return json.dumps({
@@ -258,6 +259,7 @@ class PipelineState:
                 "rctx":  self.wp_resume_ctx[:800],
             } if self.wp_items else {},
             "brc": self.bash_retry_count,
+            "lbe": self.last_bash_error[:400],
         })
 
     @classmethod
@@ -288,6 +290,7 @@ class PipelineState:
         obj.wp_retry_count = wp.get("rc",    0)
         obj.wp_resume_ctx  = wp.get("rctx",  "")
         obj.bash_retry_count = d.get("brc", 0)
+        obj.last_bash_error  = d.get("lbe", "")
         return obj
 
 
@@ -799,6 +802,8 @@ class Pipeline:
             pass
         outer_tool  = outer_step.get("tool", "bash")
         outer_input = outer_step.get("input", "")
+        # Propagate _fix_error annotation so _replan_from_outer_result can use it
+        outer_fix_error = outer_step.get("_fix_error", "")
 
         # Extract tool results from the last user message
         tool_results = _extract_tool_results(raw_history)
@@ -806,12 +811,15 @@ class Pipeline:
             # Empty stdout from bash/write means the command succeeded silently
             if not tr and outer_input:
                 tr = f"Completed successfully: {outer_input[:80]}"
-            state.results.append({
+            result_entry = {
                 "tool": outer_tool,
                 "input": outer_input,
                 "result": tr,
                 "summary": tr[:120],
-            })
+            }
+            if outer_fix_error:
+                result_entry["_fix_error"] = outer_fix_error
+            state.results.append(result_entry)
             logger.info("pipeline.continue: tool_result=%s", tr[:80])
 
             # ── Update epistemic state ─────────────────────────────────────
@@ -839,26 +847,63 @@ class Pipeline:
                 state.commands_run.append({"cmd": outer_input[:100], "brief": brief})
                 logger.debug("epistemic: ran cmd len=%d", len(outer_input))
 
-                # Bash failure retry — ask the synthesizer for a corrected command
+                # ── Bash failure retry ────────────────────────────────────────
+                # Two strategies, tried in order:
+                #   1. Smart fix loop: Python traceback with a named file →
+                #      insert Read(broken_file) so _replan_from_outer_result
+                #      calls _generate_edit_steps with the error as context,
+                #      then re-runs the original bash command.
+                #   2. Command correction: no file reference → ask the LLM
+                #      for a corrected command (existing _bash_correct path).
                 _MAX_BASH_RETRIES = 2
                 if _is_bash_failure(tr) and state.bash_retry_count < _MAX_BASH_RETRIES:
-                    corrected = await _bash_correct(outer_input, tr, self.client)
-                    if corrected:
+                    tb_info = _parse_traceback(tr)
+                    fix_file = _resolve_fix_file(
+                        tb_info["file"] if tb_info else "",
+                        state.project_dir, self.workspace,
+                    ) if tb_info else ""
+
+                    if fix_file:
+                        # Smart fix: Read broken file → LLM generates Edit → re-run
                         logger.warning(
-                            "pipeline: bash failed — retrying with corrected cmd "
-                            "(attempt %d): %s",
-                            state.bash_retry_count + 1, corrected[:80],
+                            "pipeline: traceback in %s (attempt %d) → smart fix loop",
+                            os.path.basename(fix_file), state.bash_retry_count + 1,
                         )
+                        state.last_bash_error = tr[:400]
                         try:
                             sub = state.sub_tasks[state.current_task_idx]
-                            sub["steps"][state.current_step_idx]["input"] = corrected
+                            ins = state.current_step_idx  # insert BEFORE step-idx advance
+                            # Re-run the original bash after the fix
+                            sub["steps"].insert(ins + 1, {"tool": "bash", "input": outer_input})
+                            # Read the broken file first (replanner will generate Edit)
+                            sub["steps"].insert(ins + 1, {
+                                "tool": "read", "input": fix_file, "_fix_error": tr[:400],
+                            })
                         except (IndexError, KeyError):
                             pass
                         state.bash_retry_count += 1
-                        state.current_step_idx -= 1  # re-run same step
-                        state.results.pop()          # discard failed result
+                        # Do NOT decrement step_idx — _continue advances to Read next
+                        state.results.pop()   # discard failed result so _execute re-runs
                     else:
-                        state.bash_retry_count = 0
+                        # Command-level error (wrong path, typo, OS difference) →
+                        # ask the LLM for a corrected command
+                        corrected = await _bash_correct(outer_input, tr, self.client)
+                        if corrected:
+                            logger.warning(
+                                "pipeline: bash failed — retrying with corrected cmd "
+                                "(attempt %d): %s",
+                                state.bash_retry_count + 1, corrected[:80],
+                            )
+                            try:
+                                sub = state.sub_tasks[state.current_task_idx]
+                                sub["steps"][state.current_step_idx]["input"] = corrected
+                            except (IndexError, KeyError):
+                                pass
+                            state.bash_retry_count += 1
+                            state.current_step_idx -= 1  # re-run same step
+                            state.results.pop()          # discard failed result
+                        else:
+                            state.bash_retry_count = 0
                 else:
                     state.bash_retry_count = 0
 
@@ -918,6 +963,29 @@ class Pipeline:
                 # (not docs) and only when the graph is available.
                 if wp_ftype_was == "code" and wp_file_was and self.graph:
                     _inject_file_sigs_to_graph(wp_file_was, self.graph)
+
+                # ── Per-file import verify (project builds) ───────────────────
+                # After each code file is written, verify its imports resolve
+                # with a quick `python -c "import X"` check.  If this fails,
+                # the smart fix loop (traceback → Read → Edit → re-run) kicks in
+                # automatically via the bash failure handler above.
+                # Only runs for clean module names (no hyphens, no path separators).
+                if wp_ftype_was == "code" and wp_file_was:
+                    _mod = os.path.splitext(os.path.basename(wp_file_was))[0]
+                    _ws  = self.workspace or state.project_dir or ""
+                    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', _mod) and _ws:
+                        _verify_cmd = (
+                            f'python -c "import sys; sys.path.insert(0, r\'{_ws}\'); '
+                            f'import {_mod}; print(\'import OK: {_mod}\')"'
+                        )
+                        _verify_step = {"tool": "bash", "input": _verify_cmd,
+                                        "_import_verify": True}
+                        try:
+                            sub = state.sub_tasks[state.current_task_idx]
+                            sub["steps"].insert(state.current_step_idx + 1, _verify_step)
+                            logger.info("pipeline: import verify queued for %s", _mod)
+                        except (IndexError, KeyError):
+                            pass
 
                 # Optionally run the file after writing
                 if state.wp_run_after and state.wp_file:
@@ -1543,9 +1611,24 @@ class Pipeline:
 
         elif tool == "read":
             file_path = inp  # already resolved in _execute
-            logger.info("pipeline: read→edit replan for %s", file_path)
+            # If this Read was triggered by a bash traceback (smart fix loop),
+            # use the error message as the task so the LLM knows exactly what to fix.
+            # Prefer the per-result annotation; fall back to state.last_bash_error.
+            fix_error = last.get("_fix_error", "") or state.last_bash_error
+            if fix_error:
+                edit_task = (
+                    f"Fix this Python error in {os.path.basename(file_path)}:\n"
+                    f"{fix_error[:350]}"
+                )
+                logger.info("pipeline: read→fix-edit for %s: %s",
+                            os.path.basename(file_path), fix_error[:60])
+                # Clear the stored error — it's been consumed
+                state.last_bash_error = ""
+            else:
+                edit_task = state.query
+                logger.info("pipeline: read→edit replan for %s", file_path)
             new_steps = await self._generate_edit_steps(
-                state.query, result, file_path,
+                edit_task, result, file_path,
                 epistemic=_epistemic_block(state),
             )
             if new_steps:
@@ -2059,14 +2142,24 @@ class Pipeline:
             state.task_id, state.current_task_idx,
             "write", f"{title} → {file_path}", "", status="running",
         )
-        return LoopResponse(
-            content=[
-                {"type": "thinking", "thinking": f"{_STATE_PREFIX}{state.to_json()}"},
-                {"type": "tool_use", "id": tool_id, "name": "Write",
-                 "input": {"file_path": file_path, "content": new_full_content}},
-            ],
-            stop_reason="tool_use",
+
+        # ── Visible progress for multi-file project builds ────────────────────
+        # Show a checklist at the start of each new file (wp_idx == 0) so the
+        # user can see overall project progress without looking at the dashboard.
+        # Mirrors the replan/subtask cycle: same information, surfaced as text.
+        response_content: list[dict] = [
+            {"type": "thinking", "thinking": f"{_STATE_PREFIX}{state.to_json()}"},
+        ]
+        if state.wp_idx == 0:
+            progress_text = _render_project_progress(state)
+            if progress_text:
+                response_content.append({"type": "text", "text": progress_text})
+
+        response_content.append(
+            {"type": "tool_use", "id": tool_id, "name": "Write",
+             "input": {"file_path": file_path, "content": new_full_content}},
         )
+        return LoopResponse(content=response_content, stop_reason="tool_use")
 
     async def _reflect_write_plan(self, goal: str, file_path: str) -> str:
         """One cheap LLM call after all write-plan items complete.
@@ -2886,6 +2979,118 @@ async def _bash_correct(original_cmd: str, error: str, client) -> str:
     except Exception as exc:
         logger.warning("bash_correct: LLM call failed: %s", exc)
         return ""
+
+
+# ── Smart fix loop helpers ────────────────────────────────────────────────────
+
+# Matches "  File \"path/to/file.py\", line N" in Python tracebacks
+_TB_FILE_RE = re.compile(
+    r'File ["\']([^"\']+\.py)["\'],\s*line\s*(\d+)',
+    re.IGNORECASE,
+)
+# Matches the final error line "ErrorType: message"
+_TB_ERROR_RE = re.compile(
+    r'^([A-Za-z][A-Za-z0-9_]*(?:Error|Exception|Warning)):\s*(.+)',
+    re.MULTILINE,
+)
+
+
+def _parse_traceback(stderr: str) -> dict | None:
+    """Extract structured info from a Python traceback string.
+
+    Returns {file, line, error_type, message} for the LAST file reference
+    in the traceback (the proximate cause), or None if no traceback found.
+    Only returns user-owned files (not site-packages / stdlib paths).
+    """
+    if "Traceback" not in stderr and "Error:" not in stderr:
+        return None
+
+    file_matches = _TB_FILE_RE.findall(stderr)
+    if not file_matches:
+        return None
+
+    # Walk backward to find the last user-owned file (not stdlib / site-packages)
+    user_file, user_line = "", "0"
+    for fpath, lineno in reversed(file_matches):
+        norm = fpath.replace("\\", "/").lower()
+        if ("site-packages" in norm or "lib/python" in norm or
+                "lib\\python" in norm or "<" in fpath):
+            continue
+        user_file, user_line = fpath, lineno
+        break
+
+    if not user_file:
+        # All files are stdlib — use last match anyway
+        user_file, user_line = file_matches[-1]
+
+    err_match = _TB_ERROR_RE.search(stderr)
+    error_type = err_match.group(1) if err_match else "Error"
+    message    = err_match.group(2).strip() if err_match else stderr.strip()[-120:]
+
+    return {
+        "file":       user_file,
+        "line":       int(user_line),
+        "error_type": error_type,
+        "message":    message[:200],
+    }
+
+
+def _resolve_fix_file(raw_path: str, project_dir: str, workspace: str) -> str:
+    """Turn a raw path from a traceback into an absolute path we can Read.
+
+    Returns "" if the file cannot be resolved to something that exists on disk.
+    """
+    if not raw_path:
+        return ""
+    # Already absolute and exists
+    if os.path.isabs(raw_path) and os.path.isfile(raw_path):
+        return raw_path
+    # Try against workspace first, then project_dir
+    for base in (workspace, project_dir):
+        if base:
+            candidate = os.path.join(base, os.path.basename(raw_path))
+            if os.path.isfile(candidate):
+                return candidate
+            candidate2 = os.path.join(base, raw_path)
+            if os.path.isfile(candidate2):
+                return candidate2
+    return ""
+
+
+# ── Visible progress helper ───────────────────────────────────────────────────
+
+def _render_project_progress(state: "PipelineState") -> str:  # type: ignore[name-defined]
+    """Build a one-line-per-file progress checklist for multi-file project builds.
+
+    Shown at the start of each new file so the user can see overall progress.
+    Returns "" for single-file tasks (no clutter for simple writes).
+
+    The format mirrors Claude Code's TodoWrite output so it feels familiar:
+      ✓ models.py — done
+      → api.py — writing now
+      ○ main.py
+    """
+    # Only show for tasks with multiple write_code stages
+    write_tasks = [
+        (i, s) for i, s in enumerate(state.sub_tasks)
+        if s.get("type") in ("write_code", "write_project")
+    ]
+    if len(write_tasks) <= 1:
+        return ""
+
+    lines = ["**Project progress:**"]
+    for task_idx, t in write_tasks:
+        goal = t.get("task", "")
+        # Extract "models.py" from "Write models.py: Todo dataclass..."
+        fn_m = re.search(r'\b([A-Za-z0-9_\-]+\.[a-z]{2,5})\b', goal)
+        label = fn_m.group(1) if fn_m else goal[:30]
+        if task_idx < state.current_task_idx:
+            lines.append(f"  [done] {label}")
+        elif task_idx == state.current_task_idx:
+            lines.append(f"  [ --> ] {label}  (writing)")
+        else:
+            lines.append(f"  [    ] {label}")
+    return "\n".join(lines)
 
 
 def _extract_tool_results(raw_history: list[dict]) -> list[str]:

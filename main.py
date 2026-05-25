@@ -299,7 +299,7 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
 
     if mode == "a":
         ollama_model = _ask("Ollama model name", existing.get("llm", {}).get("local_model", "qwen3:0.6b"))
-        ollama_port  = _ask("Ollama port", str(existing.get("llm", {}).get("server", {}).get("port", 11434)))
+        ollama_port  = _ask("Ollama port", str(existing.get("llm", {}).get("server", {}).get("ollama_port", 11434)))
         api_url  = ""
         api_key  = ""
         api_model = ""
@@ -339,7 +339,8 @@ def _setup_wizard(config_path: str = "config.yaml") -> None:
             "local_model": ollama_model,
             "server": {
                 "host": "127.0.0.1",
-                "port": int(ollama_port),
+                "port": existing.get("llm", {}).get("server", {}).get("port", 8080),  # llama-server port — unchanged
+                "ollama_port": int(ollama_port),  # Ollama port — written separately
                 "context_size": existing.get("llm", {}).get("server", {}).get("context_size", 8192),
                 "threads": existing.get("llm", {}).get("server", {}).get("threads", 8),
                 "gpu_layers": existing.get("llm", {}).get("server", {}).get("gpu_layers", 0),

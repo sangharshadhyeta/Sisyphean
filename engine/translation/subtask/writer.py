@@ -18,9 +18,12 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
+import re
+
 from .manifest import SubtaskItem, SubtaskManifest
 from engine.translation.subtask import planner as _planner
 from engine.translation.subtask import verifier as _verifier
+from engine.translation.subtask.verifier import parse_code_items, parse_doc_sections
 from engine.translation.subtask.line_search import (
     find_section,
     find_continuation_point,
@@ -29,9 +32,18 @@ from engine.translation.subtask.line_search import (
 
 logger = logging.getLogger(__name__)
 
-MAX_ITEM_RETRIES = 2
+MAX_ITEM_RETRIES    = 3       # 3 attempts per item: first write + 2 continuations
 MAX_WRITE_ITERATIONS = 20   # hard cap on total outer-loop iterations
 _MAX_CTX_CHARS = 6_000      # max chars injected as file context (~1500 tokens)
+
+# Writer token budget — 1024 is far too small for a real function/section.
+# 2048 gives ~1600 words, enough for most complex single items.
+MAX_TOKENS_WRITE = 2048
+
+# How many lines of the file tail to show as the "seam" on continuation.
+# 25 lines gives the model enough context (signature + partial body) without
+# flooding the prompt with the entire file.
+_SEAM_LINES = 25
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -121,6 +133,118 @@ def _read_for_context(path: str, item_title: str, file_type: str, workspace: str
     return ctx[:_MAX_CTX_CHARS] + "\n...[truncated]" if len(ctx) > _MAX_CTX_CHARS else ctx
 
 
+# ── Edit-in-place helpers ─────────────────────────────────────────────────────
+# Used by the verify-pass to patch partial/stub items without appending a second
+# copy of the function/section (which causes duplicates and regressions).
+
+def _apply_edit(path: str, old_text: str, new_text: str) -> bool:
+    """Replace the first exact occurrence of old_text with new_text.
+
+    Mirrors Claude Code's Edit tool: targeted old→new string swap rather than
+    rewriting the whole file or blindly appending.  Returns True if the swap
+    was applied, False if old_text was not found.
+    """
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if old_text in content:
+        Path(path).write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
+        return True
+    # Tolerant fallback: try stripped boundaries (handles trailing-newline mismatches)
+    for candidate in (old_text.rstrip(), old_text.strip()):
+        if candidate and candidate in content:
+            Path(path).write_text(content.replace(candidate, new_text, 1), encoding="utf-8")
+            return True
+    logger.debug("[edit] old_text not found  path=%s  len=%d", Path(path).name, len(old_text))
+    return False
+
+
+def _key_match(anchor: str, parsed: dict) -> str | None:
+    """Fuzzy key lookup: exact → substring → None."""
+    clean = anchor.strip().lower()
+    for k in parsed:
+        if k.strip().lower() == clean:
+            return k
+    for k in parsed:
+        if clean in k.strip().lower() or k.strip().lower() in clean:
+            return k
+    return None
+
+
+def _get_item_text(item: SubtaskItem, manifest: SubtaskManifest, file_content: str) -> str | None:
+    """Return the exact text of an item as it stands in the file.
+
+    For code: the `def`/`class` line + current body (as parsed by parse_code_items).
+    For docs: the `## Heading` line + current body.
+
+    Returns None when the item's anchor is not yet present in the file.
+    """
+    if manifest.file_type == "code":
+        parsed = parse_code_items(file_content)
+        key = _key_match(item.anchor, parsed)
+        return parsed.get(key) if key else None
+    else:
+        parsed = parse_doc_sections(file_content)
+        key = _key_match(item.anchor, parsed)
+        if key is None:
+            return None
+        body = parsed[key]
+        # Reconstruct heading + body (heading was stripped by parse_doc_sections)
+        for prefix in ("## ", "# "):
+            heading = f"{prefix}{key}"
+            if heading in file_content:
+                return heading + ("\n" + body if body else "")
+        return None
+
+
+def _rebuild_item(existing_text: str, new_body: str) -> str:
+    """Keep the header line (def/## line) from existing_text, swap in new_body.
+
+    If the model accidentally echoed the header as the first line of new_body,
+    that duplicate is stripped so the file stays clean.
+    """
+    lines = existing_text.splitlines()
+    header = lines[0] if lines else ""
+    body_lines = new_body.splitlines()
+    # Drop any accidental header repetition from the LLM output
+    if body_lines and body_lines[0].strip() == header.strip():
+        body_lines = body_lines[1:]
+    new_body_clean = "\n".join(body_lines).lstrip("\n")
+    return (header + "\n" + new_body_clean) if header else new_body_clean
+
+
+def _build_edit_prompt(item: SubtaskItem, manifest: SubtaskManifest, existing_text: str) -> str:
+    """Prompt for the edit pass: show the partial item, ask for the complete body only.
+
+    The LLM outputs ONLY the body (no def/class line for code, no ## heading for
+    docs).  We then splice it back in via _rebuild_item + _apply_edit.
+    """
+    short_path = Path(manifest.file_path).name
+    excerpt = existing_text[:700]
+    if manifest.file_type == "code":
+        header = existing_text.splitlines()[0] if existing_text.splitlines() else ""
+        prompt = (
+            f"The function in `{short_path}` is incomplete or stub:\n"
+            f"```python\n{excerpt}\n```\n\n"
+            f"Output the COMPLETE function body — the indented lines that come after "
+            f"`{header}`.\n"
+            f"Rules:\n"
+            f"- Do NOT output the `def`/`class` line — body only.\n"
+            f"- Properly indented (4 spaces).\n"
+            f"- Min {item.expected_min_chars} chars of real logic.\n"
+            f"- Raw Python only — no markdown fences.\n"
+        )
+    else:
+        prompt = (
+            f"The section `{item.anchor}` in `{short_path}` is incomplete:\n"
+            f"```\n{excerpt}\n```\n\n"
+            f"Output the COMPLETE section body — do NOT include the `## {item.anchor}` heading.\n"
+            f"Min {item.expected_min_chars} chars. Raw text only, no markdown code fences.\n"
+        )
+    return prompt
+
+
 def _infer_output_path(stage_goal: str, file_type: Literal["doc", "code"], workspace: str) -> str:
     """Derive a filename from the stage goal when none is specified."""
     slug = stage_goal[:40].lower()
@@ -199,11 +323,32 @@ async def _write_item(
     context: str = "",
     workspace: str = "",
 ) -> bool:
-    """Write one item with up to MAX_ITEM_RETRIES retries. Returns True if complete.
+    """Write one item with up to MAX_ITEM_RETRIES attempts.  Returns True if complete.
 
-    Snapshot+rollback: before each write we save the current file content.
-    If the write causes any previously-complete item to regress, we restore
-    the snapshot and retry with an error hint telling the model to append only.
+    Attempt 0 — fresh write
+    ───────────────────────
+    Build a focused prompt (goal + done items + 4-step progressive context) and
+    call the LLM.  The output is appended (or written fresh for the very first item).
+
+    Attempt ≥ 1 — EDIT pass  (if body already exists)
+    ──────────────────────────────────────────────────
+    When the item's anchor is already in the file (partial/stub body), use a
+    targeted edit instead of appending a second copy of the function:
+
+        _apply_edit(path, existing_text, _rebuild_item(existing_text, new_body))
+
+    This is identical in principle to Claude Code's Edit tool — old_string →
+    new_string swap.  No duplicates, no regression risk for surrounding items.
+
+    Attempt ≥ 1 — APPEND pass  (if anchor is missing)
+    ──────────────────────────────────────────────────
+    Anchor not found → fall through to the standard append path with the full
+    resume_context prompt so the model writes the item from scratch.
+
+    Rollback guard
+    ──────────────
+    A snapshot is taken before every write/edit.  If previously-complete items
+    regress after the change, the snapshot is restored.
     """
     item.status = "in_progress"
     is_first = item.index == 0
@@ -215,22 +360,41 @@ async def _write_item(
             attempt, MAX_ITEM_RETRIES, item.title[:40], manifest.file_path,
         )
 
-        prompt = _build_write_prompt(
-            item, manifest, attempt, error_hint, done_summary,
-            context=context if attempt == 0 else "",
-            workspace=workspace if attempt == 0 else "",
-        )
+        # ── Read current file state (used for both snapshot and edit detection) ──
+        snapshot = _read_file(manifest.file_path)
+        prev_complete = {it.anchor for it in manifest.items if it.status == "complete"}
+
+        # ── Decide: EDIT mode or APPEND mode? ────────────────────────────────
+        # Edit mode when (a) we are on a retry AND (b) the item already has some
+        # content in the file (partial/stub).  "already has content" means
+        # actual_chars > 20 — avoids triggering on completely missing anchors.
+        use_edit = attempt > 0 and item.actual_chars > 20
+        existing_text: str | None = None
+        if use_edit:
+            existing_text = _get_item_text(item, manifest, snapshot)
+            if not existing_text:
+                use_edit = False   # anchor not in file — use append path instead
+
+        # ── Build prompt ──────────────────────────────────────────────────────
+        if use_edit and existing_text:
+            prompt = _build_edit_prompt(item, manifest, existing_text)
+        else:
+            prompt = _build_write_prompt(
+                item, manifest, attempt, error_hint, done_summary,
+                context=context if attempt == 0 else "",
+                workspace=workspace if attempt == 0 else "",
+            )
         error_hint = ""
 
+        # ── LLM call ──────────────────────────────────────────────────────────
         messages = [
             {"role": "system", "content": _WRITE_SYSTEM},
             {"role": "user", "content": prompt},
         ]
-
         try:
             result = await client.generate(
                 messages,
-                max_tokens=1024,
+                max_tokens=MAX_TOKENS_WRITE,
                 temperature=0.3,
                 stream=False,
                 thinking=False,
@@ -245,38 +409,48 @@ async def _write_item(
             error_hint = "Empty output — write the full item."
             continue
 
-        if len(raw) < max(80, item.expected_min_chars // 3):
-            logger.debug(
-                "[subtask] output too short (%d chars, expected >=%d) — retrying",
-                len(raw), item.expected_min_chars,
-            )
+        min_out = max(60, item.expected_min_chars // 4)
+        if len(raw) < min_out:
             error_hint = (
                 f"Output was only {len(raw)} chars — write the complete item "
-                f"(minimum {item.expected_min_chars} chars). Do not stop early."
+                f"(minimum ~{item.expected_min_chars} chars). Do not stop early."
             )
             continue
 
-        # Snapshot before writing so we can rollback on regression
-        snapshot = _read_file(manifest.file_path)
-        prev_complete = {it.anchor for it in manifest.items if it.status == "complete"}
+        # ── Apply: EDIT path ──────────────────────────────────────────────────
+        if use_edit and existing_text:
+            new_text = _rebuild_item(existing_text, raw)
+            applied = _apply_edit(manifest.file_path, existing_text, new_text)
+            if applied:
+                logger.info(
+                    "[subtask] edit applied  item=%r  old=%dc  new=%dc",
+                    item.title[:40], len(existing_text), len(new_text),
+                )
+            else:
+                # Edit target drifted (e.g. file was concurrently modified).
+                # Fall back to append so the attempt isn't wasted.
+                logger.debug("[subtask] edit target not found — falling back to append")
+                _write_file(manifest.file_path, "\n\n" + raw, append=True)
 
-        existing_before = snapshot  # already read above
-        if is_first and attempt > 0 and item.status == "missing":
-            _write_file(manifest.file_path, raw, append=False)
-        elif is_first and attempt == 0 and not existing_before:
-            _write_file(manifest.file_path, raw, append=False)
+        # ── Apply: APPEND / FRESH-WRITE path ─────────────────────────────────
         else:
-            _write_file(manifest.file_path, "\n\n" + raw, append=True)
+            if is_first and attempt == 0 and not snapshot:
+                _write_file(manifest.file_path, raw, append=False)
+            elif is_first and attempt > 0 and item.status == "missing":
+                # Anchor was truly missing on a retry — write fresh
+                _write_file(manifest.file_path, raw, append=False)
+            else:
+                _write_file(manifest.file_path, "\n\n" + raw, append=True)
 
-        # Verify
+        # ── Verify ────────────────────────────────────────────────────────────
         fc = _read_file(manifest.file_path)
         diff = _verifier.run(manifest, fc)
 
-        # Rollback if file shrank by more than 20% (char-ratio regression guard)
-        if snapshot and len(fc) < len(snapshot) * 0.8:
+        # Char-ratio regression guard (only meaningful for append path)
+        if not use_edit and snapshot and len(fc) < len(snapshot) * 0.8:
             logger.warning(
-                "[subtask] char-ratio regression  item=%r attempt=%d  before=%d  after=%d — rolling back",
-                item.title[:40], attempt, len(snapshot), len(fc),
+                "[subtask] char-ratio regression  before=%d  after=%d — rolling back",
+                len(snapshot), len(fc),
             )
             try:
                 Path(manifest.file_path).write_text(snapshot, encoding="utf-8")
@@ -284,27 +458,26 @@ async def _write_item(
             except OSError as exc:
                 logger.error("[subtask] rollback failed: %s", exc)
             error_hint = (
-                f"Your output caused the file to shrink from {len(snapshot)} to {len(fc)} chars. "
-                f"Append only — do not overwrite or delete earlier content."
+                f"File shrank from {len(snapshot)} to {len(fc)} chars — "
+                f"append only, do not overwrite earlier content."
             )
             continue
 
-        # Rollback if previously-complete items regressed
+        # Anchor regression guard
         regressed_anchors = {it.anchor for it in diff.regressed} & prev_complete
         if regressed_anchors:
             logger.warning(
-                "[subtask] regression on write (item=%r attempt=%d) — rolling back. regressed=%s",
+                "[subtask] regression  item=%r attempt=%d  regressed=%s — rolling back",
                 item.title[:40], attempt, sorted(regressed_anchors)[:3],
             )
             try:
                 Path(manifest.file_path).write_text(snapshot, encoding="utf-8")
-                # Restore item statuses to match the snapshot
                 _verifier.run(manifest, snapshot)
             except OSError as exc:
                 logger.error("[subtask] rollback failed: %s", exc)
             error_hint = (
-                f"Your output caused {len(regressed_anchors)} previously-complete section(s) to disappear. "
-                f"Append only — do not overwrite earlier content."
+                f"Caused {len(regressed_anchors)} previously-complete section(s) to disappear. "
+                f"Output only the body of '{item.title}', nothing else."
             )
             continue
 
@@ -313,11 +486,17 @@ async def _write_item(
             return True
 
         if item.status == "partial":
-            error_hint = f"{item.title} is partial ({item.actual_chars}c, need {item.expected_min_chars}c). Add more content."
+            error_hint = (
+                f"'{item.title}' is partial ({item.actual_chars}c, "
+                f"need {item.expected_min_chars}c). Continue the content."
+            )
         elif item.status == "missing":
-            error_hint = f"{item.title} not found in file. Make sure to start with the exact anchor line."
+            error_hint = (
+                f"'{item.title}' not found in file. "
+                f"Start with the exact anchor line."
+            )
         elif item.status == "regressed":
-            error_hint = f"{item.title} regressed — earlier content may have been overwritten."
+            error_hint = f"'{item.title}' regressed — earlier content may have been overwritten."
 
     logger.warning("[subtask] item=%r exhausted retries — marked partial", item.title[:40])
     return False

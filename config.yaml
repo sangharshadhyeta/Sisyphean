@@ -3,8 +3,8 @@
 
 llm:
   model_path: "C:/llama.cpp/models/gemma4-e2b-q8.gguf"
-  model_name: sisyphean-qwen3:0.6b          # name exposed via /v1/models
-  local_model: "qwen3:0.6b"            # non-empty = use Ollama
+  model_name: sisyphean-qwen3:latest       # name exposed via /v1/models
+  local_model: "qwen3:0.6b"             # non-empty = use Ollama
   server:
     host: 127.0.0.1
     port: 8080                         # llama-server default port
@@ -23,7 +23,7 @@ llm:
   #   Groq        https://console.groq.com   gemma2-9b-it
   #   Google AI   https://aistudio.google.com gemini-2.0-flash-lite
   external_api:
-    enabled: true
+    enabled: false
     base_url: "http://192.168.29.37:8081/v1"
     api_key: "local"
     model: "gemma-4-E4B-it-Q8_0.gguf"

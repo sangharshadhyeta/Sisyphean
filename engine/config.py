@@ -67,9 +67,9 @@ class EmbeddingConfig(BaseModel):
 
 
 class APIConfig(BaseModel):
-    host: str = "0.0.0.0"
-    port: int = 3000
-    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    host: str = "127.0.0.1"
+    port: int = 47291
+    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:47291"]
 
 
 class PermissionsConfig(BaseModel):

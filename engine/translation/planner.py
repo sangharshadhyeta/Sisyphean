@@ -397,7 +397,8 @@ _INTERNAL_TOOLS = [
     ("search_memory", "look up previously saved facts or research from past sessions"),
     ("write_plan",    "write a file section-by-section with verify-and-retry — "
                       "use ONLY for files the user explicitly asked to keep: programs, modules, documents, reports. "
-                      "Input format: write_plan:FILENAME|GOAL  (pipe-separated filename and task description)"),
+                      "Input format: write_plan:<filename>|<task description>  "
+                      "Example: write_plan:fibonacci.py|Write a Fibonacci generator with three functions"),
     # ── Skill tools (progressive disclosure) ────────────────────────────────
     # read_skill / run_skill are shown only when the skill index is non-empty.
     # save_skill / save_skill_program are always available so the model can
@@ -449,11 +450,13 @@ def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
         "         quick test script). These are ephemeral: write, run, discard.",
         "  write_plan — for files the USER explicitly asked to create and keep: a Python",
         "         module, a PDF extractor program, a report, an essay. These are permanent.",
-        "         Format: write_plan:FILENAME|TASK DESCRIPTION",
+        "         Format: write_plan:<filename>|<task description>",
         "         Example: write_plan:fibonacci.py|Write a Fibonacci number generator with tests",
+        "         Example: write_plan:essay.md|Write a 4-section essay about consciousness",
         "",
-        "WORKSPACE: When using bash to create or run files, always use the full absolute",
+        "FILE PATHS: When using bash to create or run files, always use the full absolute",
         "  workspace path given in the task message — never bare relative filenames like calc.py.",
+        "  The workspace path is shown explicitly in the task prompt.",
     ]
     return "\n".join(lines)
 
@@ -593,7 +596,13 @@ async def resolve_bash_command(goal: str, client, context: str = "") -> str:
         raw = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
         if data and isinstance(data.get("command"), str):
-            return data["command"].strip()
+            cmd = data["command"].strip()
+            # Strip "COMMAND: " / "Run " prefixes that small models echo from
+            # the format description (e.g. model returns "COMMAND: Run python...")
+            cmd = re.sub(r'^(?:COMMAND:\s*|Run\s+COMMAND:\s*)', '', cmd, flags=re.IGNORECASE)
+            if cmd.lower().startswith("run "):
+                cmd = cmd[4:].strip()
+            return cmd
     except Exception as exc:
         logger.warning("resolve_bash_command failed: %s", exc)
     return ""
@@ -798,13 +807,22 @@ async def plan_task(
                     logger.debug("plan_task: LLM returned step dict → %s", t)
                     return [{"tool": t, "input": i}]
             elif isinstance(steps_raw_val, list):
-                # List of step dicts: [{"tool": ..., "input": ...}, ...]
-                steps = [
-                    {"tool": s.get("tool", "").strip().lower(),
-                     "input": s.get("input", "").strip()}
-                    for s in steps_raw_val
-                    if isinstance(s, dict) and s.get("tool") and s.get("input")
-                ]
+                # List of step dicts OR list of "tool:input" strings.
+                # The model sometimes returns one, sometimes the other.
+                steps = []
+                for s in steps_raw_val:
+                    if isinstance(s, dict) and s.get("tool") and s.get("input"):
+                        steps.append({
+                            "tool":  s.get("tool", "").strip().lower(),
+                            "input": s.get("input", "").strip(),
+                        })
+                    elif isinstance(s, str) and ":" in s:
+                        # "write_plan:file.py|goal" or "bash:command"
+                        t, _, i = s.partition(":")
+                        t = t.strip().lower()
+                        i = i.strip()
+                        if t and i and t not in ("tool", "input"):
+                            steps.append({"tool": t, "input": i})
                 if steps:
                     logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
                     return steps

@@ -408,153 +408,274 @@ function ExecutionTimeline({ task }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY GRAPH  (right pane) — simple force-directed via d3-lite in pure JS
+// MEMORY GRAPH  (right pane) — canvas-based continuous force-directed simulation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function useForceLayout(nodes, edges, w, h) {
-  // Minimal force simulation: spring + repulsion, no d3 dependency
-  const posRef = useRef({});
-  const [positions, setPositions] = useState({});
+// ── Physics step ────────────────────────────────────────────────────────────
+function _graphTick(s) {
+  const { pos, vel, edges, w, h } = s;
+  const alpha = s.alpha;
+  const SPRING_LEN = 55, SPRING_K = 0.12;
+  const REPULSE = 120, DAMP = 0.80, GRAV = 0.18, COOL = 0.993;
+  const ids = Object.keys(pos);
 
-  useEffect(() => {
-    if (!nodes.length) return;
-
-    // Initialise positions (random if new node)
-    const pos = {};
-    nodes.forEach(n => {
-      pos[n.id] = posRef.current[n.id] || {
-        x: w/2 + (Math.random()-0.5)*w*0.7,
-        y: h/2 + (Math.random()-0.5)*h*0.7,
-        vx: 0, vy: 0,
-      };
-    });
-
-    const edgeMap = {};
-    edges.forEach(e => {
-      if (!edgeMap[e.source]) edgeMap[e.source] = [];
-      if (!edgeMap[e.target]) edgeMap[e.target] = [];
-      edgeMap[e.source].push(e.target);
-      edgeMap[e.target].push(e.source);
-    });
-
-    let frame = 0;
-    const SIM_STEPS = 80;
-    const SPRING_LEN = 80, SPRING_K = 0.04;
-    const REPULSE = 1200, DAMP = 0.82, BOUND = 0.12;
-
-    function tick() {
-      if (frame++ >= SIM_STEPS) {
-        posRef.current = pos;
-        setPositions({...pos});
-        return;
-      }
-      const ids = Object.keys(pos);
-      // Repulsion
-      for (let i = 0; i < ids.length; i++) {
-        for (let j = i+1; j < ids.length; j++) {
-          const a = pos[ids[i]], b = pos[ids[j]];
-          const dx = a.x - b.x, dy = a.y - b.y;
-          const d2 = dx*dx + dy*dy + 1;
-          const f = REPULSE / d2;
-          a.vx += f*dx; a.vy += f*dy;
-          b.vx -= f*dx; b.vy -= f*dy;
-        }
-      }
-      // Springs
-      edges.forEach(e => {
-        const a = pos[e.source], b = pos[e.target];
-        if (!a || !b) return;
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const d = Math.sqrt(dx*dx + dy*dy) || 1;
-        const f = (d - SPRING_LEN) * SPRING_K;
-        a.vx += f*dx/d; a.vy += f*dy/d;
-        b.vx -= f*dx/d; b.vy -= f*dy/d;
-      });
-      // Centre gravity
-      ids.forEach(id => {
-        const p = pos[id];
-        p.vx += (w/2 - p.x) * BOUND;
-        p.vy += (h/2 - p.y) * BOUND;
-        p.vx *= DAMP; p.vy *= DAMP;
-        p.x += p.vx; p.y += p.vy;
-        p.x = Math.max(16, Math.min(w-16, p.x));
-        p.y = Math.max(16, Math.min(h-16, p.y));
-      });
-      requestAnimationFrame(tick);
+  // Repulsion between all node pairs
+  for (let i = 0; i < ids.length; i++) {
+    const a = pos[ids[i]], va = vel[ids[i]];
+    for (let j = i + 1; j < ids.length; j++) {
+      const b = pos[ids[j]], vb = vel[ids[j]];
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const d2 = dx*dx + dy*dy + 1;
+      const f = REPULSE * alpha / d2;
+      va.x += f*dx; va.y += f*dy;
+      vb.x -= f*dx; vb.y -= f*dy;
     }
-    requestAnimationFrame(tick);
-  }, [nodes.length, edges.length]);
+  }
 
-  return positions;
+  // Spring forces along edges
+  for (const e of edges) {
+    const a = pos[e.source], b = pos[e.target];
+    const va = vel[e.source], vb = vel[e.target];
+    if (!a || !b || !va || !vb) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx*dx + dy*dy) || 1;
+    const f = (d - SPRING_LEN) * SPRING_K * alpha;
+    va.x += f*dx/d; va.y += f*dy/d;
+    vb.x -= f*dx/d; vb.y -= f*dy/d;
+  }
+
+  // Gravity toward centre + velocity integration + wall clamp
+  for (const id of ids) {
+    const p = pos[id], v = vel[id];
+    v.x += (w/2 - p.x) * GRAV * alpha;
+    v.y += (h/2 - p.y) * GRAV * alpha;
+    v.x *= DAMP; v.y *= DAMP;
+    p.x = Math.max(30, Math.min(w - 30, p.x + v.x));
+    p.y = Math.max(30, Math.min(h - 54, p.y + v.y));
+  }
+
+  s.alpha = Math.max(0.004, alpha * COOL);
 }
 
+// ── Canvas draw ──────────────────────────────────────────────────────────────
+const _GCANVAS_COLORS = {
+  fact:'#6366f1', concept:'#06b6d4', project:'#22c55e',
+  preference:'#f59e0b', entity:'#a855f7', url:'#ec4899',
+  soul:'#f97316', user:'#34d399', system:'#64748b',
+  research:'#60a5fa', skill:'#84cc16', import_path:'#94a3b8',
+};
+
+function _graphDraw(canvas, s) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const { pos, nodes, edges, degree, hover, w, h } = s;
+  ctx.clearRect(0, 0, w, h);
+
+  // Subtle radial glow at centre for depth
+  const grd = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.min(w,h)*0.55);
+  grd.addColorStop(0,   '#0d1025');
+  grd.addColorStop(1,   '#080a14');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, w, h);
+
+  // Edges — draw hovered-node edges brighter
+  for (const e of edges) {
+    const a = pos[e.source], b = pos[e.target];
+    if (!a || !b) continue;
+    const hot = hover === e.source || hover === e.target;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = hot ? '#3b4a7a' : '#1a2040';
+    ctx.lineWidth   = hot ? 1.5 : 0.8;
+    ctx.globalAlpha = hot ? 0.8  : 0.45;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Nodes
+  for (const n of nodes) {
+    const p = pos[n.id];
+    if (!p) continue;
+    const isHov = hover === n.id;
+    const deg   = degree[n.id] || 0;
+    const r     = Math.max(3, Math.min(10, 3 + deg * 0.9));
+    const col   = _GCANVAS_COLORS[n.type] || '#6366f1';
+
+    ctx.save();
+    if (isHov) { ctx.shadowColor = col; ctx.shadowBlur = 18; }
+
+    // Outer ring for hover
+    if (isHov) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r + 6, 0, Math.PI*2);
+      ctx.strokeStyle = col + '44';
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.55;
+      ctx.stroke();
+    }
+
+    // Core dot
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, isHov ? r + 2.5 : r, 0, Math.PI*2);
+    ctx.fillStyle  = col;
+    ctx.globalAlpha = isHov ? 1.0 : 0.80;
+    ctx.fill();
+    ctx.restore();
+
+    // Permanent label for hub node types
+    const showLbl = n.type === 'user' || n.type === 'soul'
+                 || (n.type === 'project' && deg > 1);
+    if (showLbl) {
+      ctx.save();
+      ctx.font = `bold 9px "JetBrains Mono", monospace`;
+      ctx.fillStyle  = col;
+      ctx.globalAlpha = 0.85;
+      const lbl = (n.label || '').length > 18 ? (n.label||'').slice(0,16)+'…' : (n.label||'');
+      ctx.fillText(lbl, p.x + r + 4, p.y + 4);
+      ctx.restore();
+    }
+  }
+}
+
+// ── Canvas-based MemoryGraph component ────────────────────────────────────────
 function MemoryGraph({ nodes, edges, w, h }) {
-  const [hover, setHover] = useState(null);
-  const positions = useForceLayout(nodes, edges, w, h);
+  const canvasRef = useRef(null);
+  // All mutable sim state in a single ref — never causes re-renders
+  const simRef = useRef({
+    pos:{}, vel:{}, nodes:[], edges:[], degree:{},
+    w:0, h:0, alpha:1, hover:null, animId:null,
+  });
+  const [tooltip, setTooltip] = useState(null); // {node, x, y}
+
+  // Re-build / re-scale whenever inputs change
+  useEffect(() => {
+    const s = simRef.current;
+    // Cancel any running animation
+    if (s.animId) { cancelAnimationFrame(s.animId); s.animId = null; }
+    if (!w || !h || !nodes.length) return;
+
+    // Per-node degree (used for size)
+    const deg = {};
+    nodes.forEach(n => { deg[n.id] = 0; });
+    edges.forEach(e => {
+      if (deg[e.source] !== undefined) deg[e.source]++;
+      if (deg[e.target] !== undefined) deg[e.target]++;
+    });
+
+    // Positions — keep existing, rescale if dimensions changed, circular init for new
+    const pos = {}, vel = {};
+    const cx = w/2, cy = h/2, R = Math.min(w,h) * 0.22;
+    nodes.forEach((n, i) => {
+      if (s.pos[n.id]) {
+        const sx = s.w ? w/s.w : 1, sy = s.h ? h/s.h : 1;
+        pos[n.id] = {
+          x: Math.max(20, Math.min(w-20, s.pos[n.id].x * sx)),
+          y: Math.max(20, Math.min(h-20, s.pos[n.id].y * sy)),
+        };
+      } else {
+        // Evenly distribute new nodes on a ring with slight jitter
+        const angle = (i / nodes.length) * Math.PI*2 - Math.PI/2;
+        pos[n.id] = {
+          x: cx + R*Math.cos(angle) + (Math.random()-0.5)*24,
+          y: cy + R*Math.sin(angle) + (Math.random()-0.5)*24,
+        };
+      }
+      vel[n.id] = { x:0, y:0 };
+    });
+
+    s.pos = pos; s.vel = vel; s.nodes = nodes; s.edges = edges; s.degree = deg;
+    s.w = w; s.h = h;
+    // Re-heat if topology changed, otherwise just rescale
+    s.alpha = nodes.length !== (s._prevNodeCount||0) ? 1.0 : Math.min(s.alpha + 0.25, 1.0);
+    s._prevNodeCount = nodes.length;
+
+    // Start continuous animation
+    function frame() {
+      _graphTick(s);
+      _graphDraw(canvasRef.current, s);
+      s.animId = requestAnimationFrame(frame);
+    }
+    s.animId = requestAnimationFrame(frame);
+
+    return () => { cancelAnimationFrame(s.animId); s.animId = null; };
+  }, [nodes.length, edges.length, w, h]);
+
+  // Mouse hover — O(n) scan, fast enough for <300 nodes
+  const onMouseMove = useCallback(e => {
+    const s = simRef.current;
+    if (!canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let found = null;
+    for (const n of s.nodes) {
+      const p = s.pos[n.id];
+      if (p && (p.x-mx)**2 + (p.y-my)**2 < 144) { found = n; break; }
+    }
+    s.hover = found?.id ?? null;
+    if (found && s.pos[found.id]) {
+      setTooltip({ node:found, x:s.pos[found.id].x, y:s.pos[found.id].y });
+    } else {
+      setTooltip(null);
+    }
+  }, []);
+
+  const onMouseLeave = useCallback(() => {
+    simRef.current.hover = null;
+    setTooltip(null);
+  }, []);
 
   if (!nodes.length) return (
-    <div className="flex items-center justify-center h-full text-slate-600 text-xs text-center p-4">
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',
+                 height:h,color:'#475569',fontSize:12,textAlign:'center',padding:'0 24px'}}>
       No graph nodes yet.<br/>Send a few messages to start building memory.
     </div>
   );
 
   return (
     <div style={{ position:'relative', width:w, height:h, overflow:'hidden' }}>
-      <svg width={w} height={h} style={{ position:'absolute', inset:0 }}>
-        {/* Edges */}
-        {edges.map((e, i) => {
-          const a = positions[e.source], b = positions[e.target];
-          if (!a || !b) return null;
-          return (
-            <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-              stroke="#1e2235" strokeWidth={1} />
-          );
-        })}
-        {/* Nodes */}
-        {nodes.map(n => {
-          const p = positions[n.id];
-          if (!p) return null;
-          const color = ntc(n.type);
-          const isHov = hover === n.id;
-          return (
-            <g key={n.id} className="mg-node"
-               onMouseEnter={() => setHover(n.id)}
-               onMouseLeave={() => setHover(null)}>
-              <circle cx={p.x} cy={p.y} r={isHov ? 8 : 5}
-                fill={color} fillOpacity={0.85}
-                stroke={isHov ? '#fff' : color}
-                strokeWidth={isHov ? 1.5 : 0.5} />
-            </g>
-          );
-        })}
-      </svg>
+      <canvas ref={canvasRef} width={w} height={h}
+        style={{ position:'absolute', inset:0, cursor:'crosshair' }}
+        onMouseMove={onMouseMove}
+        onMouseLeave={onMouseLeave} />
 
-      {/* Hover tooltip */}
-      {hover && (() => {
-        const n = nodes.find(x => x.id === hover);
-        const p = positions[hover];
-        if (!n || !p) return null;
-        const left = p.x + 12 > w - 180 ? p.x - 190 : p.x + 12;
-        const top  = Math.min(p.y - 10, h - 80);
+      {/* Tooltip overlay */}
+      {tooltip && (() => {
+        const { node:n, x, y } = tooltip;
+        const lft = x + 14 > w - 210 ? x - 218 : x + 14;
+        const top = Math.min(y - 10, h - 92);
+        const col = ntc(n.type);
         return (
-          <div style={{ position:'absolute', left, top,
-                        background:'#1a1d2e', border:`1px solid ${ntc(n.type)}44`,
-                        borderRadius:8, padding:'8px 10px', maxWidth:180,
-                        pointerEvents:'none', zIndex:10 }}>
-            <div className="text-xs font-semibold" style={{ color: ntc(n.type) }}>{n.label}</div>
-            <div className="text-xs text-slate-500 mt-0.5">{n.type}</div>
-            {n.summary && <div className="text-xs text-slate-400 mt-1 leading-relaxed">{n.summary}</div>}
+          <div style={{ position:'absolute', left:lft, top,
+                        background:'#161929', border:`1px solid ${col}50`,
+                        borderRadius:8, padding:'8px 11px', maxWidth:200,
+                        pointerEvents:'none', zIndex:10,
+                        boxShadow:`0 0 16px ${col}22` }}>
+            <div style={{ color:col, fontSize:11, fontWeight:700,
+                          fontFamily:'"JetBrains Mono",monospace', marginBottom:2 }}>
+              {n.label}
+            </div>
+            <div style={{ color:'#475569', fontSize:10 }}>{n.type}</div>
+            {n.summary && (
+              <div style={{ color:'#94a3b8', fontSize:10, marginTop:5,
+                            lineHeight:1.45, maxHeight:64, overflow:'hidden' }}>
+                {n.summary}
+              </div>
+            )}
           </div>
         );
       })()}
 
       {/* Legend */}
       <div style={{ position:'absolute', bottom:8, left:8,
-                    background:'#0a0c14cc', borderRadius:6, padding:'6px 8px',
-                    display:'flex', flexWrap:'wrap', gap:'6px 12px', maxWidth: w-16 }}>
+                    background:'#080a14bb', borderRadius:6, padding:'5px 8px',
+                    display:'flex', flexWrap:'wrap', gap:'5px 11px', maxWidth:w-16 }}>
         {Object.entries(NODE_TYPE_COLOR).map(([t, c]) => (
-          <span key={t} style={{ display:'flex', alignItems:'center', gap:4, fontSize:9, color:'#64748b' }}>
-            <span style={{ width:7, height:7, borderRadius:'50%', background:c, display:'inline-block' }} />
+          <span key={t} style={{ display:'flex', alignItems:'center',
+                                  gap:4, fontSize:9, color:'#4b5563' }}>
+            <span style={{ width:6, height:6, borderRadius:'50%',
+                            background:c, display:'inline-block' }} />
             {t}
           </span>
         ))}

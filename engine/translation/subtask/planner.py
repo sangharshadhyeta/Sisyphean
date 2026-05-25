@@ -34,25 +34,43 @@ def _summarise_existing(content: str) -> str:
     return summary[:600] or content[:300]
 
 
-_PLAN_SYSTEM = (
-    "You are a task planner. Given a writing goal, output a JSON subtask list.\n\n"
-    "For documents: each subtask is one CONTENT SECTION with a meaningful heading.\n"
-    "For code: each subtask is one function or class.\n\n"
+_PLAN_SYSTEM_CODE = (
+    "You are a code planner. List the functions and classes to write for the given goal.\n\n"
     "Rules:\n"
     "- Output ONLY valid JSON, no explanation.\n"
-    "- For docs: 'anchor' MUST be a short content heading like 'Introduction', 'Why I Am Alive', "
-    "'Philosophical Dimensions', 'Conclusion'. NEVER use filenames, operations, or task descriptions "
-    "as anchors (e.g. NEVER 'edit_markdown', 'save_as_doc', 'query_on_self.md', 'write_essay').\n"
-    "- For code: 'anchor' is just the function or class name (no def/class prefix).\n"
-    "- 'min_chars' is the minimum expected body length in characters.\n"
-    "- 'kind' is one of: section, function, class, test.\n"
-    "- Order items in logical writing order.\n"
-    "- Do NOT include items already marked complete in existing content.\n\n"
+    "- Each item 'anchor' is the exact function or class name (no 'def'/'class' prefix, no spaces).\n"
+    "- 'kind' is one of: function, class, test.\n"
+    "- 'min_chars' is minimum expected body length in characters.\n"
+    "- Order items in logical coding order.\n"
+    "- Do NOT include items already in existing content.\n\n"
     'Output format:\n{"subtasks": [\n'
-    '  {"title": "Introduction", "anchor": "Introduction", "kind": "section", "min_chars": 300},\n'
-    '  {"title": "Why I Am Alive", "anchor": "Why I Am Alive", "kind": "section", "min_chars": 400},\n'
+    '  {"title": "add", "anchor": "add", "kind": "function", "min_chars": 150},\n'
+    '  {"title": "subtract", "anchor": "subtract", "kind": "function", "min_chars": 150},\n'
+    '  {"title": "multiply", "anchor": "multiply", "kind": "function", "min_chars": 150},\n'
     "  ...\n]}"
 )
+
+_PLAN_SYSTEM_DOC = (
+    "You are a document planner. List the sections to write for the given goal.\n\n"
+    "Rules:\n"
+    "- Output ONLY valid JSON, no explanation.\n"
+    "- Each item 'anchor' MUST be a short, specific section heading that matches the document topic.\n"
+    "  Use headings that fit the ACTUAL document being written, not generic placeholders.\n"
+    "- NEVER use filenames, operations, or task descriptions as anchors.\n"
+    "- 'kind' is always 'section'.\n"
+    "- 'min_chars' is minimum expected body length in characters.\n"
+    "- Order sections in logical document order.\n"
+    "- Do NOT include sections already in existing content.\n\n"
+    'Output format:\n{"subtasks": [\n'
+    '  {"title": "Introduction", "anchor": "Introduction", "kind": "section", "min_chars": 300},\n'
+    '  {"title": "Main Argument", "anchor": "Main Argument", "kind": "section", "min_chars": 400},\n'
+    '  {"title": "Counterarguments", "anchor": "Counterarguments", "kind": "section", "min_chars": 300},\n'
+    '  {"title": "Conclusion", "anchor": "Conclusion", "kind": "section", "min_chars": 200},\n'
+    "  ...\n]}"
+)
+
+# Legacy alias — kept for _STRICT_PLAN_SYSTEM which appends to it
+_PLAN_SYSTEM = _PLAN_SYSTEM_CODE
 
 
 def _parse_response(raw: str) -> list[dict]:
@@ -116,13 +134,22 @@ _OP_VERB_STARTS = frozenset({
     "adding", "removing", "fixing", "running", "generating", "processing",
 })
 
-_STRICT_PLAN_SYSTEM = (
-    _PLAN_SYSTEM
+_STRICT_PLAN_SYSTEM_CODE = (
+    _PLAN_SYSTEM_CODE
     + "\n\nIMPORTANT: Use SPECIFIC names only. "
-    "For code: exact function/class names like 'reverse_string', 'BankAccount', 'test_reverse'. "
-    "For docs: exact heading text like 'Installation', 'API Reference'. "
-    "NEVER use vague titles like 'main logic', 'helper function', 'section 1'."
+    "Exact function/class names like 'reverse_string', 'BankAccount', 'test_reverse'. "
+    "NEVER use vague titles like 'main', 'logic', 'helper', 'function1', 'section 1'."
 )
+
+_STRICT_PLAN_SYSTEM_DOC = (
+    _PLAN_SYSTEM_DOC
+    + "\n\nIMPORTANT: Use SPECIFIC heading text only. "
+    "Exact headings like 'Installation', 'API Reference', 'Getting Started'. "
+    "NEVER use generic placeholders like 'section 1', 'content', 'body'."
+)
+
+# Legacy aliases for any external references
+_STRICT_PLAN_SYSTEM = _STRICT_PLAN_SYSTEM_CODE
 
 
 def _is_vague(items: list[dict]) -> bool:
@@ -270,21 +297,50 @@ async def plan(
         f"File type: {file_type}{existing_note}"
     )
 
-    raw_items = await _call_planner(client, prompt, _PLAN_SYSTEM)
+    plan_sys  = _PLAN_SYSTEM_CODE  if file_type == "code" else _PLAN_SYSTEM_DOC
+    strict_sys = _STRICT_PLAN_SYSTEM_CODE if file_type == "code" else _STRICT_PLAN_SYSTEM_DOC
+
+    raw_items = await _call_planner(client, prompt, plan_sys)
 
     # Retry with stricter prompt if plan looks vague
-    if not raw_items or _is_vague(raw_items):
+    # Also retry if code items look like essay sections (model confuses file types)
+    def _has_doc_leak(items: list[dict]) -> bool:
+        """True when code items contain essay/doc section names."""
+        if file_type != "code":
+            return False
+        doc_names = {"introduction", "conclusion", "overview", "why i am alive",
+                     "philosophical dimensions", "counterarguments", "preface",
+                     "background", "abstract", "appendix", "discussion"}
+        for item in items:
+            if item.get("anchor", "").strip().lower() in doc_names:
+                return True
+        return False
+
+    if not raw_items or _is_vague(raw_items) or _has_doc_leak(raw_items):
         if raw_items:
             logger.warning(
-                "SubtaskPlanner: vague items detected (%s) — retrying with strict prompt",
+                "SubtaskPlanner: vague/wrong items detected (%s) — retrying with strict prompt",
                 [i.get("title") for i in raw_items],
             )
-        raw_items = await _call_planner(client, prompt, _STRICT_PLAN_SYSTEM)
+        raw_items = await _call_planner(client, prompt, strict_sys)
 
     if not raw_items:
         logger.warning("SubtaskPlanner returned no items after retry — single-item fallback")
         default_kind = "function" if file_type == "code" else "section"
-        raw_items = [{"title": stage_goal[:60], "anchor": stage_goal[:60], "kind": default_kind, "min_chars": 400}]
+        # For deepen tasks, extract the specific section/function being deepened
+        # rather than using the full "Deepen: ..." string as the anchor.
+        _anchor = stage_goal[:60]
+        if stage_goal.lower().startswith("deepen:"):
+            _deepen_rest = stage_goal[7:].strip()
+            # Prefer a quoted name: Deepen: 'Introduction' section → Introduction
+            _quoted = re.search(r"['\"]([^'\"]{3,60})['\"]", _deepen_rest)
+            if _quoted:
+                _anchor = _quoted.group(1).strip()
+            else:
+                # Take text up to first "needs"/"must"/"should"/"is" verb
+                _anchor = re.split(r'\b(?:needs|must|should|is |has |lacks)\b',
+                                   _deepen_rest, maxsplit=1)[0].strip()[:60]
+        raw_items = [{"title": _anchor, "anchor": _anchor, "kind": default_kind, "min_chars": 400}]
 
     return SubtaskManifest(
         stage_goal=stage_goal,

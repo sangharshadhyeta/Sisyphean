@@ -91,6 +91,29 @@ def _normalise_type(raw: str) -> str:
     return "fact"
 
 
+# Labels that the model sometimes emits verbatim from the prompt template —
+# these are placeholder examples, not real facts, and must be rejected.
+_JUNK_LABELS: frozenset[str] = frozenset({
+    "short unique name", "specific fact", "short name", "fact label",
+    "label", "name", "entity", "concept name", "fact", "item",
+    "information", "detail", "data", "knowledge", "thing",
+    "pick one", "type", "content", "summary", "value",
+    "a", "an", "the", "is", "it", "this", "that",
+})
+
+
+def _is_junk_label(label: str) -> bool:
+    """Return True when *label* is clearly a prompt-template placeholder or trivial."""
+    s = label.lower().strip().strip("\"'")
+    return (
+        s in _JUNK_LABELS
+        or len(s) < 3
+        or s.startswith("<")   # <label>
+        or s.startswith("[")   # [label]
+        or s.startswith("{")   # {label}
+    )
+
+
 def _jaccard(a: str, b: str) -> float:
     """Token-level Jaccard similarity between two strings."""
     ta = set(a.lower().split())
@@ -205,12 +228,22 @@ class MemoryExtractor:
 
             saved_facts, saved_arts = 0, 0
             kg = _knowledge_graph()
+            # Tracks (final_label, ftype) for every fact actually written —
+            # used below to create graph edges between related facts.
+            saved: list[tuple[str, str]] = []
 
             for item in data.get("facts", []):
                 label = (item.get("label") or "").strip()
                 content = (item.get("content") or "").strip()
                 ftype = _normalise_type(item.get("type", "fact"))
                 if not label or not content:
+                    continue
+
+                # ── Quality guard ─────────────────────────────────────────────
+                # Reject labels that are verbatim prompt-template placeholders
+                # (the model sometimes copies "short unique name" etc. literally).
+                if _is_junk_label(label):
+                    logger.debug("extractor: dropped junk label %r", label[:40])
                     continue
 
                 # ── Fuzzy dedup ───────────────────────────────────────────────
@@ -228,6 +261,7 @@ class MemoryExtractor:
                     else:
                         merged = existing_summary
                     kg.upsert_node(existing_name, ftype, summary=merged)
+                    final_label = existing_name
                     logger.debug(
                         "extractor: merged %r → existing node %r",
                         label[:40], existing_name[:40],
@@ -235,7 +269,41 @@ class MemoryExtractor:
                 else:
                     # Exact match or new node — upsert handles both
                     kg.upsert_node(label, ftype, summary=content)
+                    final_label = label
                 saved_facts += 1
+                saved.append((final_label, ftype))
+
+            # ── Create graph edges ────────────────────────────────────────────
+            # (1) Type-specific edges: anchor preferences/projects/concepts to
+            #     the "user" node so the graph has a meaningful hub structure.
+            for final_label, ftype in saved:
+                try:
+                    if ftype == "preference":
+                        kg.upsert_edge("user", "has_preference", final_label, weight=1.0)
+                    elif ftype == "project":
+                        kg.upsert_edge("user", "works_on", final_label, weight=1.0)
+                    elif ftype == "concept":
+                        kg.upsert_edge("user", "knows_about", final_label, weight=0.6)
+                    elif ftype == "fact":
+                        # Facts about a visible project get linked there too
+                        pass  # handled by co-occurrence below
+                except Exception as _edge_exc:
+                    logger.debug("extractor: type-edge failed: %s", _edge_exc)
+
+            # (2) Co-occurrence edges: facts extracted from the same exchange
+            #     are semantically related — wire them together (window of 4).
+            for i in range(len(saved)):
+                for j in range(i + 1, min(i + 4, len(saved))):
+                    a_lbl, a_type = saved[i]
+                    b_lbl, b_type = saved[j]
+                    # Only link if sharing a meaningful type or one is a hub type
+                    if (a_type == b_type
+                            or a_type in ("concept", "project")
+                            or b_type in ("concept", "project")):
+                        try:
+                            kg.upsert_edge(a_lbl, "related_to", b_lbl, weight=0.5)
+                        except Exception:
+                            pass
 
             for item in data.get("artifacts", []):
                 atype = item.get("type", "output")

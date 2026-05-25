@@ -565,10 +565,16 @@ class Pipeline:
                         logger.warning("pipeline: save_memory stage failed: %s", exc)
                 steps = [{"tool": "save_memory", "input": fact, "result": "saved",
                           "summary": f"saved: {fact[:80]}"}]
-            elif task.strip().lower().startswith("run "):
+            elif task.strip().lower().startswith("run ") or re.match(
+                r'^command:\s*run\s+', task.strip(), re.IGNORECASE
+            ):
                 # Stage goal is already a concrete command — skip plan_task,
                 # extract the command and emit a bash step directly.
-                cmd = _normalize_python_c(task.strip()[4:].strip())
+                # Strip "COMMAND: Run " prefix that small models echo from the format description.
+                _task_stripped = re.sub(r'^command:\s*', '', task.strip(), flags=re.IGNORECASE)
+                if _task_stripped.lower().startswith("run "):
+                    _task_stripped = _task_stripped[4:].strip()
+                cmd = _sub_workspace(_normalize_python_c(_task_stripped), self.workspace)
                 logger.info("pipeline: direct-run stage → bash: %s", cmd[:80])
                 steps = [{"tool": "bash", "input": cmd}]
             elif stage_type == "verify":
@@ -576,7 +582,7 @@ class Pipeline:
                 # Only ask "what command?" — don't re-do tool selection via plan_task.
                 cmd = await resolve_bash_command(task, self.client, context=task_ctx)
                 if cmd:
-                    cmd = _normalize_python_c(cmd)
+                    cmd = _sub_workspace(_normalize_python_c(cmd), self.workspace)
                     logger.info("pipeline: verify stage → bash: %s", cmd[:80])
                     steps = [{"tool": "bash", "input": cmd}]
                 else:
@@ -598,6 +604,23 @@ class Pipeline:
                 ws_tool = next((n for n in all_names if n in _WEB_TOOL_NAMES), "web_search")
                 steps = [{"tool": ws_tool, "input": task}]
                 logger.info("pipeline: empty plan → websearch fallback for %r", task[:60])
+            elif not steps and stage_type in ("write_code", "write_doc"):
+                # Write stage with no plan — synthesise a write_plan step directly
+                # so the model can't escape by returning an empty response.
+                _ft = "code" if stage_type == "write_code" else "doc"
+                _fn = _extract_filename_from_task(task, _ft)
+                if not _fn:
+                    _fn = _extract_filename_from_task(query, _ft)
+                if _fn:
+                    if self.workspace and not os.path.isabs(_fn):
+                        _fn = os.path.join(self.workspace, _fn)
+                    steps = [{"tool": "write_plan", "input": task,
+                              "file_path": _fn, "file_type": _ft}]
+                    logger.info("pipeline: empty plan for %s → write_plan fallback: %s",
+                                stage_type, _fn)
+                else:
+                    logger.warning("pipeline: empty plan for %s and no filename in %r",
+                                   stage_type, task[:60])
             elif not steps and stage_type not in ("direct",) and not graph_recall:
                 # Non-research stage with no plan — let synthesizer handle it
                 logger.info("pipeline: empty plan for %s stage %r", stage_type, task[:60])
@@ -650,22 +673,25 @@ class Pipeline:
     async def _continue(self, state: PipelineState, raw_history: list[dict],
                         available_tools: list[dict]) -> LoopResponse:
 
-        # ── Write plan continuation ────────────────────────────────────────────
-        # If a write plan is active the outer tool result was a Write for one item.
-        # Verify the item against the actual file; retry if partial/missing.
+        # ── Write plan continuation ─────────────────────────────────────────────
+        # Write plan is active: the outer tool result was a Write (new item) or
+        # Edit (retry of partial item).  Verify actual file content; retry if needed.
         if state.wp_items:
             tool_results = _extract_tool_results(raw_history)
-            # Item that was just written
+            # Item that was just written/edited
             written_item = state.wp_items[state.wp_idx] if state.wp_idx < len(state.wp_items) else {}
             item_title  = written_item.get("title",  f"item {state.wp_idx + 1}")
             item_anchor = written_item.get("anchor", item_title)
             item_min    = written_item.get("min_chars", 200)
 
+            # Always track the file — Write returns empty result, Edit returns a message.
+            # We track regardless so epistemic state stays accurate.
+            if state.wp_file and state.wp_file not in state.files_written:
+                state.files_written.append(state.wp_file)
+
             for tr in tool_results:
                 logger.info("pipeline.wp_continue: item=%d/%d result=%s",
                             state.wp_idx, len(state.wp_items), tr[:60])
-                if state.wp_file not in state.files_written:
-                    state.files_written.append(state.wp_file)
                 _tracker.tree_subtask_step(
                     state.task_id, state.current_task_idx,
                     "write", item_title, tr[:120], status="done",
@@ -814,7 +840,7 @@ class Pipeline:
         # Write outer-tool call.  After each result _continue advances wp_idx.
         if state.wp_items:
             if state.wp_idx < len(state.wp_items):
-                return await self._write_plan_next_item(state)
+                return await self._write_plan_next_item(state, available_tools)
             else:
                 # All items done — reflect gate: check if content is deep enough.
                 # One cheap LLM call. If "deepen", insert one more write_plan pass
@@ -1006,7 +1032,7 @@ class Pipeline:
                             step["file_type"] = "code" if _ext in (".py", ".js", ".ts", ".rb", ".go", ".rs") else "doc"
                             step["run_after"] = step["file_type"] == "code"
                             inp = _wp_task
-                    return await self._start_write_plan(step, state)
+                    return await self._start_write_plan(step, state, available_tools)
 
                 # ── Outer tool → return tool_use to Claude Code ───────────────
                 if tool in outer_tool_names:
@@ -1046,7 +1072,9 @@ class Pipeline:
                     tool_id = f"toolu_{uuid.uuid4().hex[:16]}"
                     cl = canonical.lower()
                     if cl == "bash":
-                        cmd = _normalize_python_c(inp)
+                        cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
+                        # Strip "COMMAND" prefix that models echo from format descriptions
+                        cmd = re.sub(r'^COMMAND[\s:]+', '', cmd, flags=re.IGNORECASE).strip()
                         # Safety net: if cmd writes/runs relative files, cd to workspace first
                         if self.workspace:
                             cmd = _apply_workspace_to_cmd(cmd, self.workspace)
@@ -1505,7 +1533,8 @@ class Pipeline:
 
     # ── Incremental write plan ────────────────────────────────────────────────
 
-    async def _start_write_plan(self, step: dict, state: PipelineState) -> LoopResponse:
+    async def _start_write_plan(self, step: dict, state: PipelineState,
+                               available_tools: list[dict] | None = None) -> LoopResponse:
         """Run the subtask planner and populate state.wp_* for item-by-item writing.
 
         Called when a write_plan meta-step is encountered in _execute.
@@ -1519,9 +1548,49 @@ class Pipeline:
         file_type = step.get("file_type", "doc")
         run_after = bool(step.get("run_after", False))
 
+        # If the task input is just a bare filename / path (model used the filename
+        # as the input instead of the actual goal description), fall back to the
+        # original user query so the subtask planner gets a meaningful description.
+        _task_words = task.split() if task else []
+        _looks_like_bare_path = (
+            task
+            and len(_task_words) <= 3
+            and ("/" in task or os.sep in task or "." in os.path.basename(task))
+        )
+        if not task or _looks_like_bare_path:
+            task = state.query
+            logger.info("pipeline: _start_write_plan: bare path as task — using query instead")
+
         # Resolve file_path against project_dir
         if file_path and state.project_dir and not os.path.isabs(file_path):
             file_path = os.path.join(state.project_dir, file_path)
+
+        # Guard: empty file_path OR model gave a directory (both common mistakes).
+        # Try to recover a filename from the task text or fall back to project_dir.
+        _fp_is_dir = file_path and os.path.isdir(file_path)
+        if not file_path or _fp_is_dir:
+            _extracted = _extract_filename_from_task(task or state.query, file_type)
+            if _extracted:
+                _base = file_path if _fp_is_dir else (state.project_dir or "")
+                file_path = os.path.join(_base, _extracted) if _base else _extracted
+                logger.info("pipeline: write_plan file_path fix (%s) → %s",
+                            "dir" if _fp_is_dir else "empty", file_path)
+            else:
+                logger.warning("pipeline: write_plan has no usable file_path "
+                               "and could not extract filename from task")
+
+        # Infer file_type from extension — override even "doc" default when the
+        # extension clearly indicates code.  Covers three cases:
+        #   • step.get("file_type") is None  (plan_task didn't set it)
+        #   • step.get("file_type") == "doc" (pipe-parser defaulted; deepen inherited)
+        #   • file_path was empty and just got resolved above
+        _CODE_EXTS = {".py", ".js", ".ts", ".rb", ".go", ".rs", ".java", ".c", ".cpp", ".sh"}
+        if file_path:
+            _ext = os.path.splitext(file_path)[1].lower()
+            if _ext in _CODE_EXTS and file_type != "code":
+                file_type = "code"
+                run_after = True
+                logger.info("pipeline: _start_write_plan: inferred file_type=code from %s", _ext)
 
         # Read whatever is already on disk — verifier will detect completed items
         existing = ""
@@ -1583,9 +1652,10 @@ class Pipeline:
         state.wp_resume_ctx  = ""
 
         logger.info("pipeline: write_plan %d item(s) to write for %s", len(items), file_path)
-        return await self._write_plan_next_item(state)
+        return await self._write_plan_next_item(state, available_tools)
 
-    async def _write_plan_next_item(self, state: PipelineState) -> LoopResponse:
+    async def _write_plan_next_item(self, state: PipelineState,
+                                    available_tools: list[dict] | None = None) -> LoopResponse:
         """Generate content for the current write-plan item and emit a Write outer tool.
 
         Reads the current file from disk to provide context so each section
@@ -1598,6 +1668,29 @@ class Pipeline:
         inform the writing, just as BirdClaw's planning_context did.
         """
         from engine.translation.planner import parse_format_response
+
+        # Failsafe: if wp_file is empty (can happen if the LLM omitted the filename
+        # and the _start_write_plan guard couldn't extract it), recover from the
+        # original user query before giving up.
+        if not state.wp_file:
+            _fb = _extract_filename_from_task(state.query, state.wp_ftype or "doc")
+            if _fb:
+                state.wp_file = (
+                    os.path.join(state.project_dir, _fb)
+                    if state.project_dir else _fb
+                )
+                logger.warning(
+                    "pipeline: _write_plan_next_item: empty wp_file — recovered → %s",
+                    state.wp_file,
+                )
+            else:
+                logger.error(
+                    "pipeline: _write_plan_next_item: empty wp_file, cannot extract "
+                    "filename from query %r — aborting write plan", state.query[:80]
+                )
+                state.wp_items = []
+                state.current_step_idx += 1
+                return await self._execute(state, [])
 
         item_meta = state.wp_items[state.wp_idx]
         anchor    = item_meta["anchor"]
@@ -1807,7 +1900,7 @@ class Pipeline:
                            title[:40])
             state.wp_idx += 1
             if state.wp_idx < len(state.wp_items):
-                return await self._write_plan_next_item(state)
+                return await self._write_plan_next_item(state, available_tools)
             state.wp_items = []
             state.current_step_idx += 1
             return await self._execute(state, [])
@@ -1851,13 +1944,43 @@ class Pipeline:
                     )
                     state.wp_idx += 1
                     if state.wp_idx < len(state.wp_items):
-                        return await self._write_plan_next_item(state)
+                        return await self._write_plan_next_item(state, available_tools)
                     state.wp_items = []
                     state.current_step_idx += 1
                     return await self._execute(state, [])
                 else:
-                    # Partial content exists — strip it out so we don't create
-                    # a duplicate heading when we append the new content below.
+                    # Partial content exists — prefer Edit-in-place (Claude Code pattern)
+                    # to avoid rewriting the entire file.  Falls back to strip+Write if
+                    # Edit is unavailable or the old text cannot be located.
+                    _has_edit = (
+                        available_tools
+                        and any(t.get("name", "").lower() == "edit" for t in available_tools)
+                    )
+                    if _has_edit:
+                        _old_text = _get_item_text_from_content(current_content, anchor, file_type)
+                        if _old_text:
+                            _new_text = _rebuild_item_content(_old_text, content)
+                            tool_id = f"toolu_{uuid.uuid4().hex[:16]}"
+                            logger.info(
+                                "pipeline: write_plan item %r retry — Edit in-place (%dc→%dc)",
+                                title[:40], len(_old_text), len(_new_text),
+                            )
+                            _tracker.tree_subtask_step(
+                                state.task_id, state.current_task_idx,
+                                "edit", f"{title} → {file_path}", "", status="running",
+                            )
+                            return LoopResponse(
+                                content=[
+                                    {"type": "thinking",
+                                     "thinking": f"{_STATE_PREFIX}{state.to_json()}"},
+                                    {"type": "tool_use", "id": tool_id, "name": "Edit",
+                                     "input": {"file_path": file_path,
+                                               "old_string": _old_text,
+                                               "new_string": _new_text}},
+                                ],
+                                stop_reason="tool_use",
+                            )
+                    # Fallback: strip partial and write full file
                     logger.info(
                         "pipeline: write_plan item %r partial in file — stripping for rewrite",
                         title[:40],
@@ -2529,6 +2652,23 @@ def _apply_workspace_to_cmd(cmd: str, workspace: str) -> str:
     return cmd
 
 
+def _sub_workspace(cmd: str, workspace: str) -> str:
+    """Replace the literal token WORKSPACE (or WORKSPACE_PATH) with the actual
+    workspace path.  Small models often output these as literal strings instead
+    of substituting the path provided in the prompt.
+
+    Uses simple str.replace (case-sensitive for WORKSPACE, case-insensitive for
+    workspace_path) — avoids word-boundary regex edge cases on Windows paths.
+    """
+    if not workspace or "WORKSPACE" not in cmd.upper():
+        return cmd
+    ws = workspace.replace("\\", "/")
+    # Replace longer token first to avoid partial substitution
+    cmd = cmd.replace("WORKSPACE_PATH", ws).replace("workspace_path", ws)
+    cmd = cmd.replace("WORKSPACE", ws)
+    return cmd
+
+
 def _normalize_python_c(cmd: str) -> str:
     """Fix common model mistakes in `python -c '...'` commands.
 
@@ -3035,18 +3175,104 @@ def _build_verify_resume_ctx(
 
     if wp_idx < len(wp_items):
         item = wp_items[wp_idx]
+        in_file = any(
+            (item["anchor"].strip().lower() in k.strip().lower()
+             or k.strip().lower() in item["anchor"].strip().lower())
+            for k in (parsed or {})
+        )
         lines += [
             "",
-            f'Resume at [{wp_idx}]: "{item["anchor"]}"',
-            f"Minimum {item['min_chars']} chars of substantive content.",
-            "Append the missing content below. Do NOT rewrite earlier sections.",
+            f'Resume item [{wp_idx}]: "{item["anchor"]}"',
+            f"  Anchor {'IS already in the file (partial body — write body only, NO def/## line)' if in_file else 'is NOT yet in the file — write from the anchor header'}.",
+            f"  Min {item['min_chars']} chars of substantive content.",
         ]
 
     if file_content:
-        tail = file_content[-500:].strip()
-        lines += ["", "--- current file tail ---", tail, "--- end ---"]
+        tail_lines = file_content.splitlines()[-30:]
+        tail = "\n".join(tail_lines)
+        lines += [
+            "",
+            "--- current file tail (seam — continue AFTER the last line below) ---",
+            tail,
+            "--- end seam ---",
+        ]
 
     return "\n".join(lines)
+
+
+def _extract_filename_from_task(task: str, file_type: str) -> str:
+    """Try to extract a target filename from a task description.
+
+    Used when the model supplies a directory as file_path instead of a file.
+    Returns a filename string (possibly with extension) or "" if not found.
+    """
+    import re as _re
+    # Explicit filename patterns: "in foo.py", "to bar.md", "file foo.txt"
+    m = _re.search(
+        r'\b(?:in|to|file|named?|called?|as)\s+["\']?([A-Za-z0-9_\-]+\.[a-z]{2,5})["\']?',
+        task, _re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # Bare filename anywhere in the task
+    m = _re.search(r'\b([A-Za-z0-9_\-]+\.(py|md|txt|js|ts|json|yaml|yml|html|css))\b', task)
+    if m:
+        return m.group(1)
+    # Infer extension from file_type and first meaningful word
+    ext = ".py" if file_type == "code" else ".md"
+    words = _re.findall(r'[A-Za-z][A-Za-z0-9_]+', task)
+    skip = {"write", "create", "implement", "make", "generate", "a", "the", "an",
+            "short", "simple", "module", "file", "script", "document", "essay", "in"}
+    for w in words:
+        if w.lower() not in skip and len(w) >= 3:
+            return w.lower() + ext
+    return ""
+
+
+def _get_item_text_from_content(content: str, anchor: str, file_type: str) -> str | None:
+    """Extract the exact text block of a named item from file content.
+
+    For code: returns the full def/class block (header + body).
+    For docs: returns the heading line + body.
+    Returns None if the anchor cannot be found.
+    Used by the Edit-in-place retry path in _write_plan_next_item.
+    """
+    try:
+        from engine.translation.subtask.verifier import (
+            parse_doc_sections, parse_code_items, _match_key,
+        )
+        parsed = (parse_doc_sections(content) if file_type == "doc"
+                  else parse_code_items(content))
+        key = _match_key(anchor, parsed)
+        if key is None:
+            return None
+        body = parsed.get(key, "")
+        if file_type == "doc":
+            for prefix in ("## ", "# ", "### "):
+                heading = f"{prefix}{key}"
+                if heading in content:
+                    return heading + ("\n" + body if body else "")
+            return None
+        # code: parse_code_items already returns def/class header + body as one string
+        return body or None
+    except Exception:
+        return None
+
+
+def _rebuild_item_content(existing_text: str, new_body: str) -> str:
+    """Keep the header line of existing_text, replace the body with new_body.
+
+    Used to construct new_string for the Edit tool in the retry path.
+    Strips accidental header-repetition when the model echoes the def/## line.
+    """
+    lines = existing_text.splitlines()
+    header = lines[0] if lines else ""
+    body_lines = new_body.splitlines()
+    # If model echoed the header as its first line, strip it
+    if body_lines and body_lines[0].strip() == header.strip():
+        body_lines = body_lines[1:]
+    new_body_clean = "\n".join(body_lines).lstrip("\n")
+    return (header + "\n" + new_body_clean) if header else new_body_clean
 
 
 def _search_graph(query: str, graph) -> str:

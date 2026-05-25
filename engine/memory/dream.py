@@ -206,8 +206,15 @@ async def dream_cli(
         logger.error("dream: failed to load config: %s", exc)
         return 1
 
-    llm_url = f"http://{config.llm.server.host}:{config.llm.server.port}"
-    client = LlamaClient(llm_url, mock=config.mock)
+    # Use ollama_port when a local Ollama model is configured,
+    # otherwise fall back to the llama-server port.
+    _llm_port = (
+        config.llm.server.ollama_port
+        if config.llm.local_model
+        else config.llm.server.port
+    )
+    llm_url = f"http://{config.llm.server.host}:{_llm_port}"
+    client = LlamaClient(llm_url, mock=config.mock, model=config.llm.local_model or None)
     mem_path = Path(config.memory.path)
 
     mode = "dry-run " if dry_run else ""

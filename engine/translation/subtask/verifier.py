@@ -155,29 +155,47 @@ def run(manifest: SubtaskManifest, file_content: str) -> SubtaskDiff:
 # ── Resume context ────────────────────────────────────────────────────────────
 
 def _build_resume_context(manifest: SubtaskManifest, diff: SubtaskDiff, file_content: str) -> str:
+    """Build a resume prompt for the retry path.
+
+    NOTE: When the item's anchor already exists in the file (partial/stub body),
+    the writer uses _build_edit_prompt + _apply_edit instead of this resume
+    context.  This context is used only when the anchor is genuinely missing
+    (first write failed, item still = "missing").
+    """
     lines = [f"File: {manifest.file_path}"]
     for it in manifest.items:
         if it.status == "complete":
-            lines.append(f"  ✓ [{it.index}] {it.title}  ({it.actual_chars}c)")
+            lines.append(f"  [done] {it.title}  ({it.actual_chars}c)")
         elif it.status == "partial":
-            lines.append(f"  ~ [{it.index}] {it.title}  — {it.actual_chars}c (needs body, min {it.expected_min_chars}c)  ← resume here")
+            lines.append(
+                f"  [partial] {it.title}  — {it.actual_chars}c written "
+                f"(needs {it.expected_min_chars}c)  <-- resume here"
+            )
         elif it.status in ("missing", "regressed"):
-            marker = "⚠ REGRESSED" if it.status == "regressed" else "✗ missing"
-            lines.append(f"  {marker} [{it.index}] {it.title}")
+            marker = "REGRESSED" if it.status == "regressed" else "MISSING"
+            lines.append(f"  [{marker}] {it.title}")
         else:
-            lines.append(f"  · [{it.index}] {it.title}  — pending")
+            lines.append(f"  [pending] {it.title}")
 
     if diff.seam_index < len(manifest.items):
         seam = manifest.items[diff.seam_index]
+        in_file = seam.actual_chars > 0
         lines += [
             "",
-            f'Resume at [{diff.seam_index}]. Anchor "{seam.anchor}" must be present.',
-            "Append body only. Do NOT rewrite or repeat earlier sections.",
-            f"Min {seam.expected_min_chars} chars of substantive content.",
+            f"Resume item [{diff.seam_index}]: \"{seam.anchor}\"",
+            f"  Anchor {'IS already in the file (partial body — write body only, NO def/## line)' if in_file else 'is NOT yet in the file — write from the anchor header'}.",
+            f"  Min {seam.expected_min_chars} chars of substantive content.",
         ]
 
     if file_content:
-        tail = file_content[-600:].strip()
-        lines += ["", "--- current file tail ---", tail, "--- end ---"]
+        # Show last 30 LINES (not arbitrary chars) — gives proper code/doc context
+        tail_lines = file_content.splitlines()[-30:]
+        tail = "\n".join(tail_lines)
+        lines += [
+            "",
+            "--- current file tail (seam — continue AFTER the last line below) ---",
+            tail,
+            "--- end seam ---",
+        ]
 
     return "\n".join(lines)

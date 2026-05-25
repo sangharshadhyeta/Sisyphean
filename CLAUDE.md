@@ -26,13 +26,13 @@ python main.py dream --dry-run
 python main.py dream --cleanup-only
 python main.py dream --memorise-only
 
-# Run tests (engine must be running on :8000)
+# Run tests (engine must be running on :47291)
 python test_api.py
 python test_regimen.py
 python test_openclaw.py
 ```
 
-Engine runs at `http://127.0.0.1:8000` by default. Set `mock: true` in `config.yaml` to test without a running model.
+Engine runs at `http://127.0.0.1:47291` by default. Set `mock: true` in `config.yaml` to test without a running model.
 
 ## Configuration
 
@@ -51,7 +51,7 @@ llm:
 
 api:
   host: 127.0.0.1
-  port: 8000
+  port: 47291
 
 mock: false                      # true = no model needed (for testing)
 workspace: ./workspace           # sandboxed dir; agent writes here only
@@ -131,7 +131,7 @@ Stall guard blocks duplicate (tool, input) calls. Semantic history uses Jaccard 
 
 ```json
 {
-  "customApiUrl": "http://127.0.0.1:8000",
+  "customApiUrl": "http://127.0.0.1:47291",
   "customApiKey": "local"
 }
 ```

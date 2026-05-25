@@ -531,6 +531,14 @@ async def _discover_skills(client, graph, workspace: Path) -> int:
             if len(code) < 40:
                 continue  # too short to be a real skill
 
+            # Skip library modules — only promote runnable scripts with an entry point.
+            # Pure helper/utility files (no if __name__ == '__main__' block) are not
+            # reusable skills; they need a caller and sys.argv refactoring is nonsense.
+            if "__main__" not in code:
+                logger.debug("skill discovery: %s has no __main__ block, skipping", fname)
+                newly_seen.append(ts)
+                continue
+
             skill_name = _task_to_skill_name(task)
             if not skill_name:
                 continue

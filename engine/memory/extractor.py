@@ -114,6 +114,23 @@ def _is_junk_label(label: str) -> bool:
     )
 
 
+def _normalise_label(s: str) -> str:
+    """Canonical form for dedup comparison.
+
+    Lowercases, replaces underscores/hyphens with spaces, collapses runs of
+    whitespace, and strips leading/trailing punctuation.  This ensures that
+    "vim_preference", "vim-tabs-over-spaces", "vim editor preference",
+    "vim/tabs_over_spaces", and "VIM Preference" all compare as near-identical
+    rather than generating separate nodes for the same concept.
+    """
+    import re
+    s = s.lower()
+    s = re.sub(r"[_\-/\\]", " ", s)         # separators → space
+    s = re.sub(r"[^\w\s]", "", s)            # strip punctuation
+    s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace
+    return s
+
+
 def _jaccard(a: str, b: str) -> float:
     """Token-level Jaccard similarity between two strings."""
     ta = set(a.lower().split())
@@ -126,11 +143,14 @@ def _jaccard(a: str, b: str) -> float:
 def _find_similar_node(graph, label: str, content: str, threshold: float = 0.75) -> str | None:
     """Return the name of an existing graph node similar to *label*, or None.
 
-    Similarity is computed as token-level Jaccard on the node name.  When label
-    similarity is moderate (≥ 0.5) the content is also compared — two facts
-    about the same topic but stated differently still count as duplicates if
-    their content overlaps substantially.
+    Similarity is computed as token-level Jaccard on the node name.  Labels are
+    normalised first (lowercase, separators → space, punctuation stripped) so
+    stylistic variants like "vim_preference" and "vim editor preference" match.
+    When label similarity is moderate (≥ 0.5) the content is also compared —
+    two facts about the same topic but stated differently still count as
+    duplicates if their content overlaps substantially.
     """
+    norm_label = _normalise_label(label)
     try:
         candidates = graph.search(label, top_k=5)
         for node in candidates:
@@ -140,13 +160,19 @@ def _find_similar_node(graph, label: str, content: str, threshold: float = 0.75)
             # Exact match — let upsert_node handle it
             if existing_name.lower().strip() == label.lower().strip():
                 return existing_name
-            label_sim = _jaccard(label, existing_name)
-            if label_sim >= threshold:
+            # Normalised exact match (catches vim_preference == vim preference)
+            if _normalise_label(existing_name) == norm_label:
+                return existing_name
+            # Jaccard on normalised forms — lower threshold (0.6) because
+            # normalisation already strips noise; 0.75 was too strict for
+            # multi-word stylistic variants of the same concept.
+            label_sim = _jaccard(norm_label, _normalise_label(existing_name))
+            if label_sim >= 0.6:
                 return existing_name
             # Moderate label overlap: check content too
-            if label_sim >= 0.5:
+            if label_sim >= 0.4:
                 content_sim = _jaccard(content, node.get("summary", ""))
-                if content_sim >= 0.6:
+                if content_sim >= 0.55:
                     return existing_name
     except Exception:
         pass

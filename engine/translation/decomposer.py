@@ -155,7 +155,7 @@ async def decompose(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 # Keywords used to derive step type from step text without asking the LLM.
-# Checked in priority order: verify > edit(direct) > write_code > write_doc > reflect > research.
+# Checked in priority order: verify > edit(direct) > write_project > write_code > write_doc > reflect > research.
 _VERIFY_KW    = ("run ", "bash", "execute", "mkdir", "create file", "create folder",
                  "touch ", "test ", "confirm ", "check if", "verify ", "chmod",
                  "install ", "pip ", "npm ", "git ", "convert ")
@@ -171,6 +171,15 @@ _REFLECT_KW   = ("analys", "summaris", "summariz", "review", "compare",
 _EDIT_KW      = ("edit ", "update ", "modify ", "revise ", "patch ",
                  "append to ", "add to ", "insert into ", "change ")
 
+# Multi-file project: "build/create/develop a X app/project/api/system"
+# Must have BOTH a build verb AND a multi-file subject to avoid false positives.
+_PROJECT_BUILD_VERBS = frozenset({"build", "create", "develop", "implement", "make"})
+_PROJECT_SUBJECT_KW  = (
+    " app", "application", " api", " server", " service",
+    " project", " system", " backend", " website", " cli",
+    "rest api", "web app", "todo ", "microservice",
+)
+
 
 def _derive_type(text: str) -> str:
     """Derive the step type from its text using keyword rules — no LLM needed."""
@@ -180,6 +189,11 @@ def _derive_type(text: str) -> str:
     # Edit/update existing content → direct (executor uses Read + Edit tools)
     if any(kw in t for kw in _EDIT_KW):
         return "direct"
+    # Multi-file project: "build a todo app", "create a REST API", etc.
+    # Check before write_code so "implement a FastAPI service" → write_project not write_code.
+    _first_word = t.split()[0] if t.split() else ""
+    if _first_word in _PROJECT_BUILD_VERBS and any(kw in t for kw in _PROJECT_SUBJECT_KW):
+        return "write_project"
     if any(kw in t for kw in _CODE_KW):
         return "write_code"
     if any(kw in t for kw in _DOC_KW):

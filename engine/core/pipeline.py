@@ -462,6 +462,49 @@ class Pipeline:
 
         # No hardcoded routing overrides — think_decompose() owns all routing decisions.
 
+        # ── Project expansion: write_project stages → per-file write_code stages ──
+        # When think_decompose returns a single write_project/write_code stage for a
+        # project-scale task (e.g. "build a todo app"), call the project planner to
+        # break it into ordered per-file stages.  Each file is then handled by the
+        # existing write_plan pipeline — cross-file sigs flow via the memory graph.
+        #
+        # Only triggers when:
+        #   a) at least one stage is write_project, OR
+        #   b) the query looks like a project AND there's just one write_code stage
+        has_write_project = any(s.get("type") == "write_project" for s in stages)
+        write_code_stages  = [s for s in stages if s.get("type") in ("write_code", "write_project")]
+        if has_write_project or (
+            _is_project_query(query) and len(write_code_stages) == 1
+        ):
+            from engine.translation.project.planner import plan_project as _plan_project
+            # Use the write_project/write_code stage's goal as the project description;
+            # fall back to the full query if the stage goal is too vague (≤6 words).
+            _proj_goal = (
+                write_code_stages[0]["goal"]
+                if write_code_stages and len(write_code_stages[0]["goal"].split()) > 6
+                else query
+            )
+            try:
+                _proj_files = await _plan_project(self.client, _proj_goal, self.workspace)
+            except Exception as _pe:
+                logger.warning("pipeline: project planner failed (%s) — single-stage fallback", _pe)
+                _proj_files = []
+
+            if len(_proj_files) >= 2:
+                # Keep non-write stages (research, verify, etc.), replace write stages
+                _non_write = [s for s in stages if s.get("type") not in ("write_code", "write_project")]
+                _expanded  = [
+                    {"type": "write_code",
+                     "goal": f"Write {f['filename']}: {f['purpose']}"}
+                    for f in _proj_files
+                ]
+                stages = _non_write + _expanded
+                logger.info(
+                    "pipeline: project expansion → %d files: %s",
+                    len(_proj_files),
+                    [f["filename"] for f in _proj_files],
+                )
+
         # Map stages back to the task list that plan_task expects.
         # Each stage goal becomes the sub-task text; infer_stage_type already
         # annotated the type which pipeline uses for tool selection below.
@@ -867,6 +910,14 @@ class Pipeline:
                             sub["steps"].insert(state.current_step_idx + 1, deepen_step)
                         except (IndexError, KeyError):
                             pass
+
+                # ── Cross-file sig injection (project builds) ─────────────────
+                # After a code file is fully written, extract def/class signatures
+                # and store them in the memory graph so subsequent files in the same
+                # project can import or reference them.  Only runs for code files
+                # (not docs) and only when the graph is available.
+                if wp_ftype_was == "code" and wp_file_was and self.graph:
+                    _inject_file_sigs_to_graph(wp_file_was, self.graph)
 
                 # Optionally run the file after writing
                 if state.wp_run_after and state.wp_file:
@@ -1772,6 +1823,16 @@ class Pipeline:
                 conv_ctx = f"[Recent shell output — shows what already exists]\n{bash_lines}"
             else:
                 conv_ctx = ""
+            # ── Cross-file signature injection ──────────────────────────────
+            # For multi-file project builds: inject def/class signatures that
+            # were extracted from previously-written project files.  This lets
+            # qwen3:0.6b know what functions are already available to import,
+            # keeping the cross-file context to ~50 chars/symbol (not full file).
+            _sigs = _get_graph_sigs(state.wp_goal, self.graph)
+            if _sigs:
+                conv_ctx = (_sigs + ("\n\n" + conv_ctx if conv_ctx else "")).strip()
+                logger.debug("write_plan: injected %d chars of cross-file sigs for %r",
+                             len(_sigs), title[:40])
         else:
             conv_ctx = state.synthesis_ctx[:800].strip() if state.synthesis_ctx else ""
             # Inject session research notes — web_search / web_fetch results
@@ -3284,6 +3345,96 @@ def _search_graph(query: str, graph) -> str:
             return ""
         return "\n".join(n.get("content", n.get("summary", ""))[:200] for n in nodes)
     except Exception:
+        return ""
+
+
+# ── Multi-file project helpers ────────────────────────────────────────────────
+
+# Build verbs + multi-file subject keywords that signal a project-scale task.
+# Conservative: require BOTH so "write a Python function" doesn't trigger it.
+_PROJECT_BUILD_VERBS = frozenset({"build", "create", "develop", "implement", "make"})
+_PROJECT_SUBJECT_KW  = (
+    " app", "application", " api", " server", " service",
+    " project", " system", " backend", " website", " cli",
+    "rest api", "web app", "todo ", "microservice",
+)
+
+
+def _is_project_query(query: str) -> bool:
+    """True if the query describes a multi-file project to be built.
+
+    Used in _start to decide whether to expand a single write_code stage
+    (or a write_project stage) into per-file stages via the project planner.
+    """
+    q = query.lower()
+    first_word = q.split()[0] if q.split() else ""
+    has_verb = (first_word in _PROJECT_BUILD_VERBS or
+                any(f" {v} " in q for v in _PROJECT_BUILD_VERBS))
+    has_subject = any(kw in q for kw in _PROJECT_SUBJECT_KW)
+    return has_verb and has_subject
+
+
+def _inject_file_sigs_to_graph(file_path: str, graph) -> None:
+    """Extract def/class signature lines from a code file and save as skill nodes.
+
+    Called after each file in a project is written so subsequent files can
+    import or reference the available functions/classes.  Each signature is
+    stored as a graph node (type="skill", kind="code_sig") so it can be
+    retrieved by _get_graph_sigs() before writing the next file.
+    """
+    if graph is None:
+        return
+    try:
+        content = Path(file_path).read_text(encoding="utf-8")
+        basename = os.path.basename(file_path)
+        # Match "def foo(..." and "class Bar:" at module level or inside classes
+        _SIG_RE = re.compile(
+            r'^((?:def |class )\w[\w\d_]*(?:\([^)]{0,120}\))?)\s*(?:->.*?)?:',
+            re.MULTILINE,
+        )
+        saved = 0
+        for m in _SIG_RE.finditer(content):
+            sig = m.group(1).strip()
+            if not (3 < len(sig) < 120):
+                continue
+            # Skip dunder methods — unlikely to be useful cross-file
+            if sig.startswith("def __") and not sig.startswith("def __init__"):
+                continue
+            label   = sig
+            content_str = f"{sig}  # {basename}"
+            graph.add_node(
+                type="skill",
+                label=label,
+                content=content_str,
+                metadata={"file": basename, "kind": "code_sig"},
+            )
+            saved += 1
+        if saved:
+            logger.info("pipeline: saved %d sig(s) from %s to graph", saved, basename)
+    except Exception as exc:
+        logger.warning("pipeline: sig extraction failed for %s: %s", file_path, exc)
+
+
+def _get_graph_sigs(goal: str, graph, max_sigs: int = 8) -> str:
+    """Return a compact snippet of relevant def/class signatures from the graph.
+
+    Used in _write_plan_next_item to inject cross-file context so the model
+    knows what functions/classes are already available in sibling files.
+    Returns "" when no signatures are found or the graph is unavailable.
+    """
+    if graph is None:
+        return ""
+    try:
+        nodes = graph.search(goal[:80], top_n=max_sigs, node_types=["skill"])
+        sigs = [
+            n["content"] for n in nodes
+            if n.get("metadata", {}).get("kind") == "code_sig"
+        ]
+        if not sigs:
+            return ""
+        return "# Available from other project files:\n" + "\n".join(sigs[:max_sigs])
+    except Exception as exc:
+        logger.debug("pipeline: _get_graph_sigs failed: %s", exc)
         return ""
 
 

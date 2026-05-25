@@ -12,7 +12,11 @@ the user.
 
 Design notes
 ------------
-- Updates existing graph nodes by label (avoids duplicate facts).
+- Context-aware extraction: existing graph nodes related to the current
+  conversation are injected into the prompt BEFORE the LLM call.  The
+  model can then reuse an existing label instead of inventing a new one,
+  preventing semantic duplicates at the source rather than post-hoc.
+- Exact-name dedup is handled by upsert_node's key lookup.
 - Falls back silently on any parse error — extraction is best-effort.
 - Uses temperature=0.1 to keep JSON output stable.
 """
@@ -41,12 +45,19 @@ def _extract_and_index():
     from engine.memory.retrieval import extract_and_index
     return extract_and_index
 
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
+# {existing_block} is injected at call time with existing graph nodes relevant
+# to this conversation.  When the block is non-empty, the model sees what labels
+# already exist and is instructed to reuse them — this is the primary defence
+# against duplicate nodes, replacing any post-hoc fuzzy matching.
 _PROMPT = """\
 Analyze this conversation turn and extract new information worth remembering.
 
 USER: {user_msg}
 ASSISTANT: {asst_msg}
-
+{existing_block}
 Return ONLY a JSON object:
 {{
   "facts": [
@@ -64,10 +75,15 @@ Type guide for facts — pick the single best fit:
   preference  — how the user wants things done
 
 Rules:
-- Only include genuinely NEW, specific information not already obvious.
+- If an EXISTING NODE above already covers this information, use that EXACT label.
+  Never create a new node for the same concept under a different name.
+- Only include genuinely NEW information not already captured by existing nodes.
 - Omit greetings, filler, or generic statements.
 - Return empty lists if nothing notable.
 - Return valid JSON only, no explanation."""
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 # Valid node types the extractor may write — enforced in code as a hard allowlist.
 # Any composite or unknown type the model produces is normalised to "fact".
@@ -114,70 +130,50 @@ def _is_junk_label(label: str) -> bool:
     )
 
 
-def _normalise_label(s: str) -> str:
-    """Canonical form for dedup comparison.
+def _build_existing_context(kg, conversation: str) -> str:
+    """Query the graph for nodes relevant to this conversation and format them
+    for injection into the extraction prompt.
 
-    Lowercases, replaces underscores/hyphens with spaces, collapses runs of
-    whitespace, and strips leading/trailing punctuation.  This ensures that
-    "vim_preference", "vim-tabs-over-spaces", "vim editor preference",
-    "vim/tabs_over_spaces", and "VIM Preference" all compare as near-identical
-    rather than generating separate nodes for the same concept.
+    The LLM sees these existing labels and is instructed to reuse them rather
+    than inventing new names — this prevents semantic duplicates at the source.
+    Returns an empty string when the graph is empty or the query fails.
     """
-    import re
-    s = s.lower()
-    s = re.sub(r"[_\-/\\]", " ", s)         # separators → space
-    s = re.sub(r"[^\w\s]", "", s)            # strip punctuation
-    s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace
-    return s
-
-
-def _jaccard(a: str, b: str) -> float:
-    """Token-level Jaccard similarity between two strings."""
-    ta = set(a.lower().split())
-    tb = set(b.lower().split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
-def _find_similar_node(graph, label: str, content: str, threshold: float = 0.75) -> str | None:
-    """Return the name of an existing graph node similar to *label*, or None.
-
-    Similarity is computed as token-level Jaccard on the node name.  Labels are
-    normalised first (lowercase, separators → space, punctuation stripped) so
-    stylistic variants like "vim_preference" and "vim editor preference" match.
-    When label similarity is moderate (≥ 0.5) the content is also compared —
-    two facts about the same topic but stated differently still count as
-    duplicates if their content overlaps substantially.
-    """
-    norm_label = _normalise_label(label)
     try:
-        candidates = graph.search(label, top_k=5)
-        for node in candidates:
-            existing_name = node.get("name", "")
-            if not existing_name:
-                continue
-            # Exact match — let upsert_node handle it
-            if existing_name.lower().strip() == label.lower().strip():
-                return existing_name
-            # Normalised exact match (catches vim_preference == vim preference)
-            if _normalise_label(existing_name) == norm_label:
-                return existing_name
-            # Jaccard on normalised forms — lower threshold (0.6) because
-            # normalisation already strips noise; 0.75 was too strict for
-            # multi-word stylistic variants of the same concept.
-            label_sim = _jaccard(norm_label, _normalise_label(existing_name))
-            if label_sim >= 0.6:
-                return existing_name
-            # Moderate label overlap: check content too
-            if label_sim >= 0.4:
-                content_sim = _jaccard(content, node.get("summary", ""))
-                if content_sim >= 0.55:
-                    return existing_name
+        hits = kg.search(conversation[:400], top_k=8)
+        if not hits:
+            return ""
+        lines = []
+        for h in hits:
+            name = h.get("name") or h.get("label", "")
+            summary = (h.get("summary") or h.get("content", ""))[:120]
+            ntype = h.get("type", "?")
+            if name and summary:
+                lines.append(f'  "{name}" [{ntype}]: {summary}')
+        if not lines:
+            return ""
+        return (
+            "\nExisting memory nodes — if the conversation covers the same topic as any "
+            "of these, use that EXACT label (do not create a new node):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
     except Exception:
-        pass
-    return None
+        return ""
 
+
+def _parse_json(text: str) -> dict | None:
+    """Tolerant JSON parser — finds the first {...} block in model output."""
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+
+
+# ── Extractor class ───────────────────────────────────────────────────────────
 
 class MemoryExtractor:
 
@@ -234,9 +230,18 @@ class MemoryExtractor:
                 logger.debug("NER extraction skipped: %s", ner_exc)
             return
 
+        # ── Resolve graph and build context block BEFORE the LLM call ────────
+        # Injecting existing relevant nodes lets the model reuse existing labels
+        # rather than inventing new ones — the primary dedup mechanism.
+        kg = _knowledge_graph()
+        existing_block = _build_existing_context(
+            kg, f"{user_message} {assistant_response}"
+        )
+
         prompt = _PROMPT.format(
             user_msg=user_message[:600],
             asst_msg=assistant_response[:1200],
+            existing_block=existing_block,
         )
         try:
             result = await self.client.generate(
@@ -253,7 +258,6 @@ class MemoryExtractor:
                 return
 
             saved_facts, saved_arts = 0, 0
-            kg = _knowledge_graph()
             # Tracks (final_label, ftype) for every fact actually written —
             # used below to create graph edges between related facts.
             saved: list[tuple[str, str]] = []
@@ -265,39 +269,18 @@ class MemoryExtractor:
                 if not label or not content:
                     continue
 
-                # ── Quality guard ─────────────────────────────────────────────
-                # Reject labels that are verbatim prompt-template placeholders
-                # (the model sometimes copies "short unique name" etc. literally).
+                # Reject labels that are verbatim prompt-template placeholders.
                 if _is_junk_label(label):
                     logger.debug("extractor: dropped junk label %r", label[:40])
                     continue
 
-                # ── Fuzzy dedup ───────────────────────────────────────────────
-                # Exact-name match is already handled by upsert_node's key lookup.
-                # Also check for near-duplicate labels (Jaccard ≥ 0.75) so the
-                # same fact stated slightly differently enriches the existing node
-                # instead of creating a separate one.
-                existing_name = _find_similar_node(kg, label, content)
-                if existing_name and existing_name.lower().strip() != label.lower().strip():
-                    # Enrich: append new content only if not already captured
-                    existing_node = kg.get_node(existing_name) or {}
-                    existing_summary = existing_node.get("summary", "")
-                    if content.lower()[:50] not in existing_summary.lower():
-                        merged = f"{existing_summary} | {content}"[:500]
-                    else:
-                        merged = existing_summary
-                    kg.upsert_node(existing_name, ftype, summary=merged)
-                    final_label = existing_name
-                    logger.debug(
-                        "extractor: merged %r → existing node %r",
-                        label[:40], existing_name[:40],
-                    )
-                else:
-                    # Exact match or new node — upsert handles both
-                    kg.upsert_node(label, ftype, summary=content)
-                    final_label = label
+                # upsert_node merges into the existing node when the label matches
+                # exactly — that handles the happy path where the model correctly
+                # reused an existing label from the injected context block.
+                kg.upsert_node(label, ftype, summary=content)
                 saved_facts += 1
-                saved.append((final_label, ftype))
+                saved.append((label, ftype))
+                logger.debug("extractor: saved [%s] %r", ftype, label[:40])
 
             # ── Create graph edges ────────────────────────────────────────────
             # (1) Type-specific edges: anchor preferences/projects/concepts to
@@ -310,9 +293,6 @@ class MemoryExtractor:
                         kg.upsert_edge("user", "works_on", final_label, weight=1.0)
                     elif ftype == "concept":
                         kg.upsert_edge("user", "knows_about", final_label, weight=0.6)
-                    elif ftype == "fact":
-                        # Facts about a visible project get linked there too
-                        pass  # handled by co-occurrence below
                 except Exception as _edge_exc:
                     logger.debug("extractor: type-edge failed: %s", _edge_exc)
 
@@ -322,7 +302,6 @@ class MemoryExtractor:
                 for j in range(i + 1, min(i + 4, len(saved))):
                     a_lbl, a_type = saved[i]
                     b_lbl, b_type = saved[j]
-                    # Only link if sharing a meaningful type or one is a hub type
                     if (a_type == b_type
                             or a_type in ("concept", "project")
                             or b_type in ("concept", "project")):
@@ -361,17 +340,3 @@ class MemoryExtractor:
 
         except Exception as exc:
             logger.warning("Memory extraction failed: %s", exc)
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _parse_json(text: str) -> dict | None:
-    """Tolerant JSON parser — finds the first {...} block in model output."""
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end <= start:
-        return None
-    try:
-        return json.loads(text[start:end])
-    except json.JSONDecodeError:
-        return None

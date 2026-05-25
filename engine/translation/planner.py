@@ -626,14 +626,13 @@ steps="" ONLY for pure social/conversational replies that need no factual lookup
   capability questions (what can you do?), existential questions (are you alive?).
   Do NOT use steps="" for any factual question or arithmetic — those always need a tool.
 
-steps="Search KEYWORDS" for ANY question with a factual answer: capitals, people,
+steps="Search KEYWORDS" for factual questions that cannot be computed: capitals, people,
   history, definitions, events, versions, how-to procedures, prices, commands.
-  Search even when the answer seems obvious — small models hallucinate. Always prefer
-  a real answer from the web over a confident guess.
+  Do NOT use Search for arithmetic or math — use Run for those.
 
-steps="Run COMMAND" for TEMPORARY scratch work: one-off checks, quick computations,
-  utility scripts the agent needs to verify a result. Write to a file, run it,
-  done. Use a descriptive filename. Always use the full workspace path in the command.
+steps="Run COMMAND" for shell actions and TEMPORARY scratch work: one-off checks,
+  file system operations, running scripts, installing packages.
+  Example: steps="Run mkdir test123"
   Example: steps="Run echo 'import sys; print(int(sys.argv[1])+int(sys.argv[2]))' > WORKSPACE/add.py | Run python WORKSPACE/add.py 5 3"
 
 steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to create
@@ -646,9 +645,6 @@ steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to cre
   argparse), never hardcoded values. Task "sum 5 and 3" → write sum.py that reads
   sys.argv[1] and sys.argv[2], then Run python WORKSPACE/sum.py 5 3.
   Programs with baked-in constants are one-offs; programs that read sys.argv are skills.
-
-steps="Run COMMAND" only for running already-existing files or installing
-  packages with a known manager (pip install X, npm install Y).
 
 steps="Save: FACT" only when the user says: remember / save / note / keep in mind.
 

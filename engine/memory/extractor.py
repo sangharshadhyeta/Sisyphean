@@ -139,7 +139,7 @@ def _build_existing_context(kg, conversation: str) -> str:
     Returns an empty string when the graph is empty or the query fails.
     """
     try:
-        hits = kg.search(conversation[:400], top_k=8)
+        hits = kg.search(conversation[:400], limit=8)
         if not hits:
             return ""
         lines = []
@@ -274,9 +274,15 @@ class MemoryExtractor:
                     logger.debug("extractor: dropped junk label %r", label[:40])
                     continue
 
-                # upsert_node merges into the existing node when the label matches
-                # exactly — that handles the happy path where the model correctly
-                # reused an existing label from the injected context block.
+                # Merge content into existing node rather than overwriting.
+                # When the LLM reuses an existing label (the dedup happy path),
+                # the new content should enrich, not replace, the stored summary.
+                # Append only if the new content isn't already captured.
+                existing = kg.get_node(label)
+                if existing:
+                    existing_summary = existing.get("summary", "")
+                    if content.lower()[:60] not in existing_summary.lower():
+                        content = f"{existing_summary} | {content}"[:500]
                 kg.upsert_node(label, ftype, summary=content)
                 saved_facts += 1
                 saved.append((label, ftype))

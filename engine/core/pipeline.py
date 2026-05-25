@@ -173,6 +173,69 @@ WHEN TO USE web_fetch:
 If the result already fully answers the task, reply: {"steps": ""}"""
 
 
+# ── Pre-routing layer ────────────────────────────────────────────────────────
+# Handles unambiguous request categories BEFORE think_decompose fires.
+# The small model (0.6b) is unreliable for social/capability routing — it routes
+# "what can you do?" to web_search instead of a direct answer, adding 3+ LLM
+# calls and an HTTP round-trip. These patterns are deterministic so the pre-router
+# handles them in O(1), eliminating the routing instability at the source.
+# Only catches categories where model behaviour is systematically wrong; everything
+# else falls through to think_decompose as before.
+
+_SOCIAL_EXACT = frozenset({
+    "hi", "hello", "hey", "bye", "goodbye",
+    "thanks", "thank you", "thx", "cheers", "ty",
+    "ok", "okay", "yes", "no", "sure", "noted", "got it",
+    "sounds good", "alright", "cool", "great", "no problem",
+})
+_CAPABILITY_RE = re.compile(
+    r"what can you do|can you help|what are you capable|what do you do"
+    r"|are you alive|are you real|who are you|what are you|are you a bot"
+    r"|are you an ai|what model|what version",
+    re.I,
+)
+_MATH_RE = re.compile(r"^\s*[\d\s\+\-\*\/\^\(\)\.]+\s*[\?=]?\s*$")
+_SAVE_RE  = re.compile(r"^(remember|save|note|keep in mind)\s+.{4,}", re.I)
+
+
+def _pre_route_query(query: str) -> str | None:
+    """Return a stage type to bypass think_decompose, or None to proceed normally.
+
+    Catches well-defined categories where the small model routes incorrectly:
+      direct      — social exchanges, capability/identity questions, pure math
+      save_memory — "remember X", "save: X", "note X"
+
+    Nothing else is pre-routed; think_decompose owns all other decisions.
+    """
+    q = query.strip().lower().rstrip("!.,?")
+
+    # Exact-match short social exchanges
+    if q in _SOCIAL_EXACT:
+        return "direct"
+
+    # Greeting prefix
+    if re.match(r"^(hi|hello|hey|good (morning|evening|afternoon|night))\b", q):
+        return "direct"
+
+    # Thanks / acknowledgement prefix
+    if re.match(r"^(thanks?|thank you|cheers|good work|well done)\b", q):
+        return "direct"
+
+    # Capability / identity / existence questions — never need a web search
+    if _CAPABILITY_RE.search(q):
+        return "direct"
+
+    # Pure arithmetic expressions ("2+2", "12/4", "5 * 3")
+    if _MATH_RE.match(query.strip()):
+        return "direct"
+
+    # Memory saves — "remember I prefer vim", "save: I use Python 3.12", etc.
+    if _SAVE_RE.match(query.strip()):
+        return "save_memory"
+
+    return None
+
+
 def _result_quality(result: dict) -> str:
     """Grade a step result: 'good' | 'weak' | 'empty' | 'error'."""
     content = str(result.get("result", "")).strip()
@@ -433,7 +496,7 @@ class Pipeline:
         # ── Stage 2: Decompose into stages ───────────────────────────────────
         # If BirdClaw already ran generate_plan() (thinking=True) before routing
         # here, use that plan directly — no duplicate LLM planning call.
-        # Otherwise fall back to think_decompose() (standalone Sisyphean path).
+        # Otherwise: try the fast pre-router first, then fall back to think_decompose.
         if bc_plan is not None:
             outcome, stages = bc_plan
             _tracker.tree_context_running(task_id, "birdclaw-plan")
@@ -441,29 +504,35 @@ class Pipeline:
             logger.info("pipeline: using BirdClaw plan — outcome=%r stages=%s",
                         outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
         else:
-            # One thinking-enabled planning call that reasons about the task
-            # before any execution begins. Returns (outcome, stages) where each
-            # stage has a type (research/write_code/verify/direct/…) and a
-            # plain-English goal. Sets PIPELINE_STATE accurately from the very
-            # first API turn — the full plan is visible before execution starts.
-            _tracker.tree_context_running(task_id, "think-decompose")
-            outcome, stages = await think_decompose(
-                query, self.client,
-                context=top_context,
-                soul_section=soul_section,
-                workspace=self.workspace,
-                skill_index=skill_index,
-            )
-            _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
-            logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
-                        [(s["type"], s["goal"][:40]) for s in stages])
+            # ── Fast pre-routing (no LLM) ─────────────────────────────────────
+            # Handles categories where the small model routes incorrectly:
+            # social exchanges, capability questions, save_memory, pure math.
+            # think_decompose is only called for everything else.
+            pre_routed_type = _pre_route_query(query)
+            if pre_routed_type is not None:
+                outcome = query[:80]
+                stages  = [{"type": pre_routed_type, "goal": query}]
+                _tracker.tree_context_running(task_id, "pre-route")
+                _tracker.tree_context_done(task_id, f"pre-routed → {pre_routed_type}")
+                logger.info("pipeline: pre-routed %r → %s", query[:60], pre_routed_type)
+            else:
+                # Full LLM planning call for everything else
+                _tracker.tree_context_running(task_id, "think-decompose")
+                outcome, stages = await think_decompose(
+                    query, self.client,
+                    context=top_context,
+                    soul_section=soul_section,
+                    workspace=self.workspace,
+                    skill_index=skill_index,
+                )
+                _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
+                logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
+                            [(s["type"], s["goal"][:40]) for s in stages])
 
         # Fall back only if think_decompose raised an exception (it now explicitly
         # returns a "direct" stage when the model decides steps="").
         if not stages:
             stages = [{"type": infer_stage_type(query), "goal": query}]
-
-        # No hardcoded routing overrides — think_decompose() owns all routing decisions.
 
         # ── Project expansion: write_project stages → per-file write_code stages ──
         # When think_decompose returns a single write_project/write_code stage for a

@@ -81,6 +81,8 @@ const TOOL_COLOR = {
   save_memory:'#ec4899', remember:'#ec4899',
   answer:'#a855f7', synthesize:'#34d399',
   bash:'#eab308', write:'#7c3aed', write_plan:'#6d28d9',
+  write_code:'#22c55e', write_doc:'#6ab0f5', write_project:'#f59e0b',
+  import_check:'#34d399', fix_read:'#fb923c',
   read:'#10b981', glob:'#34d399', grep:'#6ee7b7', edit:'#f59e0b',
   plan:'#818cf8', planner:'#818cf8',
   default:'#475569',
@@ -710,6 +712,8 @@ function EventRow({ r }) {
     bash:'#eab308', answer:'#34d399', synthesize:'#34d399',
     plan:'#818cf8', search:'#06b6d4', web_search:'#06b6d4',
     write:'#7c3aed', read:'#10b981',
+    import_check:'#34d399', fix_read:'#fb923c',
+    write_code:'#22c55e', write_doc:'#6ab0f5', write_project:'#f59e0b',
   }[d.action] || '#cbd5e1';
 
   const hasDetail = d.result || d.answer_preview || d.steps;

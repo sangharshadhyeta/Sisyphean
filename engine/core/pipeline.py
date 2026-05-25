@@ -907,10 +907,17 @@ class Pipeline:
                 else:
                     state.bash_retry_count = 0
 
-            # Mark outer tool as done in dashboard
+            # Mark outer tool as done in dashboard.
+            # Use display-friendly type for special steps so the dashboard
+            # can colour them distinctly: import_check (green) and fix_read (orange).
+            _display_tool = outer_tool
+            if outer_step.get("_import_verify"):
+                _display_tool = "import_check"
+            elif outer_step.get("_fix_error"):
+                _display_tool = "fix_read"
             _tracker.tree_subtask_step(
                 state.task_id, state.current_task_idx,
-                outer_tool, outer_input, tr[:200], status="done",
+                _display_tool, outer_input, tr[:200], status="done",
             )
 
         # Advance step index
@@ -3078,19 +3085,20 @@ def _render_project_progress(state: "PipelineState") -> str:  # type: ignore[nam
     if len(write_tasks) <= 1:
         return ""
 
-    lines = ["**Project progress:**"]
+    checklist = []
     for task_idx, t in write_tasks:
         goal = t.get("task", "")
         # Extract "models.py" from "Write models.py: Todo dataclass..."
         fn_m = re.search(r'\b([A-Za-z0-9_\-]+\.[a-z]{2,5})\b', goal)
         label = fn_m.group(1) if fn_m else goal[:30]
         if task_idx < state.current_task_idx:
-            lines.append(f"  [done] {label}")
+            checklist.append(f"[done] {label}")
         elif task_idx == state.current_task_idx:
-            lines.append(f"  [ --> ] {label}  (writing)")
+            checklist.append(f"[ --> ] {label}  (writing)")
         else:
-            lines.append(f"  [    ] {label}")
-    return "\n".join(lines)
+            checklist.append(f"[    ] {label}")
+    inner = "\n".join(checklist)
+    return f"**Project progress:**\n```\n{inner}\n```"
 
 
 def _extract_tool_results(raw_history: list[dict]) -> list[str]:

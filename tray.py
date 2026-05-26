@@ -267,7 +267,7 @@ def build_tray() -> pystray.Icon:
         name="Sisyphean",
         icon=_load_icon(_status_cache["status"]),
         title="Sisyphean",
-        on_activate=lambda i, _: webbrowser.open(ENGINE_DASH),
+        on_activate=lambda i, _: webbrowser.open(BC_UI_URL),
     )
 
     # ── Refresh helpers ────────────────────────────────────────────────────────
@@ -449,10 +449,9 @@ def _watchdog(icon: pystray.Icon):
             start_engine()
             time.sleep(2)
 
-        # BirdClaw (only if installed and was running before)
+        # BirdClaw — restart if it crashed (respects _bc_paused from Stop menu)
         if _BC_DIR and not _bc_paused and not _bc_running():
-            # Don't auto-start BirdClaw — user must start it explicitly
-            pass
+            start_birdclaw()
 
         # Refresh icon from live status
         s = _engine_status()
@@ -462,13 +461,36 @@ def _watchdog(icon: pystray.Icon):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def _open_browser_when_ready(url: str, port: int, timeout: float = 20.0):
+    """Wait until the service is up then open url in the default browser."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _port_open(port):
+            webbrowser.open(url)
+            return
+        time.sleep(0.4)
+    # Open anyway even if we timed out — better than silently not opening
+    webbrowser.open(url)
+
+
 def main():
     import traceback
     _tray_log = HERE / "tray.log"
     try:
-        start_engine()          # start engine on tray launch
+        # Start both services on launch
+        start_engine()
+        start_birdclaw()
+
         icon = build_tray()
         threading.Thread(target=_watchdog, args=(icon,), daemon=True).start()
+
+        # Open BirdClaw in the browser once it's ready (non-blocking)
+        threading.Thread(
+            target=_open_browser_when_ready,
+            args=(BC_UI_URL, _BC_PORT),
+            daemon=True,
+        ).start()
+
         icon.run()              # blocks until icon.stop() is called
     except Exception:
         with open(_tray_log, "a", encoding="utf-8") as f:

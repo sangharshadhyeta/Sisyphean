@@ -165,6 +165,26 @@ async def run_dream(
             logger.warning("dream: skill discovery pass failed: %s", exc)
             result.errors = (result.errors or []) + [f"skill_discovery: {exc}"]
 
+    # ── Skills sync pass ─────────────────────────────────────────────────────
+    # Re-scan skills/ and upsert skill nodes so any script added (manually or
+    # promoted by the discovery pass above) is immediately visible in the graph.
+    # Uses the same seed_skill_graph() called at engine startup — idempotent.
+    try:
+        from engine.memory.graph import seed_skill_graph, knowledge_graph
+        from engine.config import load_config as _lcfg
+        _scfg = _lcfg()
+        _skills_path = Path(getattr(_scfg, "skills_path", "skills"))
+        if _skills_path.is_dir():
+            if not dry_run:
+                seed_skill_graph(knowledge_graph, _skills_path)
+                logger.info("dream: skills/ synced → graph refreshed")
+            else:
+                _count = sum(1 for f in _skills_path.glob("*.py"))
+                logger.info("dream: --dry-run — would sync %d skill scripts", _count)
+    except Exception as exc:
+        logger.warning("dream: skills sync pass failed: %s", exc)
+        result.errors = (result.errors or []) + [f"skills_sync: {exc}"]
+
     # ── Cleanup pass ──────────────────────────────────────────────────────────
     if cleanup:
         try:

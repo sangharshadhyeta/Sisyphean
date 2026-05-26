@@ -147,6 +147,18 @@ _STEP_NUMBER_RE = re.compile(
     r'^(?:step\s*\d+\s*[:.)]\s*|\d+\s*[:.)]\s*)',
     re.IGNORECASE,
 )
+# Fast-path patterns — skip the LLM for trivially social messages
+_GREETING_RE = re.compile(
+    r'^\s*(?:hi|hello|hey|howdy|greetings|sup|yo)'
+    r'(?:\s+(?:there|everyone|all|friend))?\s*[!?.]*\s*$',
+    re.IGNORECASE,
+)
+_SOCIAL_RE = re.compile(
+    r'^\s*(?:thanks?(?:\s+you)?|thank\s+you|thx|ty|cheers'
+    r'|ok(?:ay)?|sure|got\s+it|sounds?\s+good|great|cool|nice'
+    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)\s*[!?.]*\s*$',
+    re.IGNORECASE,
+)
 
 
 def infer_stage_type(step_text: str) -> str:
@@ -682,12 +694,19 @@ async def think_decompose(
 
     The LLM decides routing — greetings, social replies, capability questions
     all return steps="" (direct) based on the prompt instructions.
-    No regex pre-filters: the model owns the routing decision.
+
+    Fast-path bypasses LLM for trivial social messages (_GREETING_RE, _SOCIAL_RE)
+    to avoid a wasted model call for "hi", "thanks", "ok", etc.
 
     skill_index: compact bullet list from get_skill_index() — tells the model
     which skills it already has for this task so it can plan a read_skill step
     instead of rediscovering from scratch.
     """
+    # Fast path — skip LLM entirely for trivial social inputs
+    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query):
+        logger.debug("think_decompose: social fast-path for %r", query[:40])
+        return query[:80], [{"type": "direct", "goal": query}]
+
     prompt = f"Task: {query[:300]}"
     if workspace:
         prompt += f"\nWorkspace (write ALL task files here): {workspace}"

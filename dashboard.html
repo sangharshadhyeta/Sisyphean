@@ -860,24 +860,42 @@ function MemoryGraphPane({ graph, h, splitMode }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SECTION LABEL  — thin uppercase divider used throughout
+// ═══════════════════════════════════════════════════════════════════════════════
+function SectionLabel({ children, count }) {
+  return (
+    <div className="flex items-center gap-3 px-1 mb-2">
+      <span className="text-slate-500 text-xs uppercase tracking-widest">{children}</span>
+      {count !== undefined && count > 0 && (
+        <span style={{background:'#1e2235',color:'#6366f1',borderRadius:4,
+                      padding:'1px 7px',fontSize:10,fontWeight:700}}>
+          {count}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function App() {
-  const [status, setStatus] = useState(null);
-  const [tasks,  setTasks]  = useState([]);
-  const [graph,  setGraph]  = useState({ nodes: [], edges: [] });
-  const [error,  setError]  = useState(null);
+  const [status,    setStatus]    = useState(null);
+  const [tasks,     setTasks]     = useState([]);
+  const [graph,     setGraph]     = useState({ nodes: [], edges: [] });
+  const [error,     setError]     = useState(null);
   const [lastFetch, setLastFetch] = useState(null);
-  const [paneH,  setPaneH]  = useState(500);
-  const paneRef = useRef(null);
+  const [graphH,    setGraphH]    = useState(480);
+  const graphRef = useRef(null);
 
-  // Adaptive pane height
+  // Graph height tracks its own container
   useEffect(() => {
+    if (!graphRef.current) return;
     const obs = new ResizeObserver(entries => {
-      for (const e of entries) setPaneH(Math.max(350, e.contentRect.height - 20));
+      for (const e of entries) setGraphH(Math.max(400, e.contentRect.width * 0.32));
     });
-    if (paneRef.current) obs.observe(paneRef.current);
+    obs.observe(graphRef.current);
     return () => obs.disconnect();
   }, []);
 
@@ -904,11 +922,12 @@ function App() {
     return () => clearInterval(id);
   }, [fetchAll]);
 
-  const running   = tasks.find(t => t.status === 'running');
-  const completed = tasks.find(t => t.status !== 'running');
+  const runningTasks  = tasks.filter(t => t.status === 'running');
+  const finishedTasks = tasks.filter(t => t.status !== 'running');
 
   return (
-    <div className="min-h-screen p-5 flex flex-col gap-5 max-w-screen-xl mx-auto">
+    // Full-width container — no max-width cap so the graph can use the whole screen
+    <div className="min-h-screen flex flex-col gap-5" style={{padding:'20px 24px'}}>
 
       {/* ── Header ─────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
@@ -955,50 +974,49 @@ function App() {
             </div>
           </div>
 
-          {/* ── Active task: execution timeline + memory graph ────────── */}
-          {running ? (
-            <div>
-              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
-                Active task
-              </div>
-              <div ref={paneRef} className="card overflow-hidden"
-                   style={{ display:'grid', gridTemplateColumns:'55fr 45fr', minHeight:480 }}>
-                {/* Left — live execution timeline */}
-                <div className="border-r border-slate-800/60"
-                     style={{ height: paneH, overflow:'hidden' }}>
-                  <ExecutionTimeline task={running}/>
-                </div>
-                {/* Right — memory graph */}
-                <MemoryGraphPane graph={graph} h={paneH} splitMode/>
-              </div>
+          {/* ── Memory Graph — always full width ──────────────────── */}
+          <div>
+            <SectionLabel>Memory Graph</SectionLabel>
+            <div ref={graphRef} className="card overflow-hidden" style={{width:'100%'}}>
+              <MemoryGraphPane graph={graph} h={graphH} splitMode={false}/>
             </div>
-          ) : (
-            /* ── Memory graph full-width when idle ──────────────────── */
+          </div>
+
+          {/* ── Active Tasks — all running tasks ──────────────────── */}
+          {runningTasks.length > 0 && (
             <div>
-              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
-                Memory Graph
-              </div>
-              <div ref={paneRef} className="card overflow-hidden">
-                <MemoryGraphPane graph={graph} h={Math.max(420, paneH)} splitMode={false}/>
+              <SectionLabel count={runningTasks.length}>Active Tasks</SectionLabel>
+              <div className="flex flex-col gap-3">
+                {runningTasks.map(task => (
+                  <div key={task.id || task.session}
+                       className="card overflow-hidden"
+                       style={{maxHeight: 500}}>
+                    <ExecutionTimeline task={task}/>
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
-          {/* ── Last completed task — always shown below ───────────── */}
-          {completed && (
+          {/* ── Recent Tasks — all finished tasks ─────────────────── */}
+          {finishedTasks.length > 0 && (
             <div>
-              <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">
-                Last completed
-              </div>
-              <div className="card overflow-hidden" style={{ maxHeight: 600 }}>
-                <ExecutionTimeline task={completed}/>
+              <SectionLabel>Recent Tasks</SectionLabel>
+              <div className="flex flex-col gap-3">
+                {finishedTasks.map(task => (
+                  <div key={task.id || task.session}
+                       className="card overflow-hidden"
+                       style={{maxHeight: 420}}>
+                    <ExecutionTimeline task={task}/>
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
           {/* ── Agent activity ─────────────────────────────────────── */}
           <div>
-            <div className="text-slate-500 text-xs uppercase tracking-widest mb-2 px-1">Agent Activity</div>
+            <SectionLabel>Agent Activity</SectionLabel>
             <ActivityPanel events={status.recent || []} />
           </div>
         </>

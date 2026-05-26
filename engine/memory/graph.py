@@ -329,6 +329,7 @@ class GraphStore:
                 existing.update(sources or [])
                 node["sources"] = list(existing)
                 node["last_seen"] = ts
+                node["type"] = node_type          # always honour the declared type
                 if summary:
                     node["summary"] = summary
                 node.update(extra)

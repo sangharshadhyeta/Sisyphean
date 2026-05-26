@@ -265,16 +265,19 @@ def tree_synthesizer_done(task_id: str, output: str = "") -> None:
 
 
 def active_tasks(n: int = 10) -> list[dict]:
-    """Return latest running task + most recently completed task."""
+    """Return all running tasks + most-recently-finished tasks, up to n total."""
     _expire_stale()
     all_tasks = list(_tasks.values())
     running  = [t for t in all_tasks if t["status"] == "running"]
-    finished = [t for t in all_tasks if t["status"] != "running"]
-    result: list[dict] = []
-    if running:
-        result.append(running[-1])
-    if finished:
-        result.append(finished[-1])
+    finished = sorted(
+        [t for t in all_tasks if t["status"] != "running"],
+        key=lambda t: t.get("finished_at") or t.get("started_at") or 0,
+        reverse=True,
+    )
+    # All running tasks first, then fill remaining slots with finished
+    result = list(running)
+    slots_left = max(0, n - len(result))
+    result.extend(finished[:slots_left])
     return result
 
 

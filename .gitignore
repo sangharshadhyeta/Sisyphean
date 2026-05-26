@@ -44,6 +44,9 @@ last_request.json
 # Memory (user data, not source) — only the root-level memory/ dir, not engine/memory/
 /memory/
 
+# Code indexer mtime cache (generated, not source)
+*.sisyphean_index_cache.json
+
 # BirdClaw is its own repo
 birdclaw/
 

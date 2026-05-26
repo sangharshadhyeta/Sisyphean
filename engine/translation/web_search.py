@@ -111,9 +111,13 @@ async def _search_searxng(
             data = resp.json()
         results = []
         for item in data.get("results", [])[:n]:
+            url = item.get("url", "")
+            # Normalise protocol-relative URLs ("//example.com") to https.
+            if url.startswith("//"):
+                url = f"https:{url}"
             results.append(SearchResult(
                 title=item.get("title", ""),
-                url=item.get("url", ""),
+                url=url,
                 snippet=item.get("content", "")[:500],
             ))
         return results

@@ -902,9 +902,12 @@ class Pipeline:
 
             # Mark outer tool as done in dashboard.
             # Use display-friendly type for special steps so the dashboard
-            # can colour them distinctly: import_check (green) and fix_read (orange).
+            # can colour them distinctly: import_check (green), fix_read (orange),
+            # and skill names (pink — e.g. "arxiv", "youtube").
             _display_tool = outer_tool
-            if outer_step.get("_import_verify"):
+            if outer_step.get("_skill_name"):
+                _display_tool = outer_step["_skill_name"]
+            elif outer_step.get("_import_verify"):
                 _display_tool = "import_check"
             elif outer_step.get("_fix_error"):
                 _display_tool = "fix_read"
@@ -1112,6 +1115,9 @@ class Pipeline:
                             logger.info(
                                 "pipeline: run_skill %r → bash: %s", inp[:40], _cmd
                             )
+                            # Preserve skill name so the dashboard shows "arxiv" in
+                            # pink rather than a generic "bash" step.
+                            step["_skill_name"] = inp.strip()
                             step["tool"]  = "bash"
                             step["input"] = _cmd
                             tool = "bash"
@@ -1178,10 +1184,13 @@ class Pipeline:
                          data={"action": "bash", "tool": tool, "input": inp[:200],
                                "task_idx": state.current_task_idx,
                                "step_idx": state.current_step_idx})
-                    # Mark as running in dashboard so outer tools are visible
+                    # Mark as running in dashboard so outer tools are visible.
+                    # Use skill name if this step was originally a run_skill invocation
+                    # so the dashboard shows e.g. "arxiv" (pink) not "bash" (yellow).
+                    _run_display = step.get("_skill_name", tool)
                     _tracker.tree_subtask_step(
                         state.task_id, state.current_task_idx,
-                        tool, inp, "", status="running",
+                        _run_display, inp, "", status="running",
                     )
                     # Find canonical name
                     canonical = next(
@@ -1554,6 +1563,14 @@ class Pipeline:
                     tool_name, _, inp = part.partition(":")
                     tool_name = tool_name.strip().lower()
                     inp = inp.strip()
+                    # Model sometimes outputs raw URLs like "https://..." instead of
+                    # "web_fetch:https://..." — reconstruct as a web_fetch step.
+                    if tool_name in ("http", "https"):
+                        inp = f"{tool_name}:{inp}"
+                        tool_name = "web_fetch"
+                    # Normalise protocol-relative URLs ("//example.com") to https.
+                    if inp.startswith("//"):
+                        inp = f"https:{inp}"
                     if tool_name and inp:
                         steps.append({"tool": tool_name, "input": inp})
             logger.debug("pipeline: replan → %d steps", len(steps))
@@ -2421,6 +2438,8 @@ class Pipeline:
                 fetched_parts: list[str] = []
                 for r in raw[:3]:
                     url = getattr(r, "url", "") or ""
+                    if url.startswith("//"):
+                        url = f"https:{url}"
                     if not url.startswith("http"):
                         continue
                     try:
@@ -2444,6 +2463,9 @@ class Pipeline:
             # Triggered by replan steps like "web_fetch:https://docs.example.com/page"
             # when search snippets are too thin to act on directly.
             url = inp.strip()
+            # Normalise protocol-relative URLs returned by some search engines.
+            if url.startswith("//"):
+                url = f"https:{url}"
             if not url.startswith("http"):
                 return {"tool": tool, "input": url, "result": "(invalid URL — must start with http)",
                         "summary": "invalid URL"}

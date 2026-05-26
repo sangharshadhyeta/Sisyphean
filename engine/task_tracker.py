@@ -169,8 +169,15 @@ def tree_plan_done(task_id: str, sub_tasks: list[dict]) -> None:
             "text": st["task"][:120],
             "status": "pending",
             "steps": [
-                {"type": s["tool"], "input": s["input"][:200],
-                 "output": "", "status": "pending", "ts": now}
+                {
+                    # For run_skill steps, use the skill name as the display type
+                    # so the dashboard shows "arxiv" / "youtube" (pink) rather than
+                    # the generic "run_skill" label.
+                    "type": s["input"].strip() if s["tool"] == "run_skill" else s["tool"],
+                    "is_skill": s["tool"] == "run_skill",
+                    "input": s["input"][:200],
+                    "output": "", "status": "pending", "ts": now,
+                }
                 for s in st.get("steps", [])
             ],
         }
@@ -194,8 +201,11 @@ def tree_subtask_replanned(task_id: str, task_idx: int,
         return
     now = round(time.time())
     for s in new_steps:
+        _is_skill = s["tool"] == "run_skill"
         subs[task_idx]["steps"].append({
-            "type": s["tool"], "input": s["input"][:200],
+            "type": s["input"].strip() if _is_skill else s["tool"],
+            "is_skill": _is_skill,
+            "input": s["input"][:200],
             "output": "", "status": "pending", "ts": now,
             "replan": True,   # mark so the dashboard can show a "↩ Replanned" divider
         })

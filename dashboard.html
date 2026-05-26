@@ -75,8 +75,9 @@ function elapsedFmt(ms) {
 }
 
 // ── Tool / type colours ────────────────────────────────────────────────────────
+const SKILL_COLOR = '#f472b6'; // pink — matches graph node type "skill"
 const TOOL_COLOR = {
-  web_search:'#06b6d4', websearch:'#06b6d4', webfetch:'#0891b2',
+  web_search:'#06b6d4', websearch:'#06b6d4', web_fetch:'#0891b2', webfetch:'#0891b2',
   search_memory:'#0ea5e9', search_knowledge:'#0ea5e9', search_soul:'#8b5cf6',
   save_memory:'#ec4899', remember:'#ec4899',
   answer:'#a855f7', synthesize:'#34d399',
@@ -85,9 +86,11 @@ const TOOL_COLOR = {
   import_check:'#34d399', fix_read:'#fb923c',
   read:'#10b981', glob:'#34d399', grep:'#6ee7b7', edit:'#f59e0b',
   plan:'#818cf8', planner:'#818cf8',
+  run_skill: SKILL_COLOR,
   default:'#475569',
 };
-function tc(t){ return TOOL_COLOR[(t||'').toLowerCase()] || TOOL_COLOR.default; }
+// If a step is flagged is_skill=true, always use pink regardless of the type name.
+function tc(t, isSkill){ if(isSkill) return SKILL_COLOR; return TOOL_COLOR[(t||'').toLowerCase()] || TOOL_COLOR.default; }
 
 const NODE_TYPE_COLOR = {
   soul:'#a78bfa', policy:'#a78bfa', user:'#34d399', project:'#f59e0b',
@@ -170,7 +173,7 @@ function PhaseBar({ label, status, color, detail, children }) {
 // Single tool-call step: icon + tool name + args preview; click to expand input/output
 function StepRow({ step, replanBefore=false }) {
   const [open, setOpen] = useState(false);
-  const col = tc(step.type||'');
+  const col = tc(step.type||'', step.is_skill);
   const hasDetail = step.input || step.output;
   const dur = (step.finished_at && step.started_at)
     ? `${step.finished_at - step.started_at}s` : null;

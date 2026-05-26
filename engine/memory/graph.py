@@ -623,17 +623,38 @@ knowledge_graph = GraphStore(_knowledge_graph_path())
 # ── Seed ─────────────────────────────────────────────────────────────────────
 
 def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
-    """Populate a fresh GraphStore with the engine policy and empty stubs."""
-    if graph.get_node("policy") or graph.get_node("soul"):
-        return  # already seeded
-    if policy_text:
-        graph.upsert_node("policy", "soul", summary=policy_text[:500],
-                          sources=["engine_policy.md"], confidence=1.0)
-    graph.upsert_node("user", "user", summary="User profile — to be filled in.",
-                      confidence=1.0)
-    graph.upsert_node("active_project", "project", summary="Current project — to be filled in.",
-                      confidence=1.0)
-    logger.info("GraphStore seeded with policy, user, and project nodes")
+    """Populate a fresh GraphStore with identity anchors.
+
+    Soul/policy text is NOT stored here — it is injected via the system prompt
+    by the engine directly. The KG holds only nodes that benefit retrieval.
+    """
+    # Guard: only seed once (check the stable user node)
+    if graph.get_node("user") and graph.get_node("inner_self"):
+        return
+
+    # ── Core identity anchors (always confidence=1.0 — ground truths) ─────────
+    graph.upsert_node(
+        "user", "user",
+        summary="User profile — filled in through conversation and dream cycle.",
+        confidence=1.0,
+    )
+    graph.upsert_node(
+        "active_project", "project",
+        summary="Current project — to be filled in.",
+        confidence=1.0,
+    )
+    # Self-knowledge documents — referenced by retrieval when self-questions arise
+    graph.upsert_node(
+        "inner_self", "self",
+        summary="My evolving understanding of my own nature, built through conversation.",
+        confidence=1.0,
+    )
+    graph.upsert_node(
+        "world_model", "self",
+        summary="Accumulated understanding of how the world works, built from research.",
+        confidence=1.0,
+    )
+    logger.info("GraphStore seeded: user, active_project, inner_self, world_model")
 
 
 def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:
@@ -664,21 +685,6 @@ def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
     """
     sp = Path(skills_path)
 
-    # ── Ensure the sisyphean identity node exists ─────────────────────────────
-    graph.upsert_node(
-        "sisyphean", "soul",
-        summary="Sisyphean local AI agent",
-    )
-    # Ensure the ai concept node exists
-    graph.upsert_node(
-        "ai", "concept",
-        summary="Artificial intelligence",
-    )
-
-    # Permanent identity edges — upsert_edge is idempotent
-    graph.upsert_edge("sisyphean", "is_a", "ai", weight=1.0)
-    graph.upsert_edge("sisyphean", "serves", "user", weight=1.0)
-
     if not sp.exists() or not sp.is_dir():
         logger.info("seed_skill_graph: skills_path %s not found — skipping skill nodes", sp)
         return
@@ -690,18 +696,18 @@ def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
         try:
             first_line = script.read_text(encoding="utf-8").splitlines()[0]
             if first_line.startswith("#"):
-                # Strip leading "# " (or just "#") and optional "Sisyphean skill — "
                 summary = first_line.lstrip("#").strip()
         except Exception:
             pass
 
+        # Skills are standalone — no hub node needed, found by keyword search
         graph.upsert_node(
             stem, "skill",
             summary=summary,
             path=str(script.resolve()),
             sources=[str(script)],
+            confidence=1.0,
         )
-        graph.upsert_edge("sisyphean", "has_skill", stem, weight=1.0)
         count += 1
 
     logger.info("seed_skill_graph: %d skill node(s) seeded from %s", count, sp)
@@ -735,38 +741,33 @@ def sync_personality_to_graph(
     """
 
     # ── Soul / personality ────────────────────────────────────────────────────
+    # Soul text is injected via the system prompt — NOT stored in the KG.
+    # The KG holds retrieval anchors, not the full soul document.
     if soul_path:
         _sp = Path(soul_path)
         if _sp.exists():
-            soul_text = _sp.read_text(encoding="utf-8")
-            graph.upsert_node(
-                "policy", "soul",
-                summary=soul_text[:600],
-                sources=[str(_sp)],
-                confidence=1.0,
-            )
-            logger.info("sync_personality: policy node updated from %s", _sp.name)
+            logger.debug("sync_personality: soul text injected via system prompt, not KG")
 
-    # ── User preferences ──────────────────────────────────────────────────────
+    # ── User preferences → update the user node summary ───────────────────────
     if prefs_path:
         _pp = Path(prefs_path)
         if _pp.exists():
-            count = 0
-            for line in _pp.read_text(encoding="utf-8").splitlines():
-                pref = line.strip()
-                if pref and not pref.startswith("#"):
-                    graph.upsert_node(
-                        pref[:80], "user",
-                        summary=pref,
-                        sources=[str(_pp)],
-                        confidence=1.0,  # directly stated preference — ground truth
-                    )
-                    count += 1
-            if count:
-                logger.info("sync_personality: %d user prefs synced from %s",
-                            count, _pp.name)
+            prefs = [
+                line.strip() for line in _pp.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            if prefs:
+                # Merge all prefs into the user node summary (one node, rich text)
+                merged = " | ".join(prefs[:20])
+                graph.upsert_node(
+                    "user", "user",
+                    summary=merged[:500],
+                    sources=[str(_pp)],
+                    confidence=1.0,
+                )
+                logger.info("sync_personality: user node updated with %d prefs", len(prefs))
 
-    # ── Stubs (create only if missing) ───────────────────────────────────────
+    # ── Ensure core anchor nodes exist ────────────────────────────────────────
     if not graph.get_node("user"):
         graph.upsert_node("user", "user",
                           summary="User profile — to be filled in through conversation.",
@@ -775,14 +776,14 @@ def sync_personality_to_graph(
         graph.upsert_node("active_project", "project",
                           summary="Current project — to be filled in.",
                           confidence=1.0)
-
-    # ── Permanent identity nodes and edges ────────────────────────────────────
-    graph.upsert_node("sisyphean", "soul", summary="Sisyphean local AI agent",
-                      confidence=1.0)
-    graph.upsert_node("ai", "concept", summary="Artificial intelligence",
-                      confidence=1.0)
-    graph.upsert_edge("sisyphean", "is_a", "ai", weight=1.0)
-    graph.upsert_edge("sisyphean", "serves", "user", weight=1.0)
+    if not graph.get_node("inner_self"):
+        graph.upsert_node("inner_self", "self",
+                          summary="My evolving understanding of my own nature.",
+                          confidence=1.0)
+    if not graph.get_node("world_model"):
+        graph.upsert_node("world_model", "self",
+                          summary="Accumulated understanding of how the world works.",
+                          confidence=1.0)
 
 
 # ── Faithfulness ─────────────────────────────────────────────────────────────

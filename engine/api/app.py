@@ -362,11 +362,13 @@ def create_app(config: Config) -> FastAPI:
 
         nodes = [
             {
-                "id":      n.get("key", n.get("name", "?")),
-                "label":   (n.get("name") or n.get("label", n.get("key", "?")))[:32],
-                "type":    n.get("type", "fact"),
-                "summary": (n.get("summary") or n.get("content", ""))[:120],
-                "ts":      _sort_ts(n),
+                "id":         n.get("key", n.get("name", "?")),
+                "label":      (n.get("name") or n.get("label", n.get("key", "?")))[:32],
+                "type":       n.get("type", "fact"),
+                "summary":    (n.get("summary") or n.get("content", ""))[:120],
+                "confidence": round(float(n.get("confidence", 0.5)), 2),
+                "observations": int(n.get("observations", 1)),
+                "ts":         _sort_ts(n),
             }
             for n in sorted_n
         ]

@@ -598,6 +598,65 @@ def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:
     logger.info("Graph seeded with soul, user, and project nodes")
 
 
+def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
+    """Upsert skill nodes from *.py files in skills_path and wire identity edges.
+
+    For each ``<stem>.py`` in *skills_path* the function:
+      * Reads the first-line comment (``# Sisyphean skill — <desc>``) for the summary.
+      * Upserts a ``skill`` node: name=stem, type="skill", summary=<desc>, path=<abs_path>.
+      * Creates edge: ``sisyphean ──has_skill──► <stem>``.
+
+    It also ensures the permanent identity edges exist:
+      * ``sisyphean`` (soul) ──is_a──► ``ai`` (concept)
+      * ``sisyphean`` (soul) ──serves──► ``user``
+
+    Safe to call multiple times — upsert_node and upsert_edge are idempotent.
+    """
+    sp = Path(skills_path)
+
+    # ── Ensure the sisyphean identity node exists ─────────────────────────────
+    graph.upsert_node(
+        "sisyphean", "soul",
+        summary="Sisyphean local AI agent",
+    )
+    # Ensure the ai concept node exists
+    graph.upsert_node(
+        "ai", "concept",
+        summary="Artificial intelligence",
+    )
+
+    # Permanent identity edges — upsert_edge is idempotent
+    graph.upsert_edge("sisyphean", "is_a", "ai", weight=1.0)
+    graph.upsert_edge("sisyphean", "serves", "user", weight=1.0)
+
+    if not sp.exists() or not sp.is_dir():
+        logger.info("seed_skill_graph: skills_path %s not found — skipping skill nodes", sp)
+        return
+
+    count = 0
+    for script in sorted(sp.glob("*.py")):
+        stem = script.stem
+        summary = ""
+        try:
+            first_line = script.read_text(encoding="utf-8").splitlines()[0]
+            if first_line.startswith("#"):
+                # Strip leading "# " (or just "#") and optional "Sisyphean skill — "
+                summary = first_line.lstrip("#").strip()
+        except Exception:
+            pass
+
+        graph.upsert_node(
+            stem, "skill",
+            summary=summary,
+            path=str(script.resolve()),
+            sources=[str(script)],
+        )
+        graph.upsert_edge("sisyphean", "has_skill", stem, weight=1.0)
+        count += 1
+
+    logger.info("seed_skill_graph: %d skill node(s) seeded from %s", count, sp)
+
+
 def sync_personality_to_graph(
     graph: GraphStore,
     soul_path: "Path | None" = None,
@@ -662,6 +721,19 @@ def sync_personality_to_graph(
     if not graph.get_node("active_project"):
         graph.upsert_node("active_project", "project",
                           summary="Current project — to be filled in.")
+
+    # ── Permanent identity nodes and edges ────────────────────────────────────
+    # These are structural facts about Sisyphean itself, not derived from prefs.
+    graph.upsert_node(
+        "sisyphean", "soul",
+        summary="Sisyphean local AI agent",
+    )
+    graph.upsert_node(
+        "ai", "concept",
+        summary="Artificial intelligence",
+    )
+    graph.upsert_edge("sisyphean", "is_a", "ai", weight=1.0)
+    graph.upsert_edge("sisyphean", "serves", "user", weight=1.0)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

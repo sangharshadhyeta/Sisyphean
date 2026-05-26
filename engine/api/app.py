@@ -16,7 +16,7 @@ from engine.task_tracker import active_tasks
 from engine.config import Config
 from engine.llm.client import LlamaClient
 from engine.llm.context import ContextManager
-from engine.memory.graph import knowledge_graph, seed_knowledge_graph, sync_personality_to_graph
+from engine.memory.graph import knowledge_graph, seed_knowledge_graph, sync_personality_to_graph, seed_skill_graph
 from engine.memory.store import ArtifactStore
 from engine.memory.injector import MemoryInjector
 from engine.memory.extractor import MemoryExtractor
@@ -100,6 +100,10 @@ def create_app(config: Config) -> FastAPI:
     policy_text = policy_path.read_text(encoding="utf-8") if policy_path.exists() else ""
     prefs_path  = mem_path / "user_prefs.md"
     sync_personality_to_graph(graph, policy_path, prefs_path)
+
+    # Seed skill nodes from the skills/ directory into the knowledge graph.
+    skills_path = Path(config.skills_path) if hasattr(config, "skills_path") else Path("skills")
+    seed_skill_graph(graph, skills_path)
 
     # Mtime state for live pickup — middleware checks these on every request
     # and re-syncs if either file has changed since last sync.

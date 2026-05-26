@@ -124,10 +124,16 @@ class Config(BaseModel):
     debug: DebugConfig = DebugConfig()
     mock: bool = False
     workspace: str = "./workspace"
+    skills_path: str = "./skills"
 
     @field_validator("workspace")
     @classmethod
     def expand_workspace(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
+
+    @field_validator("skills_path")
+    @classmethod
+    def expand_skills_path(cls, v: str) -> str:
         return str(Path(v).expanduser().resolve())
 
 

@@ -118,7 +118,8 @@ def _resolve_node(skill_name: str, graph) -> dict | None:
 
 # ── Layer 1 — Compact index ───────────────────────────────────────────────────
 
-def get_skill_index(task: str, graph, top_n: int = _INDEX_TOP_N) -> str:
+def get_skill_index(task: str, graph, top_n: int = _INDEX_TOP_N,
+                    stage_type: str = "") -> str:
     """Compact skill index for skills relevant to *task*.
 
     Scores all 'skill' graph nodes by token overlap with the task text.
@@ -126,11 +127,12 @@ def get_skill_index(task: str, graph, top_n: int = _INDEX_TOP_N) -> str:
         "  • name: 60-char summary"           (text-only skill)
         "  • name: 60-char summary [runnable]" (skill with program)
 
-    The [runnable] tag tells the model it can use run_skill:NAME to re-execute
-    the stored program without re-implementing the solution.
+    stage_type: when provided, skills whose stored stage_type field does NOT
+    match are excluded.  Skills without a stage_type field are always included
+    (backwards compatibility with nodes saved before this field existed).
 
     Empty string when no relevant skills exist or graph is None.
-    Injected into think_decompose + plan_task at planning time (Layer 1).
+    Injected into plan_task at planning time (Layer 1).
     """
     if not graph:
         return ""
@@ -139,25 +141,33 @@ def get_skill_index(task: str, graph, top_n: int = _INDEX_TOP_N) -> str:
         if not nodes:
             return ""
 
-        scored: list[tuple[int, str, str, bool]] = []
+        scored: list[tuple[int, str, str, bool, str]] = []
         for node in nodes:
-            name    = node.get("name", "")
-            summary = node.get("summary", "")
-            content = str(node.get("content", "") or "")[:200]
-            has_program = bool(node.get("program") or node.get("program_path"))
-            score   = _token_overlap(task, f"{name} {summary} {content}")
+            name         = node.get("name", "")
+            summary      = node.get("summary", "")
+            content      = str(node.get("content", "") or "")[:200]
+            has_program  = bool(node.get("program") or node.get("program_path"))
+            context_hint = (node.get("context_hint") or "").strip()
+            # Stage-type gate: if the node carries a stage_type, only include it
+            # when the requested stage matches.  No field = always eligible.
+            node_stage = (node.get("stage_type") or "").strip().lower()
+            if stage_type and node_stage and node_stage != stage_type.lower():
+                continue
+            score = _token_overlap(task, f"{name} {summary} {content}")
             if score >= _MIN_SCORE:
-                scored.append((score, name, summary, has_program))
+                scored.append((score, name, summary, has_program, context_hint))
 
         if not scored:
             return ""
 
         scored.sort(reverse=True)
         lines = []
-        for _, name, summary, has_prog in scored[:top_n]:
+        for _, name, summary, has_prog, ctx_hint in scored[:top_n]:
             desc = summary[:_SUMMARY_LEN].rstrip()
             tag  = " [runnable]" if has_prog else ""
-            lines.append(f"  • {name}: {desc}{tag}")
+            # Append context hint so the model knows what input to pass
+            hint = f" — needs: {ctx_hint}" if ctx_hint else ""
+            lines.append(f"  • {name}: {desc}{tag}{hint}")
 
         logger.debug("skill_index: %d match(es) for %r", len(lines), task[:40])
         return "\n".join(lines)
@@ -253,8 +263,17 @@ def save_skill_program_to_graph(
     graph,
     runbook: str = "",
     summary: str = "",
+    stage_type: str = "",
+    context_hint: str = "",
 ) -> Path | None:
     """Upsert a skill node with program code and write script to disk.
+
+    stage_type:   which pipeline stage type this skill belongs to
+                  (run | write_code | write_doc | research | edit).
+                  Used by get_skill_index() to filter skills by stage.
+    context_hint: brief note on what input the skill needs, e.g.
+                  "file path", "search query", "url".
+                  Surfaced in the tool list so the model knows what to pass.
 
     Version tracking:
       - Reads the existing node (if any).
@@ -303,6 +322,10 @@ def save_skill_program_to_graph(
         script_path = save_skill_to_disk(skill_name, code)
         path_str    = str(script_path) if script_path else ""
 
+        # Preserve existing stage_type / context_hint if caller didn't provide new ones
+        _stage_type    = stage_type    or existing.get("stage_type", "")
+        _context_hint  = context_hint  or existing.get("context_hint", "")
+
         graph.upsert_node(
             name=skill_name,
             node_type="skill",
@@ -315,6 +338,9 @@ def save_skill_program_to_graph(
             program_history=json.dumps(history),
             version=new_version,
             status=new_status,
+            # Routing metadata — used by get_skill_index stage filter
+            stage_type=_stage_type,
+            context_hint=_context_hint,
         )
         logger.info(
             "skills: saved program for %r  v%d  %d chars  status=%s",

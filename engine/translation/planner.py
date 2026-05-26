@@ -424,6 +424,36 @@ _INTERNAL_TOOLS = [
 ]
 _INTERNAL_TOOL_NAMES = frozenset(t[0] for t in _INTERNAL_TOOLS)
 
+# All tool names the planner is allowed to use.  Steps whose tool name is NOT
+# in this set are silently normalised to web_search — this catches small-model
+# mistakes like outputting "arxiv:query" instead of "run_skill:arxiv" when the
+# model reads a platform name in the instruction text as a tool name.
+_KNOWN_PLANNER_TOOLS = _INTERNAL_TOOL_NAMES | {
+    "run_skill", "read_skill",     # skill execution (progressive disclosure)
+    "bash", "write", "edit", "read", "glob", "multiedit",  # outer harness tools
+    "web_search", "web_fetch",     # web tools
+    "direct", "write_plan",        # pipeline-internal special steps
+}
+
+
+def _normalise_step(tool: str, inp: str, outer_tool_names: frozenset[str]) -> tuple[str, str]:
+    """Normalise a (tool, input) pair from the planner LLM.
+
+    If the tool name is not in the allowed set, the model probably read a
+    platform/library name from the instruction text and used it as a tool
+    (e.g. "arxiv:beingalive" instead of "run_skill:arxiv").
+    Fall back to web_search with "<tool> <inp>" as the query.
+    """
+    all_known = _KNOWN_PLANNER_TOOLS | outer_tool_names
+    if tool in all_known:
+        return tool, inp
+    # Unknown tool → web_search fallback
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "plan_task: unknown tool %r → web_search (inp=%r)", tool, inp[:60]
+    )
+    return "web_search", f"{tool} {inp}".strip()
+
 
 def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
     """Build the plan system prompt from harness-provided tools + internal tools."""
@@ -436,16 +466,22 @@ def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
             lines.append(f"  {name} — {desc}")
     for name, desc in _INTERNAL_TOOLS:
         lines.append(f"  {name} — {desc}")
-    # read_skill / run_skill only shown when relevant skills exist (Layer 2/3 disclosure)
+    # Skills: one line per skill, same format as other tools — model picks by name.
+    # Never injected as a text block; always presented as selectable tool entries.
     if skill_index:
-        lines.append(
-            "  read_skill — load the full step-by-step runbook for a known skill — "
-            "read_skill:SKILL-NAME"
-        )
-        lines.append(
-            "  run_skill  — execute a skill's saved program directly (skips re-implementation) — "
-            "run_skill:SKILL-NAME"
-        )
+        for _sk_line in skill_index.strip().splitlines():
+            _sk = _sk_line.strip().lstrip("•").strip()
+            if not _sk:
+                continue
+            _ci = _sk.find(":")
+            if _ci > 0:
+                _sname = _sk[:_ci].strip()
+                _sdesc = _sk[_ci + 1:].strip().replace("[runnable]", "").strip()[:60]
+            else:
+                _sname = _sk.strip()
+                _sdesc = "skill"
+            if _sname:
+                lines.append(f"  run_skill:{_sname} — {_sdesc}")
     lines += [
         "",
         "Use 'direct' for: hi, hello, thanks, what can you do, are you alive, simple social exchanges.",
@@ -714,9 +750,7 @@ async def think_decompose(
         prompt += f"\nContext:\n{context[:300]}"
     if soul_section:
         prompt += f"\nPersonality guidance:\n{soul_section[:150]}"
-    # Layer 1 — inject compact skill index so model can plan read_skill steps
-    if skill_index:
-        prompt += f"\nRelevant skills (use read_skill:NAME for full runbook):\n{skill_index}"
+    # Skills are listed as tool entries in plan_task's system prompt — not injected here.
 
     try:
         result = await client.generate(
@@ -792,9 +826,10 @@ async def plan_task(
         prompt += f"\nPersonality guidance:\n{soul_section[:200]}"
     if user_prefs:
         prompt += f"\nUser preferences:\n{user_prefs[:150]}"
-    # Layer 1 — compact skill index so model can plan read_skill or save_skill steps
-    if skill_index:
-        prompt += f"\nRelevant skills (read_skill:NAME for full runbook):\n{skill_index}"
+    # Skills are presented as tool entries in the system prompt (see _build_plan_system),
+    # NOT injected as a text block here — prevents the model from echoing descriptions.
+
+    _outer_names = frozenset(t.get("name", "").lower() for t in outer_tools)
 
     try:
         result = await client.generate(
@@ -819,6 +854,7 @@ async def plan_task(
                 t = steps_raw_val.get("tool", "").strip().lower()
                 i = steps_raw_val.get("input", "").strip()
                 if t and i:
+                    t, i = _normalise_step(t, i, _outer_names)
                     logger.debug("plan_task: LLM returned step dict → %s", t)
                     return [{"tool": t, "input": i}]
             elif isinstance(steps_raw_val, list):
@@ -827,16 +863,17 @@ async def plan_task(
                 steps = []
                 for s in steps_raw_val:
                     if isinstance(s, dict) and s.get("tool") and s.get("input"):
-                        steps.append({
-                            "tool":  s.get("tool", "").strip().lower(),
-                            "input": s.get("input", "").strip(),
-                        })
+                        t = s.get("tool", "").strip().lower()
+                        i = s.get("input", "").strip()
+                        t, i = _normalise_step(t, i, _outer_names)
+                        steps.append({"tool": t, "input": i})
                     elif isinstance(s, str) and ":" in s:
                         # "write_plan:file.py|goal" or "bash:command"
                         t, _, i = s.partition(":")
                         t = t.strip().lower()
                         i = i.strip()
                         if t and i and t not in ("tool", "input"):
+                            t, i = _normalise_step(t, i, _outer_names)
                             steps.append({"tool": t, "input": i})
                 if steps:
                     logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
@@ -859,6 +896,7 @@ async def plan_task(
                     # trailing garbage the model appended (e.g. "tab: ",
                     # "space: ") after a valid step.
                     if tool and inp:
+                        tool, inp = _normalise_step(tool, inp, _outer_names)
                         steps.append({"tool": tool, "input": inp})
                     elif tool:
                         logger.debug("plan_task: dropping empty-input fragment %r", tool)

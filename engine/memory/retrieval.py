@@ -162,6 +162,9 @@ def retrieve_top_nodes(query: str, n: int = 3) -> list[str]:
 def extract_and_index(text: str, context: str = "") -> int:
     """Extract named entities from text and upsert into knowledge_graph.
 
+    Uses structural regex patterns for syntactic entities: file paths,
+    function names, class names, import paths, error types, URLs, packages.
+
     Returns the number of new/updated nodes.
     """
     if not text or len(text) < 20:

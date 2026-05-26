@@ -147,6 +147,23 @@ async def run_dream(
             logger.error("dream: memorise pass failed: %s", exc, exc_info=True)
             result.errors = (result.errors or []) + [f"memorise: {exc}"]
 
+    # ── Relation refinement pass ─────────────────────────────────────────────
+    # Takes 'related_to' placeholder edges and replaces them with specific
+    # verb-phrase relation labels via tiny focused LLM prompts.
+    # Runs after memorise so new nodes from this cycle are already in the graph.
+    if memorise:
+        try:
+            from engine.memory.graph import knowledge_graph
+            if not dry_run:
+                refined = await _refine_relations(client, knowledge_graph)
+                if refined:
+                    logger.info("dream: %d relations refined", refined)
+            else:
+                logger.info("dream: --dry-run — skipping relation refinement")
+        except Exception as exc:
+            logger.warning("dream: relation refinement pass failed: %s", exc)
+            result.errors = (result.errors or []) + [f"relation_refine: {exc}"]
+
     # ── Skill discovery pass ──────────────────────────────────────────────────
     # Mines task_log.md for completed programs that should become reusable skills.
     # Runs after memorise (so graph is fresh) and before cleanup.
@@ -463,6 +480,91 @@ def _parse_task_log(task_log_path: Path) -> list[dict]:
     return entries
 
 
+async def _refine_relations(client, graph, max_edges: int = 40) -> int:
+    """Refine generic 'related_to' edges into specific relation labels.
+
+    The extractor creates 'related_to' as a placeholder when co-occurrence is
+    detected but no explicit relation is stated.  This pass takes those rough
+    edges and uses tiny focused LLM prompts to determine the real relationship.
+
+    Each prompt is ~40-60 tokens so even a 0.6b model handles it reliably.
+    Returns the number of edges refined.
+    """
+    if not graph:
+        return 0
+
+    try:
+        all_edges = graph.all_edges() if hasattr(graph, "all_edges") else []
+    except Exception:
+        return 0
+
+    # Only target 'related_to' edges where both endpoints are real content nodes
+    _SKIP_TYPES = {"soul", "session", "research", "system"}
+    candidates = []
+    for edge in all_edges:
+        if edge.get("relation", "") != "related_to":
+            continue
+        src = edge.get("source", "")
+        tgt = edge.get("target", "")
+        if not src or not tgt:
+            continue
+        s_node = graph.get_node(src)
+        t_node = graph.get_node(tgt)
+        if not s_node or not t_node:
+            continue
+        if (s_node.get("type", "") in _SKIP_TYPES or
+                t_node.get("type", "") in _SKIP_TYPES):
+            continue
+        candidates.append((src, tgt, s_node, t_node))
+
+    if not candidates:
+        return 0
+
+    # Cap to avoid excessive LLM calls in one dream run
+    candidates = candidates[:max_edges]
+    refined = 0
+
+    for src, tgt, s_node, t_node in candidates:
+        s_summary = (s_node.get("summary") or "")[:60].replace("\n", " ")
+        t_summary = (t_node.get("summary") or "")[:60].replace("\n", " ")
+        prompt = (
+            f'What is the relationship between "{src}" and "{tgt}"?\n'
+            f'{src}: {s_summary}\n'
+            f'{tgt}: {t_summary}\n'
+            f'Answer with ONE short snake_case phrase only '
+            f'(e.g. is_part_of, created_by, runs_on, depends_on, version_of):'
+        )
+        try:
+            r = await client.generate(
+                [{"role": "user", "content": prompt}],
+                max_tokens=12,
+                temperature=0.0,
+                stream=False,
+                thinking=False,
+            )
+            raw = (r["choices"][0]["message"]["content"] or "").strip().lower()
+            # Clean: take first token, normalise to snake_case
+            import re as _re
+            relation = _re.sub(r'[^a-z0-9_]+', '_', raw.split()[0])[:40] if raw.split() else ""
+            if relation and relation != "related_to" and len(relation) >= 3:
+                graph.upsert_edge(src, relation, tgt, weight=0.8)
+                # Remove the old generic edge
+                graph.remove_edge(src, "related_to", tgt)
+                refined += 1
+                logger.debug("dream: refined %r -[%s]-> %r", src[:30], relation, tgt[:30])
+        except Exception as exc:
+            logger.debug("dream: relation refinement failed for %r->%r: %s", src, tgt, exc)
+
+    if refined:
+        try:
+            graph.save()
+        except Exception:
+            pass
+        logger.info("dream: refined %d generic 'related_to' edges", refined)
+
+    return refined
+
+
 async def _discover_skills(client, graph, workspace: Path) -> int:
     """Mine task_log.md for programs worth promoting to reusable skills.
 
@@ -656,12 +758,51 @@ async def _discover_skills(client, graph, workspace: Path) -> int:
                 runbook = f"## Goal\n{task}\n\n## Steps taken\n{stage_text}"
 
             summary_line = task[:60].rstrip()
+
+            # ── Infer stage_type and context_hint from task evidence ──────────
+            # stage_type: what kind of pipeline stage this skill is for.
+            # Inferred from the task log entry so get_skill_index() can
+            # filter it to the right stage and not choke the model.
+            _stages_text  = " ".join(entry.get("stages", [])).lower()
+            _files_text   = " ".join(entry.get("files",  [])).lower()
+            _task_lower   = task.lower()
+            _code_exts    = {".py", ".js", ".ts", ".sh", ".rb", ".go", ".java", ".rs"}
+            _doc_exts     = {".md", ".txt", ".rst", ".html", ".css"}
+            _has_code_file = any(
+                _os.path.splitext(f)[1].lower() in _code_exts
+                for f in entry.get("files", [])
+            )
+            _has_doc_file  = any(
+                _os.path.splitext(f)[1].lower() in _doc_exts
+                for f in entry.get("files", [])
+            )
+            if _has_code_file or "write" in _stages_text or "write" in _task_lower:
+                _skill_stage = "write_code"
+            elif _has_doc_file:
+                _skill_stage = "write_doc"
+            elif any(w in _stages_text for w in ("search", "web", "fetch", "research")):
+                _skill_stage = "research"
+            else:
+                _skill_stage = "run"   # bash execution skill
+
+            # context_hint: what input the skill needs (inferred from task text).
+            # Keeps it simple — extract the most likely input type from the task.
+            _hint = ""
+            if any(w in _task_lower for w in ("file", "path", "pdf", "csv", "document")):
+                _hint = "file path"
+            elif any(w in _task_lower for w in ("search", "query", "find", "look up")):
+                _hint = "search query"
+            elif any(w in _task_lower for w in ("url", "link", "fetch", "page")):
+                _hint = "url"
+
             result_path = save_skill_program_to_graph(
                 skill_name=skill_name,
                 code=code,
                 graph=graph,
                 runbook=runbook,
                 summary=summary_line,
+                stage_type=_skill_stage,
+                context_hint=_hint,
             )
             if result_path is not None or graph:  # graph upsert succeeded
                 new_skills += 1

@@ -399,8 +399,7 @@ class Pipeline:
                      recall_ctx: str = "",
                      memory_ctx: str = "",
                      recent_turns_text: str = "") -> LoopResponse:
-        from engine.policy.router import load_user_prefs
-        from engine.soul.router import parse_soul_sections, match_soul_section
+        from engine.soul.router import load_user_prefs, parse_soul_sections, match_soul_section
 
         task_id = _tracker.start_task(session_id=session_id, user_message=query)
 
@@ -579,6 +578,14 @@ class Pipeline:
             filtered_names = [t.get("name", "") for t in relevant_tools]
             logger.info("pipeline: task=%r filtered_tools=%s", task[:60], filtered_names)
 
+            # ── Stage-type skill filter ───────────────────────────────────────
+            # Mirror the tool filter: hide skills that can't be used in this
+            # stage type.  Prevents the model from seeing run_skill entries
+            # when it's doing a verify or social-answer stage.
+            _stage_skill_index = get_skill_index(
+                task, self.graph, stage_type=stage_type
+            ) if self.graph and stage_type not in ("direct", "verify", "save_memory") else ""
+
             # For "direct" stages (social messages, trivial answers) skip planning.
             # For "save_memory" stages, extract the fact and save it directly.
             if stage_type == "direct":
@@ -604,6 +611,20 @@ class Pipeline:
                         logger.warning("pipeline: save_memory stage failed: %s", exc)
                 steps = [{"tool": "save_memory", "input": fact, "result": "saved",
                           "summary": f"saved: {fact[:80]}"}]
+            elif re.match(r'^search\s+keywords?\s*', task.strip(), re.IGNORECASE):
+                # "Search KEYWORDS [Platform:] <query>"
+                # Small models echo this literal prefix from the decomposer plan format;
+                # strip it and route directly to web_search.
+                _kw = re.sub(r'^search\s+keywords?\s*', '', task.strip(), flags=re.IGNORECASE)
+                # Strip any leading "Platform: " token (e.g. "arXiv: ", "HuggingFace: ")
+                _kw = re.sub(r'^[A-Za-z0-9_\-]+:\s*', '', _kw).strip()
+                # Strip enclosing quotes
+                if len(_kw) >= 2 and _kw[0] in ('"', "'") and _kw[-1] == _kw[0]:
+                    _kw = _kw[1:-1].strip()
+                if not _kw:
+                    _kw = task.strip()
+                logger.info("pipeline: Search KEYWORDS literal → web_search: %s", _kw[:80])
+                steps = [{"tool": "web_search", "input": _kw}]
             elif task.strip().lower().startswith("run ") or re.match(
                 r'^command:\s*run\s+', task.strip(), re.IGNORECASE
             ):
@@ -613,9 +634,16 @@ class Pipeline:
                 _task_stripped = re.sub(r'^command:\s*', '', task.strip(), flags=re.IGNORECASE)
                 if _task_stripped.lower().startswith("run "):
                     _task_stripped = _task_stripped[4:].strip()
+                # Extract "; Save: TYPE" suffix before stripping — propagate as _save_after
+                # so _continue auto-inserts a save_memory step once the result is known.
+                _save_m = re.search(r'\s*;\s*[Ss]ave:\s*(\w+)\s*$', _task_stripped)
+                _task_stripped = re.sub(r'\s*;\s*[Ss]ave:\s*\w+\s*$', '', _task_stripped).strip()
                 cmd = _sub_workspace(_normalize_python_c(_task_stripped), self.workspace)
                 logger.info("pipeline: direct-run stage → bash: %s", cmd[:80])
-                steps = [{"tool": "bash", "input": cmd}]
+                _bash_step: dict = {"tool": "bash", "input": cmd}
+                if _save_m:
+                    _bash_step["_save_after"] = _save_m.group(1).lower()
+                steps = [_bash_step]
             elif stage_type == "verify":
                 # Tool already decided by think_decompose: bash.
                 # Only ask "what command?" — don't re-do tool selection via plan_task.
@@ -628,14 +656,14 @@ class Pipeline:
                     steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                             context=task_ctx, soul_section=soul_section,
                                             user_prefs=user_prefs, workspace=self.workspace,
-                                            skill_index=skill_index)
+                                            skill_index=_stage_skill_index)
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
                                         context=task_ctx,
                                         soul_section=soul_section,
                                         user_prefs=user_prefs,
                                         workspace=self.workspace,
-                                        skill_index=skill_index)
+                                        skill_index=_stage_skill_index)
 
             # ── Websearch fallback — if plan is empty and no graph recall ──────
             if not steps and stage_type == "research" and not graph_recall:
@@ -839,6 +867,25 @@ class Pipeline:
                 brief = tr[:120].replace("\n", " ").strip()
                 state.commands_run.append({"cmd": outer_input[:100], "brief": brief})
                 logger.debug("epistemic: ran cmd len=%d", len(outer_input))
+
+                # ── Auto save_memory after bash ───────────────────────────────
+                # If the step was tagged _save_after (from "; Save: TYPE" in the
+                # plan text), insert a save_memory step so the result gets stored.
+                # This only fires on success — no point saving an error message.
+                _save_type = outer_step.get("_save_after", "")
+                if _save_type and tr and not _is_bash_failure(tr):
+                    try:
+                        sub = state.sub_tasks[state.current_task_idx]
+                        sub["steps"].insert(state.current_step_idx + 1, {
+                            "tool": "save_memory",
+                            "input": tr[:500].strip(),
+                            "_auto_save": True,
+                        })
+                        logger.info(
+                            "pipeline: queued auto save_memory after bash (type=%s)", _save_type
+                        )
+                    except (IndexError, KeyError):
+                        pass
 
                 # ── Bash failure retry ────────────────────────────────────────
                 # Two strategies, tried in order:
@@ -1203,6 +1250,14 @@ class Pipeline:
                         cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
                         # Strip "COMMAND" prefix that models echo from format descriptions
                         cmd = re.sub(r'^COMMAND[\s:]+', '', cmd, flags=re.IGNORECASE).strip()
+                        # Extract "; Save: TYPE" before stripping — tag step so _continue
+                        # can auto-insert a save_memory step once the result arrives.
+                        # Skip if already tagged by the fast-path above.
+                        if "_save_after" not in step:
+                            _sm = re.search(r'\s*;\s*[Ss]ave:\s*(\w+)\s*$', cmd)
+                            if _sm:
+                                step["_save_after"] = _sm.group(1).lower()
+                        cmd = re.sub(r'\s*;\s*[Ss]ave:\s*\w+\s*$', '', cmd).strip()
                         # Safety net: if cmd writes/runs relative files, cd to workspace first
                         if self.workspace:
                             cmd = _apply_workspace_to_cmd(cmd, self.workspace)
@@ -2327,33 +2382,147 @@ class Pipeline:
 
     # ── Research graph persistence ────────────────────────────────────────────
 
-    async def _save_research_to_graph(self, query: str, result: str) -> None:
-        """Upsert a web search result into the knowledge graph.
+    @staticmethod
+    def _clean_query_for_graph(query: str) -> str:
+        """Strip LLM-generated literal prefixes from a query before using it as a
+        graph node name.  Small models echo prompt-template text verbatim:
+          "Search KEYWORDS 'philosophy of being alive'"  →  "philosophy of being alive"
+          "Search the web for X"                         →  "X"
+          "Search memory for X"                          →  "X"
+          ": github_ops: ..."                            →  "github_ops: ..."
+        Also strips enclosing quotes and normalises whitespace.
+        """
+        q = query.strip()
+        # Strip common LLM-echoed prefixes (same patterns as pipeline stage stripping)
+        _QUERY_STRIP_RE = [
+            re.compile(r'^search\s+keywords?\s*', re.IGNORECASE),
+            re.compile(r'^search\s+the\s+web\s+for\s+', re.IGNORECASE),
+            re.compile(r'^search\s+(?:the\s+)?web\s+for\s+', re.IGNORECASE),
+            re.compile(r'^look\s+up\s+(?:online\s+)?', re.IGNORECASE),
+            re.compile(r'^search\s+(?:for\s+)?', re.IGNORECASE),
+            re.compile(r'^find\s+(?:current\s+)?', re.IGNORECASE),
+        ]
+        for pat in _QUERY_STRIP_RE:
+            m = pat.match(q)
+            if m:
+                q = q[m.end():]
+                break  # strip at most one prefix
+        # Strip leading "Platform: " tokens like "arXiv: " or ": github_ops: "
+        q = re.sub(r'^:?\s*[\w\s_\-]+:\s*', '', q).strip() or q.strip()
+        # Strip surrounding quotes
+        if len(q) >= 2 and q[0] in ('"', "'") and q[-1] == q[0]:
+            q = q[1:-1].strip()
+        return q or query.strip()
 
-        Creates a new research node on cold miss, or enriches (overwrites summary
-        + bumps last_seen) on a stale hit where the model chose to re-search.
-        No LLM call — the dream cycle consolidates and distils during off-peak hours.
+    @staticmethod
+    def _strip_md(text: str) -> str:
+        """Strip markdown headers and bold markers from web search result text."""
+        text = re.sub(r'^#+\s*[^\n]*\n?', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*\d+\.\s+(?:\*\*[^*]+\*\*\s+)?', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\*\*[^*]+\*\*\s*', '', text)
+        return text.strip()
+
+    async def _extract_triple_llm(
+        self, query: str, result: str
+    ) -> tuple[str, str, str]:
+        """Tiny LLM call — extract entity + relation + context from a search result.
+
+        Returns (entity, relation, context_entity).
+        All three may be empty strings on failure or low-confidence output.
+
+        Example:
+          query  = "what is the capital of France"
+          result = "Paris is the capital of France..."
+          → ("Paris", "is_capital_of", "France")
+
+          query  = "who invented the telephone"
+          result = "Alexander Graham Bell patented the telephone in 1876..."
+          → ("Alexander Graham Bell", "invented", "telephone")
+        """
+        snippet = self._strip_md(result)[:200]
+        if not snippet:
+            return "", "", ""
+
+        prompt = (
+            f'Query: "{query}"\n'
+            f'Text: "{snippet}"\n'
+            'Extract a knowledge triple that answers the query.\n'
+            'Reply with ONLY this JSON:\n'
+            '{"entity": "<answer entity>", "relation": "<snake_case_verb>", "context": "<entity from query or empty>"}'
+        )
+        try:
+            r = await self.client.generate(
+                [{"role": "user", "content": prompt}],
+                max_tokens=40,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                stream=False,
+                thinking=False,
+            )
+            raw = (r["choices"][0]["message"]["content"] or "").strip()
+            import json as _json
+            data = _json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            entity  = str(data.get("entity",  "") or "").strip().strip('"\'')
+            relation = str(data.get("relation", "") or "").strip().strip('"\'').lower()
+            context  = str(data.get("context",  "") or "").strip().strip('"\'')
+            relation = re.sub(r'[^a-z0-9_]+', '_', relation)[:40].strip('_')
+
+            _junk = {"", "unknown", "n/a", "none", "entity", "answer", "the answer"}
+            entity  = entity  if 2 <= len(entity)  <= 60 and entity.lower()  not in _junk else ""
+            context = context if 2 <= len(context) <= 60 and context.lower() not in _junk else ""
+            relation = relation if len(relation) >= 2 else "related_to"
+            return entity, relation, context
+        except Exception as exc:
+            logger.debug("pipeline: triple LLM call failed: %s", exc)
+        return "", "", ""
+
+    async def _save_research_to_graph(self, query: str, result: str) -> None:
+        """Upsert a web search result into the knowledge graph as a proper triple.
+
+        One tiny LLM call extracts (entity, relation, context_entity) from the
+        result snippet.  This produces an immediately meaningful graph edge:
+
+          Paris → is_capital_of → France
+          Alexander Graham Bell → invented → telephone
+          NumPy → is_a → Python library
+
+        Falls back to a plain research node when the LLM returns nothing useful.
+        Dream cycle only needs to handle extractor's rough related_to edges, not
+        these research edges (they arrive already labelled).
         """
         if not self.graph or not result:
             return
         try:
             summary = result[:500].replace("\n", " ").strip()
-            node_name = query[:80]
-            existing = self.graph.get_node(node_name)
-            if existing:
-                logger.debug(
-                    "pipeline: enriching existing research node %r", node_name[:40]
+            query_label = self._clean_query_for_graph(query)[:80]
+
+            entity, relation, context = await self._extract_triple_llm(query, result)
+
+            if entity and entity.lower() != query_label.lower():
+                existing_ent = self.graph.get_node(entity)
+                ent_summary = (
+                    f"{existing_ent.get('summary', '')} | {summary}"[:500]
+                    if existing_ent else summary
                 )
+                self.graph.upsert_node(entity, "fact",
+                                       summary=ent_summary, sources=["web_search"])
+                self.graph.upsert_node(query_label, "research",
+                                       summary=summary, sources=["web_search"])
+                self.graph.upsert_edge(entity, "answers", query_label, weight=0.9)
+
+                if context and context.lower() != entity.lower():
+                    if not self.graph.get_node(context):
+                        self.graph.upsert_node(context, "entity",
+                                               summary=f"mentioned in: {query_label}")
+                    self.graph.upsert_edge(entity, relation, context, weight=0.9)
+                    logger.debug("pipeline: %r -[%s]-> %r", entity[:30], relation, context[:30])
+                else:
+                    logger.debug("pipeline: entity %r answers %r", entity[:40], query_label[:40])
             else:
-                logger.debug(
-                    "pipeline: creating new research node %r", node_name[:40]
-                )
-            self.graph.upsert_node(
-                name=node_name,
-                node_type="research",
-                summary=summary,
-                sources=["web_search"],
-            )
+                self.graph.upsert_node(query_label, "research",
+                                       summary=summary, sources=["web_search"])
+                logger.debug("pipeline: research node (no entity) %r", query_label[:40])
+
             self.graph.save()
         except Exception as exc:
             logger.warning("pipeline: _save_research_to_graph failed: %s", exc)
@@ -2363,9 +2532,7 @@ class Pipeline:
     async def _run_internal(self, tool: str, inp: str, state: PipelineState) -> dict:
 
         if tool in ("search_soul", "search_policy"):
-            from engine.policy.router import parse_policy_sections, match_policy_section, load_inner_self
-            parse_soul_sections = parse_policy_sections  # alias for the code below
-            match_soul_section  = match_policy_section
+            from engine.soul.router import parse_soul_sections, match_soul_section, load_inner_self
             # Check inner_self first for philosophical queries
             q = inp.lower()
             if any(kw in q for kw in ("alive", "think", "feel", "conscious", "exist",
@@ -2384,7 +2551,7 @@ class Pipeline:
             return {"tool": tool, "input": inp, "result": content, "summary": f"memory: {content[:100]}"}
 
         if tool == "search_user_prefs":
-            from engine.policy.router import load_user_prefs
+            from engine.soul.router import load_user_prefs
             content = load_user_prefs(self.prefs_path)
             return {"tool": tool, "input": inp, "result": content, "summary": f"prefs: {content[:80]}"}
 
@@ -2488,6 +2655,13 @@ class Pipeline:
                         "summary": f"fetch error: {exc}"}
 
         if tool in ("save_memory", "remember"):
+            # Strip type-prefix echoes — small models start the input with the
+            # plan-format type keyword, e.g. "FACT: Windows 11 AMD64..." → content
+            _inp_lower = inp.lower()
+            for _pfx in ("fact:", "concept:", "project:", "preference:", "entity:", "skill:", "output:"):
+                if _inp_lower.startswith(_pfx):
+                    inp = inp[len(_pfx):].strip()
+                    break
             if self.graph:
                 try:
                     _save_fact_to_graph(self.graph, inp)
@@ -2674,6 +2848,20 @@ def _save_fact_to_graph(graph, fact: str) -> None:
     if not graph or not fact:
         return
     fact = fact.strip()
+
+    # Reject bare type-keyword echoes and anything too short to be a real fact.
+    # e.g. "FACT", "concept", "output", "result" — these are prompt-format echoes,
+    # not actual knowledge worth storing.
+    _JUNK_FACTS = frozenset({
+        "fact", "facts", "concept", "concepts", "preference", "preferences",
+        "project", "entity", "skill", "output", "result", "results",
+        "info", "information", "data", "memory", "note", "notes",
+        "knowledge", "thing", "item", "detail", "value", "content",
+        "text", "save", "saved", "remember", "noted", "summary",
+    })
+    if len(fact) < 8 or fact.lower().rstrip(".:!?") in _JUNK_FACTS:
+        logger.debug("_save_fact_to_graph: rejected junk input %r", fact[:40])
+        return
 
     _STOP = {
         "the", "and", "for", "with", "that", "this", "from", "into",

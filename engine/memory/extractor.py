@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -61,26 +62,26 @@ ASSISTANT: {asst_msg}
 Return ONLY a JSON object:
 {{
   "facts": [
-    {{"label": "short unique name", "content": "specific fact (1-2 sentences)", "type": "<pick ONE: fact | concept | project | preference>"}}
+    {{"label": "short unique name", "content": "≤15 words", "type": "<fact|concept|project|preference>"}}
+  ],
+  "relations": [
+    {{"from": "entity A", "relation": "verb_phrase", "to": "entity B"}}
   ],
   "artifacts": [
-    {{"type": "<pick ONE: code | file | decision | output>", "summary": "what it is in <15 words", "content": "key content or path"}}
+    {{"type": "<code|file|decision|output>", "summary": "<15 words", "content": "key content or path"}}
   ]
 }}
 
-Type guide for facts — pick the single best fit:
-  fact        — a specific thing that is true (name, version, date, result)
-  concept     — a reusable idea, pattern, or explanation
-  project     — something being built or worked on
-  preference  — how the user wants things done
+facts: entity names only — short labels, minimal content.
+relations: explicit connections between entities. Use short verb phrases:
+  is_part_of | created_by | used_for | depends_on | runs_on | version_of | answers
+  Only state what is EXPLICITLY said. 2-4 relations max.
 
 Rules:
-- If an EXISTING NODE above already covers this information, use that EXACT label.
-  Never create a new node for the same concept under a different name.
-- Only include genuinely NEW information not already captured by existing nodes.
-- Omit greetings, filler, or generic statements.
-- Return empty lists if nothing notable.
-- Return valid JSON only, no explanation."""
+- Use EXACT label from existing nodes above when the topic matches.
+- New info only. Skip greetings and filler.
+- Empty lists if nothing notable.
+- Valid JSON only."""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,6 +89,10 @@ Rules:
 # Valid node types the extractor may write — enforced in code as a hard allowlist.
 # Any composite or unknown type the model produces is normalised to "fact".
 _VALID_FACT_TYPES = frozenset({"fact", "concept", "project", "preference", "entity", "skill"})
+
+# URL pattern — labels matching this are always saved as "url" type regardless
+# of what the LLM outputs, preventing URLs from being stored as "skill" nodes.
+_URL_LABEL_RE = re.compile(r'^https?://', re.IGNORECASE)
 
 
 def _normalise_type(raw: str) -> str:
@@ -266,6 +271,12 @@ class MemoryExtractor:
                 label = (item.get("label") or "").strip()
                 content = (item.get("content") or "").strip()
                 ftype = _normalise_type(item.get("type", "fact"))
+                # Skip URL labels entirely — the extractor has no useful context
+                # to attach to them (summary would just be "conversation").
+                # Researched URLs are saved with real content by _save_research_to_graph.
+                if _URL_LABEL_RE.match(label):
+                    logger.debug("extractor: skipping URL label %r", label[:60])
+                    continue
                 if not label or not content:
                     continue
 
@@ -289,8 +300,7 @@ class MemoryExtractor:
                 logger.debug("extractor: saved [%s] %r", ftype, label[:40])
 
             # ── Create graph edges ────────────────────────────────────────────
-            # (1) Type-specific edges: anchor preferences/projects/concepts to
-            #     the "user" node so the graph has a meaningful hub structure.
+            # (1) Type-specific edges: anchor node to the right hub based on type.
             for final_label, ftype in saved:
                 try:
                     if ftype == "preference":
@@ -299,11 +309,42 @@ class MemoryExtractor:
                         kg.upsert_edge("user", "works_on", final_label, weight=1.0)
                     elif ftype == "concept":
                         kg.upsert_edge("user", "knows_about", final_label, weight=0.6)
+                    elif ftype == "skill":
+                        kg.upsert_edge("sisyphean", "has_skill", final_label, weight=0.8)
                 except Exception as _edge_exc:
                     logger.debug("extractor: type-edge failed: %s", _edge_exc)
 
-            # (2) Co-occurrence edges: facts extracted from the same exchange
-            #     are semantically related — wire them together (window of 4).
+            # (2) Intra-fact entity edges: extract capitalised nouns from each
+            #     fact's content and create entity nodes + edges to the fact node.
+            #     This gives "Paris is the capital of France" →
+            #       fact:Paris — related_to → entity:France
+            for final_label, ftype in saved:
+                try:
+                    item_content = next(
+                        (i.get("content", "") for i in data.get("facts", [])
+                         if (i.get("label") or "").strip() == final_label),
+                        ""
+                    )
+                    if not item_content:
+                        continue
+                    # Extract capitalised noun phrases from the fact content
+                    _nouns = re.findall(
+                        r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\b', item_content
+                    )
+                    for noun in _nouns:
+                        if noun.lower() == final_label.lower():
+                            continue
+                        if len(noun) < 3:
+                            continue
+                        # Only create entity node if it doesn't already exist
+                        if not kg.get_node(noun):
+                            kg.upsert_node(noun, "entity",
+                                           summary=f"mentioned with: {final_label}")
+                        kg.upsert_edge(final_label, "related_to", noun, weight=0.6)
+                except Exception:
+                    pass
+
+            # (3) Co-occurrence edges: facts from the same exchange are related.
             for i in range(len(saved)):
                 for j in range(i + 1, min(i + 4, len(saved))):
                     a_lbl, a_type = saved[i]
@@ -315,6 +356,32 @@ class MemoryExtractor:
                             kg.upsert_edge(a_lbl, "related_to", b_lbl, weight=0.5)
                         except Exception:
                             pass
+
+            # ── (4) Explicit relations from the model ─────────────────────────
+            # The model now outputs a "relations" array of {from, relation, to}
+            # triples.  These are first-class edges — more reliable than the
+            # heuristic noun extraction above because the model stated them.
+            saved_rels = 0
+            for rel in data.get("relations", []):
+                r_from     = (rel.get("from") or "").strip()
+                r_relation = (rel.get("relation") or "").strip().lower()
+                r_to       = (rel.get("to") or "").strip()
+                if not r_from or not r_relation or not r_to:
+                    continue
+                if _is_junk_label(r_from) or _is_junk_label(r_to):
+                    continue
+                # Ensure both endpoint nodes exist (create stubs if needed)
+                if not kg.get_node(r_from):
+                    kg.upsert_node(r_from, "entity", summary=r_from)
+                if not kg.get_node(r_to):
+                    kg.upsert_node(r_to, "entity", summary=r_to)
+                # Normalise relation to snake_case
+                r_relation = re.sub(r'\s+', '_', r_relation)[:40]
+                kg.upsert_edge(r_from, r_relation, r_to, weight=0.8)
+                saved_rels += 1
+                logger.debug("extractor: relation %r -[%s]-> %r", r_from[:30], r_relation, r_to[:30])
+            if saved_rels:
+                logger.debug("extractor: %d explicit relations saved", saved_rels)
 
             for item in data.get("artifacts", []):
                 atype = item.get("type", "output")

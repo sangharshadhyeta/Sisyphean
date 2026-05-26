@@ -529,6 +529,31 @@ class GraphStore:
             frontier = next_frontier - visited
         return result
 
+    def all_edges(self) -> list[dict]:
+        """Return all edges as a list of dicts with source/target/relation/weight."""
+        result = []
+        for s, t, data in self._graph.edges(data=True):
+            s_name = self._graph.nodes[s].get("name", s) if self._graph.has_node(s) else s
+            t_name = self._graph.nodes[t].get("name", t) if self._graph.has_node(t) else t
+            result.append({
+                "source": s_name,
+                "target": t_name,
+                "relation": data.get("relation", "related_to"),
+                "weight": data.get("weight", 1.0),
+            })
+        return result
+
+    def remove_edge(self, source: str, relation: str, target: str) -> bool:
+        """Remove a specific edge by source, relation, and target names."""
+        s_key = _node_key(source)
+        t_key = _node_key(target)
+        if self._graph.has_edge(s_key, t_key):
+            edge_data = self._graph.edges[s_key, t_key]
+            if edge_data.get("relation", "") == relation:
+                self._graph.remove_edge(s_key, t_key)
+                return True
+        return False
+
     def remove_node(self, name: str) -> bool:
         key = _node_key(name)
         if self._graph.has_node(key):

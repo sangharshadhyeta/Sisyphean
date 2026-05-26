@@ -318,22 +318,40 @@ class GraphStore:
         node_type: str,
         summary: str = "",
         sources: list[str] | None = None,
+        confidence: float | None = None,
         **extra,
     ) -> str:
+        """Upsert a node, tracking confidence and corroboration count.
+
+        confidence  Initial faithfulness score [0.4, 0.9] from the caller.
+                    Seed nodes pass 1.0. Omit to default to 0.5.
+        observations increments on every upsert — each new write is corroboration.
+        """
         with self._lock:
             key = _node_key(name)
             ts = _now()
             if self._graph.has_node(key):
                 node = self._graph.nodes[key]
-                existing = set(node.get("sources", []))
-                existing.update(sources or [])
-                node["sources"] = list(existing)
+                existing_srcs = set(node.get("sources", []))
+                existing_srcs.update(sources or [])
+                node["sources"] = list(existing_srcs)
                 node["last_seen"] = ts
-                node["type"] = node_type          # always honour the declared type
+                node["type"] = node_type
                 if summary:
                     node["summary"] = summary
+                # Corroboration: each write bumps confidence slightly.
+                # If the new evidence has higher faithfulness, take that as base first.
+                obs = node.get("observations", 1) + 1
+                existing_conf = node.get("confidence", 0.5)
+                base = max(existing_conf, confidence) if confidence is not None else existing_conf
+                node["confidence"] = round(min(base + 0.08, 0.95), 3)
+                node["observations"] = obs
                 node.update(extra)
             else:
+                init_conf = round(
+                    min(max(confidence, 0.0), 1.0) if confidence is not None else 0.5,
+                    3,
+                )
                 self._graph.add_node(
                     key,
                     name=name,
@@ -342,6 +360,8 @@ class GraphStore:
                     sources=list(sources or []),
                     created_at=ts,
                     last_seen=ts,
+                    confidence=init_conf,
+                    observations=1,
                     **extra,
                 )
             if self._path is not None:
@@ -446,8 +466,9 @@ class GraphStore:
             else:
                 last_seen = float(last_seen_raw) if last_seen_raw else 0
             age_hours = max(0, (_now - last_seen) / 3600) if last_seen else 9999
-            recency   = max(0.0, 1.0 - age_hours / (7 * 24))
-            score     = token_score + recency * 0.5
+            recency     = max(0.0, 1.0 - age_hours / (7 * 24))
+            confidence  = float(data.get("confidence", 0.5))
+            score       = token_score * confidence + recency * 0.5
             scored.append((score, {"key": key, **data}))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -606,9 +627,12 @@ def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
     if graph.get_node("policy") or graph.get_node("soul"):
         return  # already seeded
     if policy_text:
-        graph.upsert_node("policy", "soul", summary=policy_text[:500], sources=["engine_policy.md"])
-    graph.upsert_node("user", "user", summary="User profile — to be filled in through conversation.")
-    graph.upsert_node("active_project", "project", summary="Current project — to be filled in.")
+        graph.upsert_node("policy", "soul", summary=policy_text[:500],
+                          sources=["engine_policy.md"], confidence=1.0)
+    graph.upsert_node("user", "user", summary="User profile — to be filled in.",
+                      confidence=1.0)
+    graph.upsert_node("active_project", "project", summary="Current project — to be filled in.",
+                      confidence=1.0)
     logger.info("GraphStore seeded with policy, user, and project nodes")
 
 
@@ -719,6 +743,7 @@ def sync_personality_to_graph(
                 "policy", "soul",
                 summary=soul_text[:600],
                 sources=[str(_sp)],
+                confidence=1.0,
             )
             logger.info("sync_personality: policy node updated from %s", _sp.name)
 
@@ -734,6 +759,7 @@ def sync_personality_to_graph(
                         pref[:80], "user",
                         summary=pref,
                         sources=[str(_pp)],
+                        confidence=1.0,  # directly stated preference — ground truth
                     )
                     count += 1
             if count:
@@ -743,23 +769,47 @@ def sync_personality_to_graph(
     # ── Stubs (create only if missing) ───────────────────────────────────────
     if not graph.get_node("user"):
         graph.upsert_node("user", "user",
-                          summary="User profile — to be filled in through conversation.")
+                          summary="User profile — to be filled in through conversation.",
+                          confidence=1.0)
     if not graph.get_node("active_project"):
         graph.upsert_node("active_project", "project",
-                          summary="Current project — to be filled in.")
+                          summary="Current project — to be filled in.",
+                          confidence=1.0)
 
     # ── Permanent identity nodes and edges ────────────────────────────────────
-    # These are structural facts about Sisyphean itself, not derived from prefs.
-    graph.upsert_node(
-        "sisyphean", "soul",
-        summary="Sisyphean local AI agent",
-    )
-    graph.upsert_node(
-        "ai", "concept",
-        summary="Artificial intelligence",
-    )
+    graph.upsert_node("sisyphean", "soul", summary="Sisyphean local AI agent",
+                      confidence=1.0)
+    graph.upsert_node("ai", "concept", summary="Artificial intelligence",
+                      confidence=1.0)
     graph.upsert_edge("sisyphean", "is_a", "ai", weight=1.0)
     graph.upsert_edge("sisyphean", "serves", "user", weight=1.0)
+
+
+# ── Faithfulness ─────────────────────────────────────────────────────────────
+
+def faithfulness(source: str, output: str) -> float:
+    """Fraction of output tokens grounded in source text. Maps to [0.4, 0.9].
+
+    High score → output stays close to source (reliable extraction).
+    Low score  → output contains tokens not in source (possible hallucination).
+    Used as the initial confidence for any model-generated node content.
+    """
+    import re as _re
+    _STOPS = {
+        "the","a","an","and","or","is","was","i","you","it","to","of","in",
+        "that","this","be","are","has","have","had","not","but","so","as",
+        "at","by","for","if","on","with","its","their","they","we","also",
+    }
+    def _tok(t: str) -> set[str]:
+        return {w for w in _re.findall(r"[a-z0-9]+", t.lower()) if len(w) > 2} - _STOPS
+
+    src = _tok(source)
+    out = _tok(output)
+    if not out:
+        return 0.4
+    grounded = out & src
+    ratio = len(grounded) / len(out)
+    return round(0.4 + ratio * 0.5, 3)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

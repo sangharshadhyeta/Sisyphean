@@ -1,38 +1,32 @@
 """Memory consolidation — batch-drain session logs into the knowledge graph.
 
-The 'memorise' pass is the offline half of the memory pipeline.  During a
-live session the extractor saves individual exchange facts inline (hot path).
-The memorise pass runs after the fact — typically nightly via the dream command
-— and does a deeper sweep:
+Design (v2)
+-----------
+  ONE LLM call per session produces a prose summary stored as full text on
+  the session node.  No per-exchange extraction, no fact nodes from conversation.
 
-  1. Finds every session JSONL not yet marked as memorised.
-  2. For each session, groups (user, assistant) exchange pairs.
-  3. Runs an LLM extraction call per exchange (same prompt as extractor.py).
-  4. Runs NER over stage_done summaries to pick up file paths, functions, etc.
-  5. Upserts all extracted facts/entities into the persistent knowledge_graph.
-  6. Marks the session as memorised (writes to a watermark file).
+  What goes into the KG
+  ---------------------
+  - session node    — full prose summary as the .summary field (searchable)
+  - session edges   — precedes, contains (timeline chain)
+  - NER entities    — file paths, functions, imports, URLs from stage_done logs
+                      (regex, zero LLM calls)
 
-Skipped events
---------------
-  tool_call / tool_result / compaction / plan events are not fed to the LLM —
-  they are noisy and most useful entities are already in stage_done summaries.
+  What does NOT go into the KG
+  ----------------------------
+  - Arithmetic results, greetings, generic Q&A — these live in the session
+    summary text, not as separate nodes.
 
 Watermark
 ---------
-  ~/.sisyphean/sessions/.memorised  — JSON file: {session_id → ISO timestamp}
+  ~/.sisyphean/sessions/.memorised  — JSON: {session_id → ISO timestamp}
   Processed sessions are never re-processed (idempotent).
-
-Limits
-------
-  _MAX_EXCHANGES_PER_SESSION = 20  — avoid LLM overload for giant sessions.
-  _MAX_SESSIONS_PER_RUN      = 50  — cap one dream pass.
 """
 from __future__ import annotations
 
 import json
 import logging
-import re
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,27 +38,17 @@ logger = logging.getLogger(__name__)
 _SESSIONS_DIR = Path.home() / ".sisyphean" / "sessions"
 _WATERMARK_FILE = _SESSIONS_DIR / ".memorised"
 
-_MAX_EXCHANGES_PER_SESSION: int = 20
+_MAX_EXCHANGES_PER_SESSION: int = 12
 _MAX_SESSIONS_PER_RUN: int = 50
 
-_EXTRACT_PROMPT = """\
-Analyze this conversation exchange and extract information worth remembering long-term.
+# Simple summary prompt — small models handle "summarize in 2-3 sentences" reliably.
+_SUMMARY_PROMPT = """\
+Summarize this conversation in 2-3 sentences.
+Say what the user asked, what was done, and what the outcome was.
 
-USER: {user_msg}
-ASSISTANT: {asst_msg}
+{exchanges_text}
 
-Return ONLY a JSON object:
-{{
-  "facts": [
-    {{"label": "short unique name", "content": "specific fact (1-2 sentences)", "type": "fact|concept|project|preference"}}
-  ]
-}}
-
-Rules:
-- Only include genuinely NEW, specific information.
-- Omit greetings, filler, generic statements, tool output noise.
-- Return empty lists if nothing notable.
-- Return valid JSON only."""
+Write only the summary. Be specific."""
 
 
 # ── Watermark helpers ─────────────────────────────────────────────────────────
@@ -85,10 +69,9 @@ def _save_watermark(wm: dict[str, str]) -> None:
     tmp.replace(_WATERMARK_FILE)
 
 
-# ── Exchange extraction ───────────────────────────────────────────────────────
+# ── Event parsing ─────────────────────────────────────────────────────────────
 
 def _build_exchanges(events: list[dict]) -> list[tuple[str, str]]:
-    """Pair up user_message + assistant_message events into exchange tuples."""
     exchanges: list[tuple[str, str]] = []
     pending_user: str | None = None
     for evt in events:
@@ -105,13 +88,12 @@ def _build_exchanges(events: list[dict]) -> list[tuple[str, str]]:
 
 
 def _stage_summaries(events: list[dict]) -> list[str]:
-    """Collect stage_done summaries for NER pass."""
     summaries = []
     for evt in events:
         if evt.get("type") == "stage_done":
-            summary = evt.get("data", {}).get("summary", "").strip()
-            if summary:
-                summaries.append(summary)
+            s = evt.get("data", {}).get("summary", "").strip()
+            if s:
+                summaries.append(s)
     return summaries
 
 
@@ -130,22 +112,49 @@ def _load_session_events(path: Path) -> list[dict]:
     return events
 
 
-# ── JSON parsing ──────────────────────────────────────────────────────────────
+# ── Session summary (one LLM call per session) ────────────────────────────────
 
-def _parse_json(text: str) -> dict | None:
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end <= start:
-        return None
-    fragment = text[start:end]
+async def _summarise_session(
+    exchanges: list[tuple[str, str]],
+    client: "LlamaClient",
+) -> str:
+    """Produce a 2-3 sentence prose summary of the session.
+
+    Caps input to keep the prompt short enough for small models.
+    Falls back to empty string on any failure — the caller uses the first
+    user message as a fallback label.
+    """
+    if not exchanges:
+        return ""
+
+    lines: list[str] = []
+    total = 0
+    for user, asst in exchanges[:_MAX_EXCHANGES_PER_SESSION]:
+        u_clip = user[:200]
+        a_clip = asst[:300]
+        lines.append(f"User: {u_clip}")
+        lines.append(f"Assistant: {a_clip}")
+        total += len(u_clip) + len(a_clip)
+        if total > 1200:
+            break
+
+    text = "\n".join(lines)
     try:
-        return json.loads(fragment)
-    except json.JSONDecodeError:
-        cleaned = re.sub(r",\s*([}\]])", r"\1", fragment)
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            return None
+        r = await client.generate(
+            [{"role": "user", "content": _SUMMARY_PROMPT.format(exchanges_text=text)}],
+            max_tokens=150,
+            temperature=0.1,
+            stream=False,
+            thinking=False,
+        )
+        summary = (r["choices"][0]["message"]["content"] or "").strip()
+        # Sanity: reject if model just echoed the prompt or returned garbage
+        if len(summary.split()) < 5 or "exchanges_text" in summary:
+            return ""
+        return summary
+    except Exception as exc:
+        logger.debug("memorise: summary call failed: %s", exc)
+        return ""
 
 
 # ── Memoriser ─────────────────────────────────────────────────────────────────
@@ -157,7 +166,6 @@ class Memoriser:
         self._watermark: dict[str, str] = _load_watermark()
 
     async def run(self, client: "LlamaClient") -> "MemoriseResult":
-        """Process all pending sessions. Returns a summary result."""
         from engine.memory.graph import knowledge_graph
         try:
             from engine.memory.retrieval import extract_and_index as _ner
@@ -167,46 +175,39 @@ class Memoriser:
         if not _SESSIONS_DIR.exists():
             return MemoriseResult(0, 0, 0)
 
-        # Collect unprocessed .jsonl files (not archives, not the watermark)
-        pending: list[Path] = []
-        for p in sorted(_SESSIONS_DIR.glob("*.jsonl")):
-            session_id = p.stem
-            if session_id not in self._watermark:
-                pending.append(p)
-
+        pending: list[Path] = [
+            p for p in sorted(_SESSIONS_DIR.glob("*.jsonl"))
+            if p.stem not in self._watermark
+        ]
         pending = pending[:_MAX_SESSIONS_PER_RUN]
+
         if not pending:
             logger.info("memorise: no new sessions to process")
             return MemoriseResult(0, 0, 0)
 
         sessions_done = 0
-        total_facts = 0
         total_ner = 0
 
         for session_path in pending:
             session_id = session_path.stem
-            facts_this, ner_this = await self._process_session(
+            ner_this = await self._process_session(
                 session_path, session_id, client, knowledge_graph, _ner
             )
-            total_facts += facts_this
             total_ner += ner_this
             sessions_done += 1
-            # Mark as processed immediately so a crash doesn't re-process
-            from datetime import datetime, timezone
             self._watermark[session_id] = datetime.now(timezone.utc).isoformat()
             _save_watermark(self._watermark)
 
-        # Persist graph once at the end
         try:
             knowledge_graph.save()
         except Exception as exc:
             logger.warning("memorise: graph save failed: %s", exc)
 
         logger.info(
-            "memorise: processed %d sessions → %d facts, %d NER entities",
-            sessions_done, total_facts, total_ner,
+            "memorise: processed %d sessions → %d NER entities",
+            sessions_done, total_ner,
         )
-        return MemoriseResult(sessions_done, total_facts, total_ner)
+        return MemoriseResult(sessions_done, 0, total_ner)
 
     async def _process_session(
         self,
@@ -215,113 +216,74 @@ class Memoriser:
         client: "LlamaClient",
         kg,
         ner_fn,
-    ) -> tuple[int, int]:
+    ) -> int:
         events = _load_session_events(path)
         if not events:
-            return 0, 0
+            return 0
 
-        exchanges = _build_exchanges(events)[:_MAX_EXCHANGES_PER_SESSION]
-        summaries = _stage_summaries(events)
+        exchanges = _build_exchanges(events)
+        stage_texts = _stage_summaries(events)
 
-        facts_saved = 0
-        ner_saved = 0
-
-        # LLM extraction per exchange
-        for user_msg, asst_msg in exchanges:
+        # ── ONE LLM call: prose summary of the whole session ──────────────────
+        llm_summary = ""
+        summary_confidence: float | None = None
+        if exchanges:
             try:
-                new_facts = await self._extract_exchange(user_msg, asst_msg, client, kg)
-                facts_saved += new_facts
+                llm_summary = await _summarise_session(exchanges, client)
+                if llm_summary:
+                    # Score how well the summary is grounded in the actual exchanges
+                    from engine.memory.graph import faithfulness as _faith
+                    src_text = " ".join(f"{u} {a}" for u, a in exchanges[:8])
+                    summary_confidence = _faith(src_text, llm_summary)
+                    logger.debug("memorise: summary faithfulness=%.2f (%s)",
+                                 summary_confidence, session_id)
             except Exception as exc:
-                logger.debug("memorise: exchange extraction failed (%s): %s", session_id, exc)
+                logger.debug("memorise: summary failed (%s): %s", session_id, exc)
 
-        # NER pass over stage summaries
-        if ner_fn and summaries:
-            combined = "\n".join(summaries)
+        # ── NER pass over stage_done logs (regex, zero LLM calls) ────────────
+        ner_count = 0
+        if ner_fn and stage_texts:
+            combined = "\n".join(stage_texts)
             try:
-                count = ner_fn(combined, context="dream")
-                ner_saved = count or 0
+                ner_count = ner_fn(combined, context=session_id) or 0
             except Exception as exc:
                 logger.debug("memorise: NER pass failed (%s): %s", session_id, exc)
 
-        # ── Build session timeline node ───────────────────────────────────────
-        # Creates a 'session' node for this conversation and wires it into the
-        # chronological chain anchored at 'session_timeline'.
-        # Injected into context when the user asks "what did we do recently?"
-        # or "when did we last work on X?"
+        # ── Session timeline node (summary = LLM prose or fallback) ──────────
         try:
-            _build_timeline_node(session_id, events, facts_saved + ner_saved, kg)
+            _build_timeline_node(session_id, events, llm_summary, kg,
+                                 summary_confidence)
         except Exception as exc:
             logger.debug("memorise: timeline node failed (%s): %s", session_id, exc)
 
         logger.debug(
-            "memorise: session %s → %d facts, %d NER",
-            session_id, facts_saved, ner_saved,
+            "memorise: session %s → summary=%d chars, %d NER",
+            session_id, len(llm_summary), ner_count,
         )
-        return facts_saved, ner_saved
-
-    async def _extract_exchange(
-        self,
-        user_msg: str,
-        asst_msg: str,
-        client: "LlamaClient",
-        kg,
-    ) -> int:
-        """Run one LLM extraction call. Returns number of facts saved."""
-        prompt = _EXTRACT_PROMPT.format(
-            user_msg=user_msg[:600],
-            asst_msg=asst_msg[:1200],
-        )
-        result = await client.generate(
-            [{"role": "user", "content": prompt}],
-            max_tokens=512,
-            temperature=0.1,
-            stream=False,
-            thinking=False,
-        )
-        raw = result["choices"][0]["message"]["content"].strip()
-        data = _parse_json(raw)
-        if not data:
-            return 0
-
-        saved = 0
-        for item in data.get("facts", []):
-            label = (item.get("label") or "").strip()
-            content = (item.get("content") or "").strip()
-            ftype = item.get("type", "fact")
-            if label and content:
-                kg.upsert_node(label, ftype, summary=content, sources=["dream:memorise"])
-                saved += 1
-        return saved
+        return ner_count
 
 
 # ── Session timeline builder ──────────────────────────────────────────────────
 
-def _build_timeline_node(session_id: str, events: list[dict], facts_count: int, kg) -> None:
-    """Create / upsert a 'session' graph node and wire it into the timeline.
+def _build_timeline_node(
+    session_id: str,
+    events: list[dict],
+    llm_summary: str,
+    kg,
+    confidence: float | None = None,
+) -> None:
+    """Create / upsert a session node with a prose summary and wire it into the timeline.
 
-    Structure produced
-    ------------------
-    session_timeline  (type=timeline)
-        │ contains
-        ▼
-    session:{date}:{id8}  (type=session)   ◄── summary: date + first user msg + tools
-        │ precedes
-        ▼
-    session:{date}:{id8}  (type=session)   ← next session (linked later)
-
-    The serial 'precedes' chain is built by finding the most recent existing
-    session node and pointing it at the new one.  On first run the timeline
-    root is the only anchor.
+    The session node's .summary field is the primary text store for what happened
+    in that conversation.  It is searched by keyword during retrieval.
     """
-    from datetime import datetime, timezone
-
-    # ── Derive metadata from events ───────────────────────────────────────────
     first_ts: str = ""
     first_user: str = ""
     tools_used: list[str] = []
+
     for evt in events:
         etype = evt.get("type", "")
-        data  = evt.get("data", {})
+        data = evt.get("data", {})
         if not first_ts and evt.get("ts"):
             first_ts = evt["ts"]
         if not first_user and etype == "user_message":
@@ -331,7 +293,6 @@ def _build_timeline_node(session_id: str, events: list[dict], facts_count: int, 
             if name and name not in tools_used:
                 tools_used.append(name)
 
-    # Date from first event timestamp (fallback: today)
     if first_ts:
         try:
             date_str = datetime.fromisoformat(first_ts).strftime("%Y-%m-%d")
@@ -340,20 +301,21 @@ def _build_timeline_node(session_id: str, events: list[dict], facts_count: int, 
     else:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    short_id  = session_id[:8]
+    short_id = session_id[:8]
     node_name = f"session:{date_str}:{short_id}"
-
     tools_str = ", ".join(tools_used[:6]) if tools_used else "none"
-    summary   = (
-        f"{date_str} | {first_user[:120] or '(no message)'} "
-        f"| tools: {tools_str} | facts extracted: {facts_count}"
-    )
 
-    # ── Upsert this session node ──────────────────────────────────────────────
+    # Summary: LLM prose first, fall back to first user message as label
+    if llm_summary:
+        summary = f"{date_str} | {llm_summary} | tools: {tools_str}"
+    else:
+        label = first_user[:120] or "(no message)"
+        summary = f"{date_str} | {label} | tools: {tools_str}"
+
     kg.upsert_node(node_name, "session", summary=summary,
-                   sources=[f"session:{session_id}"])
+                   sources=[f"session:{session_id}"],
+                   confidence=confidence)
 
-    # ── Ensure timeline root exists ───────────────────────────────────────────
     _TL = "session_timeline"
     if not kg.get_node(_TL):
         kg.upsert_node(
@@ -365,22 +327,20 @@ def _build_timeline_node(session_id: str, events: list[dict], facts_count: int, 
             ),
         )
 
-    # ── timeline → session ────────────────────────────────────────────────────
     kg.upsert_edge(_TL, "contains", node_name)
 
-    # ── Find the most recent session node and chain it ────────────────────────
-    # All session nodes are sorted by name (date is first so lexicographic = chrono).
+    # Chain sessions chronologically via 'precedes' edges
     session_nodes = sorted(
         [n for n in kg.all_nodes(node_type="session")
          if n.get("name", "").startswith("session:") and n.get("name") != node_name],
         key=lambda n: n.get("name", ""),
     )
     if session_nodes:
-        prev_name = session_nodes[-1].get("name", "")  # lexically last = most recent
+        prev_name = session_nodes[-1].get("name", "")
         if prev_name and prev_name < node_name:
             kg.upsert_edge(prev_name, "precedes", node_name)
 
-    logger.debug("memorise: timeline node %r (%d tools, %d facts)", node_name, len(tools_used), facts_count)
+    logger.debug("memorise: session node %r (tools: %s)", node_name, tools_str)
 
 
 # ── Result type ───────────────────────────────────────────────────────────────

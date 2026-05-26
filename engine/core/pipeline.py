@@ -2498,29 +2498,39 @@ class Pipeline:
 
             entity, relation, context = await self._extract_triple_llm(query, result)
 
+            from engine.memory.graph import faithfulness as _faith
             if entity and entity.lower() != query_label.lower():
                 existing_ent = self.graph.get_node(entity)
                 ent_summary = (
                     f"{existing_ent.get('summary', '')} | {summary}"[:500]
                     if existing_ent else summary
                 )
+                # Faithfulness: is the entity name grounded in the search result?
+                ent_conf = _faith(result[:600], entity)
                 self.graph.upsert_node(entity, "fact",
-                                       summary=ent_summary, sources=["web_search"])
+                                       summary=ent_summary, sources=["web_search"],
+                                       confidence=ent_conf)
                 self.graph.upsert_node(query_label, "research",
-                                       summary=summary, sources=["web_search"])
+                                       summary=summary, sources=["web_search"],
+                                       confidence=_faith(result[:600], query_label))
                 self.graph.upsert_edge(entity, "answers", query_label, weight=0.9)
 
                 if context and context.lower() != entity.lower():
                     if not self.graph.get_node(context):
+                        ctx_conf = _faith(result[:600], context)
                         self.graph.upsert_node(context, "entity",
-                                               summary=f"mentioned in: {query_label}")
+                                               summary=f"mentioned in: {query_label}",
+                                               confidence=ctx_conf)
                     self.graph.upsert_edge(entity, relation, context, weight=0.9)
-                    logger.debug("pipeline: %r -[%s]-> %r", entity[:30], relation, context[:30])
+                    logger.debug("pipeline: %r -[%s]-> %r (conf=%.2f)",
+                                 entity[:30], relation, context[:30], ent_conf)
                 else:
-                    logger.debug("pipeline: entity %r answers %r", entity[:40], query_label[:40])
+                    logger.debug("pipeline: entity %r answers %r (conf=%.2f)",
+                                 entity[:40], query_label[:40], ent_conf)
             else:
                 self.graph.upsert_node(query_label, "research",
-                                       summary=summary, sources=["web_search"])
+                                       summary=summary, sources=["web_search"],
+                                       confidence=_faith(result[:600], query_label))
                 logger.debug("pipeline: research node (no entity) %r", query_label[:40])
 
             self.graph.save()

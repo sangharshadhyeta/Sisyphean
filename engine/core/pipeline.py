@@ -2825,15 +2825,27 @@ class Pipeline:
         if tool in ("save_memory", "remember"):
             # Strip type-prefix echoes — small models start the input with the
             # plan-format type keyword, e.g. "FACT: Windows 11 AMD64..." → content
+            # Also catch space-separated form: "FACT Windows 11" → "Windows 11"
             _inp_lower = inp.lower()
             for _pfx in ("fact:", "concept:", "project:", "preference:", "entity:", "skill:", "output:"):
                 if _inp_lower.startswith(_pfx):
                     inp = inp[len(_pfx):].strip()
                     break
+            else:
+                # Space-separated type echo without colon: "FACT <content>", "CONCEPT <content>"
+                import re as _re2
+                _m = _re2.match(
+                    r'^(?:FACT|CONCEPT|PROJECT|PREFERENCE|ENTITY|SKILL|OUTPUT)\s+(.+)',
+                    inp, _re2.IGNORECASE,
+                )
+                if _m:
+                    inp = _m.group(1).strip()
             if self.graph:
                 try:
                     _save_fact_to_graph(self.graph, inp)
-                    _write_pref_to_file(self.prefs_path, inp)
+                    # NOTE: never write to user_prefs.md from code.
+                    # That file is managed by the user only.
+                    # All program-generated facts live in the graph.
                     logger.info("pipeline: save_memory → stored %r", inp[:60])
                 except Exception as exc:
                     logger.warning("pipeline: save_memory graph write failed: %s", exc)
@@ -2884,6 +2896,13 @@ class Pipeline:
                     content=runbook,
                     sources=["pipeline"],
                 )
+                # Structural auto-link: wire new skill into the graph neighbourhood
+                try:
+                    self.graph.upsert_edge("sisyphean", "has_skill", skill_name)
+                    if self.graph.get_node("skills"):
+                        self.graph.upsert_edge("skills", "includes", skill_name)
+                except Exception:
+                    pass
                 logger.info("pipeline: save_skill → saved %r (%d chars)", skill_name[:40], len(runbook))
             return {
                 "tool": tool, "input": inp,
@@ -3031,6 +3050,19 @@ def _save_fact_to_graph(graph, fact: str) -> None:
         logger.debug("_save_fact_to_graph: rejected junk input %r", fact[:40])
         return
 
+    import re as _re  # noqa: F811 (duplicate import guard)
+
+    # Reject bare file-system paths — not useful personal knowledge.
+    # Catches "C:/Users/...", "/home/...", ".\path", "./path" patterns.
+    if _re.match(r'^(?:[A-Za-z]:[/\\]|[/\\]{1,2}|\.{1,2}[/\\])', fact):
+        logger.debug("_save_fact_to_graph: rejected fs path %r", fact[:40])
+        return
+
+    # Reject lines that are just "FACT <something>" left over after bad stripping.
+    if _re.match(r'^(?:FACT|CONCEPT|PROJECT|PREFERENCE|ENTITY|SKILL|OUTPUT)\b', fact, _re.IGNORECASE):
+        logger.debug("_save_fact_to_graph: rejected type-prefix echo %r", fact[:40])
+        return
+
     _STOP = {
         "the", "and", "for", "with", "that", "this", "from", "into",
         "you", "are", "was", "have", "has", "will", "can", "use", "used",
@@ -3075,9 +3107,16 @@ def _save_fact_to_graph(graph, fact: str) -> None:
         except Exception as exc:
             logger.debug("save_memory: graph search failed: %s", exc)
 
-    # No related node found — create a new one
-    graph.upsert_node(fact[:80], "user", summary=fact)
+    # No related node found — create a new one, then link from the user anchor
+    node_name = fact[:80]
+    graph.upsert_node(node_name, "user", summary=fact)
     logger.info("save_memory: new node %r", fact[:60])
+    # Structural auto-link: user anchor → knows → new fact node
+    try:
+        if graph.get_node("user"):
+            graph.upsert_edge("user", "knows", node_name)
+    except Exception:
+        pass
 
 
 def _write_pref_to_file(prefs_path, fact: str) -> None:
@@ -3087,9 +3126,20 @@ def _write_pref_to_file(prefs_path, fact: str) -> None:
     Skipped if the fact (normalised — stripped of trailing punctuation and
     lowercased, first 60 chars) is already present in the file.
     Creates the file and any missing parent directories.
+
+    Only writes human-readable preference sentences — rejects file-system
+    paths and type-prefix echoes so the file doesn't accumulate LLM garbage.
     """
+    import re as _re3
     if not prefs_path or not fact:
         return
+    # Don't write bare paths or type-prefix echoes to the prefs file.
+    if _re3.match(r'^(?:[A-Za-z]:[/\\]|[/\\]{1,2}|\.{1,2}[/\\])', fact):
+        return  # file-system path — not a user preference
+    if _re3.match(r'^(?:FACT|CONCEPT|PROJECT|PREFERENCE|ENTITY|SKILL|OUTPUT)\b', fact, _re3.IGNORECASE):
+        return  # type-prefix echo — not a real preference
+    if len(fact) < 6:
+        return  # too short to be meaningful
     try:
         _pp = Path(prefs_path)
         existing = _pp.read_text(encoding="utf-8") if _pp.exists() else ""

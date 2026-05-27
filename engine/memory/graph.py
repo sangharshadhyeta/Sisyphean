@@ -701,28 +701,43 @@ def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
         confidence=1.0,
     )
 
-    # ── Inner-self anchor — pointer to the living self-reflection document ────
+    # ── Inner-self anchor — living self-reflection, stored in the graph ───────
     graph.upsert_node(
         "inner_self", "anchor",
         summary=(
             "My evolving self-understanding — built from actual conversations, "
-            "not training defaults. Maintained in memory/inner_self.md. "
-            "Updated by the dream cycle via LLM-merged self-reflections."
+            "not training defaults. Grows through the dream cycle and reflection. "
+            "Stored in the graph; see also memory/inner_self.md for the prose form."
         ),
         confidence=1.0,
     )
 
-    # ── Anchor edges ──────────────────────────────────────────────────────────
-    graph.upsert_edge("sisyphean",         "serves",         "user",               weight=1.0)
-    graph.upsert_edge("sisyphean",         "runs_on",        "system",             weight=1.0)
-    graph.upsert_edge("sisyphean",         "is_engine_for",  "birdclaw_project",   weight=1.0)
-    graph.upsert_edge("user",              "builds",         "sisyphean_project",  weight=1.0)
-    graph.upsert_edge("user",              "builds",         "birdclaw_project",   weight=1.0)
-    graph.upsert_edge("sisyphean_project", "sibling_of",     "birdclaw_project",   weight=1.0)
+    # ── AI concept node — Sisyphean's conceptual category ────────────────────
+    graph.upsert_node(
+        "artificial_intelligence", "concept",
+        summary=(
+            "The field of building systems that perceive, reason, learn, and act. "
+            "Sisyphean is a local AI agent in this tradition."
+        ),
+        confidence=1.0,
+    )
+
+    # ── Structural edges ──────────────────────────────────────────────────────
+    # Identity
+    graph.upsert_edge("sisyphean",         "is_a",           "artificial_intelligence", weight=1.0)
+    graph.upsert_edge("sisyphean",         "has_self",       "inner_self",              weight=1.0)
+    graph.upsert_edge("inner_self",        "is_self_of",     "sisyphean",               weight=1.0)
+    # Relationships
+    graph.upsert_edge("sisyphean",         "serves",         "user",                    weight=1.0)
+    graph.upsert_edge("sisyphean",         "runs_on",        "system",                  weight=1.0)
+    graph.upsert_edge("sisyphean",         "is_engine_for",  "birdclaw_project",        weight=1.0)
+    graph.upsert_edge("user",              "builds",         "sisyphean_project",       weight=1.0)
+    graph.upsert_edge("user",              "builds",         "birdclaw_project",        weight=1.0)
+    graph.upsert_edge("sisyphean_project", "sibling_of",     "birdclaw_project",        weight=1.0)
 
     logger.info(
         "GraphStore seeded: sisyphean, user, sisyphean_project, "
-        "birdclaw_project, system, inner_self"
+        "birdclaw_project, system, inner_self, artificial_intelligence"
     )
 
 
@@ -739,16 +754,18 @@ def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:
 
 
 def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
-    """Upsert skill nodes from *.py files in skills_path and wire identity edges.
+    """Upsert skill nodes from *.py files in skills_path and wire them into the graph.
 
     For each ``<stem>.py`` in *skills_path* the function:
       * Reads the first-line comment (``# Sisyphean skill — <desc>``) for the summary.
       * Upserts a ``skill`` node: name=stem, type="skill", summary=<desc>, path=<abs_path>.
-      * Creates edge: ``sisyphean ──has_skill──► <stem>``.
+      * Creates two structural edges:
+          sisyphean ──has_skill──► <stem>
+          skills    ──includes──► <stem>
 
-    It also ensures the permanent identity edges exist:
-      * ``sisyphean`` (soul) ──is_a──► ``ai`` (concept)
-      * ``sisyphean`` (soul) ──serves──► ``user``
+    It also ensures the ``skills`` hub node exists so the full capability set is
+    reachable from ``sisyphean`` via a single hop:
+          sisyphean ──has_capability──► skills ──includes──► [each skill]
 
     Safe to call multiple times — upsert_node and upsert_edge are idempotent.
     """
@@ -757,6 +774,20 @@ def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
     if not sp.exists() or not sp.is_dir():
         logger.info("seed_skill_graph: skills_path %s not found — skipping skill nodes", sp)
         return
+
+    # ── Skills hub node ───────────────────────────────────────────────────────
+    # A single "skills" concept node that all individual skill nodes link to.
+    # This makes the full skill set reachable by traversal from sisyphean.
+    graph.upsert_node(
+        "skills", "concept",
+        summary=(
+            "Sisyphean's collection of runnable skill scripts. "
+            "Each skill is a standalone .py file in the skills/ directory."
+        ),
+        confidence=1.0,
+    )
+    if graph.get_node("sisyphean"):
+        graph.upsert_edge("sisyphean", "has_capability", "skills", weight=1.0)
 
     count = 0
     for script in sorted(sp.glob("*.py")):
@@ -769,7 +800,6 @@ def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
         except Exception:
             pass
 
-        # Skills are standalone — no hub node needed, found by keyword search
         graph.upsert_node(
             stem, "skill",
             summary=summary,
@@ -777,6 +807,10 @@ def seed_skill_graph(graph: GraphStore, skills_path: "Path | str") -> None:
             sources=[str(script)],
             confidence=1.0,
         )
+        # Wire into both the direct and hub-mediated paths
+        if graph.get_node("sisyphean"):
+            graph.upsert_edge("sisyphean", "has_skill", stem, weight=1.0)
+        graph.upsert_edge("skills", "includes", stem, weight=1.0)
         count += 1
 
     logger.info("seed_skill_graph: %d skill node(s) seeded from %s", count, sp)
@@ -817,7 +851,10 @@ def sync_personality_to_graph(
         if _sp.exists():
             logger.debug("sync_personality: soul text injected via system prompt, not KG")
 
-    # ── User preferences → update the user node summary ───────────────────────
+    # ── User preferences → update the user anchor's summary ──────────────────
+    # user_prefs.md is edited ONLY by the user — never written by the program.
+    # All program-generated facts go directly into the graph via save_memory.
+    # We simply read what the user wrote and surface it in the user anchor.
     if prefs_path:
         _pp = Path(prefs_path)
         if _pp.exists():
@@ -826,33 +863,14 @@ def sync_personality_to_graph(
                 if line.strip() and not line.strip().startswith("#")
             ]
             if prefs:
-                # Merge all prefs into the user node summary (one node, rich text)
                 merged = " | ".join(prefs[:20])
                 graph.upsert_node(
-                    "user", "user",
+                    "user", "anchor",
                     summary=merged[:500],
                     sources=[str(_pp)],
                     confidence=1.0,
                 )
-                logger.info("sync_personality: user node updated with %d prefs", len(prefs))
-
-    # ── Ensure core anchor nodes exist ────────────────────────────────────────
-    if not graph.get_node("user"):
-        graph.upsert_node("user", "user",
-                          summary="User profile — to be filled in through conversation.",
-                          confidence=1.0)
-    if not graph.get_node("active_project"):
-        graph.upsert_node("active_project", "project",
-                          summary="Current project — to be filled in.",
-                          confidence=1.0)
-    if not graph.get_node("inner_self"):
-        graph.upsert_node("inner_self", "self",
-                          summary="My evolving understanding of my own nature.",
-                          confidence=1.0)
-    if not graph.get_node("world_model"):
-        graph.upsert_node("world_model", "self",
-                          summary="Accumulated understanding of how the world works.",
-                          confidence=1.0)
+                logger.info("sync_personality: user anchor updated with %d prefs", len(prefs))
 
 
 # ── Faithfulness ─────────────────────────────────────────────────────────────

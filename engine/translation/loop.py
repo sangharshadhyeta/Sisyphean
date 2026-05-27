@@ -54,11 +54,13 @@ class TranslationLoop:
         from engine.config import load_config as _load_config
         try:
             _cfg = _load_config()
-            _soul_path  = _Path(_cfg.memory.engine_policy_file)
-            _prefs_path = _Path(_cfg.memory.path) / "user_prefs.md"
+            _soul_path   = _Path(_cfg.memory.engine_policy_file)
+            _prefs_path  = _Path(_cfg.memory.path) / "user_prefs.md"
+            _skills_path = str(_Path(getattr(_cfg, "skills_path", "skills")))
         except Exception:
-            _soul_path  = _Path("engine_policy.md")
-            _prefs_path = _Path("memory/user_prefs.md")
+            _soul_path   = _Path("engine_policy.md")
+            _prefs_path  = _Path("memory/user_prefs.md")
+            _skills_path = "skills"
         self._pipeline = Pipeline(
             client=client,
             policy_path=_soul_path,
@@ -66,6 +68,7 @@ class TranslationLoop:
             knowledge_graph=knowledge_graph,
             workspace=workspace,
             budget_tracker=budget_tracker,
+            skills_path=_skills_path,
         )
 
     async def process(

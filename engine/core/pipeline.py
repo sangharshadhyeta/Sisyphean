@@ -326,6 +326,7 @@ class Pipeline:
         knowledge_graph=None,
         workspace: str = "",
         budget_tracker=None,
+        skills_path: str = "",
     ) -> None:
         self.client  = client
         self.soul_path  = policy_path  # kept as soul_path internally for compatibility
@@ -333,6 +334,7 @@ class Pipeline:
         self.graph   = knowledge_graph
         self.workspace = workspace
         self.budget_tracker = budget_tracker
+        self.skills_path = skills_path  # project skills/ directory for on-disk skill lookup
         self.recall  = Recall(graph=knowledge_graph, workspace=workspace or ".")
 
     async def process(
@@ -450,7 +452,15 @@ class Pipeline:
         # no graph. skill_index is the only extra context allowed here.
         _route = ""
         if bc_plan is None:
-            _route = await route_query(query, self.client, skill_index=skill_index)
+            # Pre-classify pure arithmetic before LLM routing — qwen3:0.6b
+            # misroutes "100/4" as web_search (slash looks like a URL path).
+            # Force "bash" so think_decompose plans a calc skill step instead.
+            _ARITH_PAT = re.compile(r'^[\d\s\+\-\*\/\.\(\)\^%]+$')
+            if _ARITH_PAT.match(query.strip()):
+                _route = "bash"
+                logger.info("pipeline: arithmetic fast-route=bash for %r", query[:40])
+            else:
+                _route = await route_query(query, self.client, skill_index=skill_index)
             logger.info("pipeline: route=%r for query=%r", _route, query[:60])
 
         # ── Stage 2: Decompose into stages ───────────────────────────────────
@@ -638,8 +648,34 @@ class Pipeline:
             ) if self.graph and stage_type not in ("direct", "verify", "save_memory") else ""
 
             # For "direct" stages (social messages, trivial answers) skip planning.
-            # For "save_memory" stages, extract the fact and save it directly.
-            if stage_type == "direct":
+            # EXCEPTION: if the stage goal is "Run skill:X args", think_decompose
+            # recognised a skill but labelled the stage "direct" — override so the
+            # skill actually runs instead of being silently dropped.
+            _skill_goal_m = re.match(
+                r'^(?:run\s+)?skill:(\S+)\s*(.*)', task.strip(), re.IGNORECASE
+            )
+            if not _skill_goal_m:
+                _skill_goal_m = re.match(
+                    r'^run\s+skill:(\S+)\s*(.*)', task.strip(), re.IGNORECASE
+                )
+            if _skill_goal_m:
+                _sg_name = _skill_goal_m.group(1)
+                _sg_args = _skill_goal_m.group(2).strip()
+                # Calc skill: model strips operators ("2+2" → "2 2").
+                # If args have no operators BUT the original query is a clean
+                # arithmetic expression (digits + operators only), use it directly.
+                # Do NOT fall back when query is natural language — calc.py is a
+                # pure Python expression evaluator, not an NL parser.
+                _ARITH_CLEAN = re.compile(r'^[\d\s\+\-\*\/\.\(\)\^%]+$')
+                if (_sg_name.lower() == "calc"
+                        and not any(op in _sg_args for op in "+-*/^%().")
+                        and _ARITH_CLEAN.match(query.strip())):
+                    _sg_args = query.strip()
+                steps = [{"tool": "run_skill",
+                          "input": f"{_sg_name} {_sg_args}".strip()}]
+                logger.info("pipeline: skill goal override → run_skill:%s %s",
+                            _sg_name, _sg_args[:40])
+            elif stage_type == "direct":
                 steps = []
             elif stage_type == "save_memory":
                 # Extract fact from goal: strip leading verb/prefix
@@ -1211,34 +1247,54 @@ class Pipeline:
                 # ── run_skill → resolve stored program → convert to bash ────
                 # Layer 3: the model chose to re-execute a previously built
                 # program instead of re-planning from scratch.
-                # 1. Look up program in graph.
-                # 2. Ensure it exists on disk (write if missing).
-                # 3. Substitute this step with bash execution of the script.
-                # If the skill has no program, fall through to _run_internal
-                # which returns a "not found" result and lets synthesis explain.
+                # 1. Parse skill name + args ("calc 2+2" → name="calc", args="2+2").
+                # 2. Look up program in graph by name only (not full "name args" string).
+                # 3. Ensure script exists on disk (write if missing).
+                # 4. Fall back to project skills/ directory if graph has no program.
+                # 5. Substitute this step with bash execution of the script.
                 if tool == "run_skill":
-                    _prog = get_skill_program(inp, self.graph)
+                    _parts = inp.strip().split(None, 1)
+                    _skill_name = _parts[0] if _parts else inp
+                    _skill_args = _parts[1] if len(_parts) > 1 else ""
+                    _prog = get_skill_program(_skill_name, self.graph)
+                    _resolved_script: "Path | None" = None
                     if _prog:
-                        _script = get_skill_script_path(inp)
-                        # Write to disk if missing or stale
+                        _script = get_skill_script_path(_skill_name)
                         if not _script.exists():
-                            _script = save_skill_to_disk(inp, _prog) or _script
+                            _script = save_skill_to_disk(_skill_name, _prog) or _script
                         if _script and _script.exists():
-                            _cmd = f"python {_script}"
-                            logger.info(
-                                "pipeline: run_skill %r → bash: %s", inp[:40], _cmd
-                            )
-                            # Preserve skill name so the dashboard shows "arxiv" in
-                            # pink rather than a generic "bash" step.
-                            step["_skill_name"] = inp.strip()
-                            step["tool"]  = "bash"
-                            step["input"] = _cmd
-                            tool = "bash"
-                            inp  = _cmd
-                            # Fall through — bash is an outer tool and will be dispatched below
-                        else:
-                            logger.warning("pipeline: run_skill %r — could not write script", inp[:40])
-                            # Fall through to _run_internal for graceful "not found" response
+                            _resolved_script = _script
+                    if not _resolved_script:
+                        # Fallback: check project skills/ directory on disk.
+                        # Covers skills that are on disk but not yet in the graph
+                        # (e.g. calc.py before save_skill_program_to_graph is called).
+                        for _sp in (
+                            self.skills_path,
+                            str(Path(__file__).parent.parent.parent / "skills"),
+                        ):
+                            if _sp:
+                                _candidate = Path(_sp) / f"{_skill_name}.py"
+                                if _candidate.exists():
+                                    _resolved_script = _candidate
+                                    logger.info(
+                                        "pipeline: run_skill %r — found on disk: %s",
+                                        _skill_name, _candidate,
+                                    )
+                                    break
+                    if _resolved_script:
+                        _cmd = f"python {_resolved_script}" + (f" {_skill_args}" if _skill_args else "")
+                        logger.info(
+                            "pipeline: run_skill %r → bash: %s", inp[:40], _cmd
+                        )
+                        step["_skill_name"] = _skill_name
+                        step["tool"]  = "bash"
+                        step["input"] = _cmd
+                        tool = "bash"
+                        inp  = _cmd
+                        # Fall through — bash is an outer tool and will be dispatched below
+                    else:
+                        logger.warning("pipeline: run_skill %r — script not found in graph or skills/", inp[:40])
+                        # Fall through to _run_internal for graceful "not found" response
 
                 # ── direct — skip all steps, synthesizer answers from query ──
                 # Used for greetings, thanks, simple questions where no tool

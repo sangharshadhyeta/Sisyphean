@@ -465,14 +465,17 @@ class Pipeline:
                         outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
         else:
             _tracker.tree_context_running(task_id, "think-decompose")
-            # Need-to-know: think_decompose gets graph nodes only (no history).
-            # Spec for generate_plan: question, route hint, user_prefs, graph nodes.
-            # top_context (history extract) intentionally excluded.
+            # Decompose context: task grounding (400 chars) + graph nodes (400 chars).
+            # top_context is essential — without it qwen3:0.6b returns 0 stages for
+            # multi-step write tasks ("write X then run Y") and the pipeline falls back
+            # to a single wrong bash step.  Cap tightly so it doesn't flood the call.
             _graph_for_decompose = _search_graph(query, self.graph) if self.graph else ""
-            _decompose_ctx = (
-                f"[Memory]\n{_graph_for_decompose[:_CTX_DECOMPOSE]}"
-                if _graph_for_decompose else ""
-            )
+            _decompose_parts = []
+            if top_context:
+                _decompose_parts.append(f"[Context]\n{top_context[:400]}")
+            if _graph_for_decompose:
+                _decompose_parts.append(f"[Memory]\n{_graph_for_decompose[:400]}")
+            _decompose_ctx = "\n\n".join(_decompose_parts)
             outcome, stages = await think_decompose(
                 query, self.client,
                 context=_decompose_ctx,

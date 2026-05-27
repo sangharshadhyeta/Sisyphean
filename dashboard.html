@@ -831,6 +831,9 @@ function MemoryGraphPane({ graph, h, splitMode }) {
   const [width, setWidth] = useState(splitMode
     ? Math.floor((window.innerWidth - 80) / 2)
     : Math.max(600, window.innerWidth - 80));
+  // purge button state: idle | confirm | running | done | error
+  const [purge, setPurge] = useState('idle');
+  const [purgeInfo, setPurgeInfo] = useState('');
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -841,15 +844,66 @@ function MemoryGraphPane({ graph, h, splitMode }) {
     return () => obs.disconnect();
   }, []);
 
+  const onPurge = async () => {
+    if (purge === 'idle') {
+      // First click — arm the button; auto-disarm after 3 s
+      setPurge('confirm');
+      setTimeout(() => setPurge(s => s === 'confirm' ? 'idle' : s), 3000);
+      return;
+    }
+    if (purge === 'confirm') {
+      // Second click — execute
+      setPurge('running');
+      try {
+        const r  = await fetch('/api/graph/purge', { method: 'POST' });
+        const d  = await r.json();
+        setPurgeInfo(`${d.nodes_before} → ${d.nodes_after} nodes`);
+        setPurge('done');
+        setTimeout(() => { setPurge('idle'); setPurgeInfo(''); }, 3000);
+      } catch {
+        setPurge('error');
+        setTimeout(() => setPurge('idle'), 2000);
+      }
+    }
+  };
+
+  const PURGE_LABEL = {
+    idle:    'Purge & Re-seed',
+    confirm: 'Confirm?',
+    running: '…',
+    done:    'Done',
+    error:   'Error',
+  };
+  const PURGE_CLS = {
+    idle:    'text-slate-600 hover:text-red-400 cursor-pointer',
+    confirm: 'text-amber-400 hover:text-amber-200 cursor-pointer',
+    running: 'text-slate-500 cursor-default',
+    done:    'text-green-400 cursor-default',
+    error:   'text-red-400 cursor-default',
+  };
+
   return (
     <div className={splitMode ? 'flex flex-col' : 'flex flex-col'} style={{ height: h }}>
       <div className="px-4 py-2 border-b border-slate-800/40 flex items-center justify-between">
         <span className="text-slate-500 text-xs uppercase tracking-widest">
           Memory Graph
         </span>
-        <span className="text-slate-700 text-xs font-mono">
-          {graph.nodes.length} nodes · {graph.edges.length} edges
-        </span>
+        <div className="flex items-center gap-3">
+          {purgeInfo && (
+            <span className="text-green-500 text-xs font-mono">{purgeInfo}</span>
+          )}
+          <span className="text-slate-700 text-xs font-mono">
+            {graph.nodes.length} nodes · {graph.edges.length} edges
+          </span>
+          <button
+            onClick={onPurge}
+            disabled={purge === 'running'}
+            className={`text-xs font-mono transition-colors ${PURGE_CLS[purge]}`}
+            title="Purge all graph data and re-seed identity anchors + skills"
+          >
+            {PURGE_LABEL[purge]}
+          </button>
+        </div>
       </div>
       <div ref={containerRef} style={{ flex:1, overflow:'hidden', position:'relative' }}>
         <MemoryGraph

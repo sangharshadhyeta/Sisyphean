@@ -385,6 +385,39 @@ def create_app(config: Config) -> FastAPI:
 
         return {"nodes": nodes, "edges": edges[:300]}
 
+    @app.post("/api/graph/purge", tags=["admin"])
+    async def api_graph_purge():
+        """Purge every node and edge from the knowledge graph then re-seed.
+
+        Re-seeds:
+          1. Identity anchor nodes  (seed_knowledge_graph)
+          2. Skill nodes from skills/  (seed_skill_graph)
+
+        Returns { nodes_before, nodes_after }.
+        """
+        nodes_before = graph.node_count()
+
+        # Clear all nodes and edges atomically
+        with graph._lock:
+            graph._graph.clear()
+
+        # Re-seed identity anchors (guard removed because graph is empty)
+        seed_knowledge_graph(graph, "")
+
+        # Re-seed skill nodes
+        _sp = Path(config.skills_path) if hasattr(config, "skills_path") else Path("skills")
+        seed_skill_graph(graph, _sp)
+
+        # Persist to disk
+        try:
+            graph.save()
+        except Exception as exc:
+            logger.warning("graph purge: save failed: %s", exc)
+
+        nodes_after = graph.node_count()
+        logger.info("api: graph purged %d -> %d nodes", nodes_before, nodes_after)
+        return {"status": "ok", "nodes_before": nodes_before, "nodes_after": nodes_after}
+
     # ── Task flowchart API ───────────────────────────────────────────────────
 
     @app.get("/api/tasks", tags=["info"])

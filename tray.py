@@ -1,7 +1,7 @@
 """Sisyphean — unified system tray manager.
 
-Manages both the Sisyphean engine and the BirdClaw agent from a single tray
-icon.  Run via install.bat or directly:
+Manages the Sisyphean engine, the BirdClaw agent, and the SearXNG local
+search engine from a single tray icon.  Run via install.bat or directly:
 
     pythonw tray.py          (no console window)
     python  tray.py          (with console, useful for debugging)
@@ -36,8 +36,9 @@ MAIN_PY   = HERE / "main.py"
 PYTHON    = Path(sys.executable)
 PYTHONW   = PYTHON.parent / "pythonw.exe"
 
-_DEFAULT_ENGINE_PORT = 47291
-_DEFAULT_BC_PORT     = 47293
+_DEFAULT_ENGINE_PORT  = 47291
+_DEFAULT_BC_PORT      = 47293
+_DEFAULT_SEARXNG_PORT = 8888
 
 CREATE_NO_WINDOW = 0x08000000  # Windows: suppress console popup
 
@@ -52,12 +53,37 @@ def _read_engine_port() -> int:
         return _DEFAULT_ENGINE_PORT
 
 
-_ENGINE_PORT = _read_engine_port()
-ENGINE_DASH  = f"http://127.0.0.1:{_ENGINE_PORT}/dashboard"
-_LOG_DIR     = Path.home() / ".sisyphean" / "logs"
+def _read_searxng_port() -> int:
+    """Parse the port from config.yaml search.searxng_url (e.g. http://localhost:8888)."""
+    try:
+        import yaml  # type: ignore[import]
+        import urllib.parse
+        with (HERE / "config.yaml").open(encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        url = data.get("search", {}).get("searxng_url", "")
+        if url:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.port:
+                return int(parsed.port)
+    except Exception:
+        pass
+    return _DEFAULT_SEARXNG_PORT
+
+
+_ENGINE_PORT  = _read_engine_port()
+_SEARXNG_PORT = _read_searxng_port()
+ENGINE_DASH   = f"http://127.0.0.1:{_ENGINE_PORT}/dashboard"
+_SEARXNG_URL  = f"http://127.0.0.1:{_SEARXNG_PORT}"
+_LOG_DIR      = Path.home() / ".sisyphean" / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE     = _LOG_DIR / "engine_out.txt"
-BC_LOG_FILE  = _LOG_DIR / "birdclaw_out.txt"
+LOG_FILE          = _LOG_DIR / "engine_out.txt"
+BC_LOG_FILE       = _LOG_DIR / "birdclaw_out.txt"
+SEARXNG_LOG_FILE  = _LOG_DIR / "searxng_out.txt"
+
+# SearXNG source location (installed by install.bat)
+_SEARXNG_SRC      = Path.home() / ".birdclaw" / "searxng-src"
+# Per-install settings.yml — generated once if absent
+_SEARXNG_SETTINGS = Path.home() / ".birdclaw" / "searxng-settings.yml"
 
 # ── Singleton guard ────────────────────────────────────────────────────────────
 _singleton_mutex = None
@@ -70,13 +96,15 @@ if sys.platform == "win32":
         sys.exit(0)
 
 # ── Process handles ────────────────────────────────────────────────────────────
-_engine_proc: subprocess.Popen | None = None
-_bc_proc:     subprocess.Popen | None = None
+_engine_proc:  subprocess.Popen | None = None
+_bc_proc:      subprocess.Popen | None = None
+_searxng_proc: subprocess.Popen | None = None
 _lock = threading.Lock()
 
 # When True, watchdog will not auto-restart that component
-_engine_paused = False
-_bc_paused     = False
+_engine_paused  = False
+_bc_paused      = False
+_searxng_paused = False
 
 
 # ── Port helpers ───────────────────────────────────────────────────────────────
@@ -124,6 +152,45 @@ def _bc_running() -> bool:
     with _lock:
         alive = _bc_proc is not None and _bc_proc.poll() is None
     return alive or _port_open(_BC_PORT)
+
+
+# ── SearXNG helpers ────────────────────────────────────────────────────────────
+
+def _searxng_available() -> bool:
+    """True when SearXNG source has been installed by install.bat."""
+    return (_SEARXNG_SRC / "searx" / "webapp.py").exists()
+
+
+def _searxng_running() -> bool:
+    with _lock:
+        alive = _searxng_proc is not None and _searxng_proc.poll() is None
+    return alive or _port_open(_SEARXNG_PORT)
+
+
+def _ensure_searxng_settings() -> Path:
+    """Return path to a valid settings.yml, generating a minimal one if needed."""
+    # 1. user-managed file next to source
+    src_settings = _SEARXNG_SRC / "searx" / "settings.yml"
+    if src_settings.exists():
+        return src_settings
+    # 2. per-install file in ~/.birdclaw/
+    if _SEARXNG_SETTINGS.exists():
+        return _SEARXNG_SETTINGS
+    # 3. generate a minimal file so SearXNG starts on the right port
+    import secrets
+    _SEARXNG_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    _SEARXNG_SETTINGS.write_text(
+        f"use_default_settings: true\n"
+        f"server:\n"
+        f"  secret_key: \"{secrets.token_hex(24)}\"\n"
+        f"  bind_address: \"127.0.0.1\"\n"
+        f"  port: {_SEARXNG_PORT}\n"
+        f"  limiter: false\n"
+        f"search:\n"
+        f"  safe_search: 0\n",
+        encoding="utf-8",
+    )
+    return _SEARXNG_SETTINGS
 
 
 # ── Status probe ───────────────────────────────────────────────────────────────
@@ -226,6 +293,53 @@ def restart_birdclaw():
     stop_birdclaw()
     time.sleep(0.8)
     start_birdclaw()
+
+
+# ── SearXNG lifecycle ──────────────────────────────────────────────────────────
+
+def start_searxng():
+    global _searxng_proc, _searxng_paused
+    if not _searxng_available():
+        return
+    _searxng_paused = False
+    with _lock:
+        if _searxng_proc and _searxng_proc.poll() is None:
+            return
+    if _port_open(_SEARXNG_PORT):
+        return
+    settings = _ensure_searxng_settings()
+    with _lock:
+        flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        env = os.environ.copy()
+        env["SEARXNG_SETTINGS_PATH"] = str(settings)
+        log = open(SEARXNG_LOG_FILE, "a", encoding="utf-8")
+        _searxng_proc = subprocess.Popen(
+            [str(PYTHON), "-m", "searx.webapp"],
+            cwd=str(_SEARXNG_SRC),
+            stdout=log,
+            stderr=log,
+            env=env,
+            creationflags=flags,
+        )
+
+
+def stop_searxng():
+    global _searxng_proc, _searxng_paused
+    _searxng_paused = True
+    with _lock:
+        if _searxng_proc:
+            _searxng_proc.terminate()
+            try:
+                _searxng_proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                _searxng_proc.kill()
+            _searxng_proc = None
+
+
+def restart_searxng():
+    stop_searxng()
+    time.sleep(0.8)
+    start_searxng()
 
 
 # ── Icon rendering ─────────────────────────────────────────────────────────────
@@ -378,6 +492,40 @@ def build_tray() -> pystray.Icon:
         else:
             subprocess.Popen(["xdg-open", str(BC_LOG_FILE)])
 
+    # ── SearXNG callbacks ──────────────────────────────────────────────────────
+
+    def on_open_searxng(icon, item):
+        webbrowser.open(_SEARXNG_URL)
+
+    def on_start_searxng(icon, item):
+        def _do():
+            if not _searxng_available():
+                icon.notify("Sisyphean", "SearXNG not installed — run install.bat first.")
+                return
+            start_searxng()
+            time.sleep(2)
+            icon.notify("Sisyphean", f"SearXNG started — localhost:{_SEARXNG_PORT}")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def on_restart_searxng(icon, item):
+        def _do():
+            icon.notify("Sisyphean", "Restarting SearXNG…")
+            restart_searxng()
+            time.sleep(2)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def on_stop_searxng(icon, item):
+        def _do():
+            stop_searxng()
+            icon.notify("Sisyphean", "SearXNG stopped.")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def on_view_searxng_logs(icon, item):
+        if sys.platform == "win32":
+            os.startfile(str(SEARXNG_LOG_FILE))
+        else:
+            subprocess.Popen(["xdg-open", str(SEARXNG_LOG_FILE)])
+
     # ── Quit — stops tray only; engine/BirdClaw keep running ──────────────────
 
     def on_quit_tray(icon, item):
@@ -388,6 +536,7 @@ def build_tray() -> pystray.Icon:
         """Stop everything and close the tray."""
         stop_engine()
         stop_birdclaw()
+        stop_searxng()
         icon.stop()
 
     # ── Menu ───────────────────────────────────────────────────────────────────
@@ -400,17 +549,32 @@ def build_tray() -> pystray.Icon:
             return "BirdClaw — not installed"
         return f"{'● BirdClaw running' if _bc_running() else '○ BirdClaw stopped'}"
 
+    def _searxng_status(_):
+        if not _searxng_available():
+            return "SearXNG — not installed"
+        return f"{'● SearXNG running' if _searxng_running() else '○ SearXNG stopped'}"
+
     bc_items = []
     if _BC_DIR is not None:
         bc_items = [
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(_bc_status, None, enabled=False),
-            pystray.MenuItem(f"Open BirdClaw (localhost:{_BC_PORT})", on_open_bc),
+            pystray.MenuItem(f"Open BirdClaw  (localhost:{_BC_PORT})", on_open_bc),
             pystray.MenuItem("Start BirdClaw",   on_start_bc),
             pystray.MenuItem("Restart BirdClaw", on_restart_bc),
             pystray.MenuItem("Stop BirdClaw",    on_stop_bc),
             pystray.MenuItem("BirdClaw Logs",    on_view_bc_logs),
         ]
+
+    searxng_items = [
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_searxng_status, None, enabled=False),
+        pystray.MenuItem(f"Open SearXNG   (localhost:{_SEARXNG_PORT})", on_open_searxng),
+        pystray.MenuItem("Start SearXNG",   on_start_searxng),
+        pystray.MenuItem("Restart SearXNG", on_restart_searxng),
+        pystray.MenuItem("Stop SearXNG",    on_stop_searxng),
+        pystray.MenuItem("SearXNG Logs",    on_view_searxng_logs),
+    ]
 
     icon.menu = pystray.Menu(
         pystray.MenuItem(_sisyphean_status, None, enabled=False),
@@ -421,16 +585,17 @@ def build_tray() -> pystray.Icon:
             default=True,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Start Engine",          on_start_engine),
-        pystray.MenuItem("Restart Engine",        on_restart_engine),
-        pystray.MenuItem("Stop Engine",           on_stop_engine),
+        pystray.MenuItem("Start Engine",             on_start_engine),
+        pystray.MenuItem("Restart Engine",           on_restart_engine),
+        pystray.MenuItem("Stop Engine",              on_stop_engine),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Engine Logs",           on_view_engine_logs),
+        pystray.MenuItem("Engine Logs",              on_view_engine_logs),
         pystray.MenuItem("Update Engine (git pull)", on_update_engine),
         *bc_items,
+        *searxng_items,
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit Tray",             on_quit_tray),
-        pystray.MenuItem("Quit All",              on_quit_all),
+        pystray.MenuItem("Quit Tray",                on_quit_tray),
+        pystray.MenuItem("Quit All",                 on_quit_all),
     )
 
     return icon
@@ -439,8 +604,8 @@ def build_tray() -> pystray.Icon:
 # ── Watchdog ───────────────────────────────────────────────────────────────────
 
 def _watchdog(icon: pystray.Icon):
-    """Polls engine + BirdClaw health every 15 s.  Restarts crashed processes,
-    but respects intentional stops (_engine_paused / _bc_paused flags)."""
+    """Polls engine, BirdClaw, and SearXNG health every 15 s.
+    Restarts crashed processes but respects intentional stops (the *_paused flags)."""
     while True:
         time.sleep(15)
 
@@ -452,6 +617,10 @@ def _watchdog(icon: pystray.Icon):
         # BirdClaw — restart if it crashed (respects _bc_paused from Stop menu)
         if _BC_DIR and not _bc_paused and not _bc_running():
             start_birdclaw()
+
+        # SearXNG — restart if it crashed (respects _searxng_paused from Stop menu)
+        if _searxng_available() and not _searxng_paused and not _searxng_running():
+            start_searxng()
 
         # Refresh icon from live status
         s = _engine_status()
@@ -477,9 +646,10 @@ def main():
     import traceback
     _tray_log = HERE / "tray.log"
     try:
-        # Start both services on launch
+        # Start all three services on launch
         start_engine()
         start_birdclaw()
+        start_searxng()
 
         icon = build_tray()
         threading.Thread(target=_watchdog, args=(icon,), daemon=True).start()

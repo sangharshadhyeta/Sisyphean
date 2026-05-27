@@ -476,18 +476,7 @@ def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
         "Never use 'direct' if the answer must be looked up or computed — use web_search or bash.",
         "Never answer from training knowledge. Every fact must come from web_search or bash.",
         "",
-        "WEB SEARCH QUERY RULES (strictly enforced):",
-        "  • Write ONLY content words — nouns, topics, names — 3-6 words per query.",
-        "  • NEVER start a query with 'search for', 'find', 'how to', 'what is', 'look up'.",
-        "    Strip all verbs. Write only the subject matter.",
-        "    Bad:  web_search:search for philosophical viewpoints on meaning of life",
-        "    Good: web_search:meaning of life philosophy viewpoints",
-        "  • For broad research topics with multiple angles or perspectives, use 2-3 separate",
-        "    web_search steps — one per angle, not one combined query.",
-        "    Example — 'meaning of life from different philosophical viewpoints':",
-        "      web_search:meaning of life philosophy | web_search:existentialism nihilism purpose | web_search:AI consciousness meaning",
-        "    Example — 'Python async vs threading':",
-        "      web_search:Python asyncio event loop | web_search:Python threading GIL comparison",
+        "Each web_search query must be a short keyword phrase — strip question words. For multiple angles, use separate web_search steps.",
         "",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
         "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then direct).",
@@ -731,7 +720,7 @@ You are a task router. Output ONLY valid JSON: {"outcome": "...", "steps": "..."
 
 STEP FORMATS:
   steps=""                      answer directly — no tool needed
-  steps="Search: keywords"      web search — write 3-6 content keywords only
+  steps="Search: keywords"      web search — 3-5 nouns only, no verbs or question words
   steps="Run COMMAND"           run a shell command
   steps="Write FILENAME"        create a code or document file
   steps="Save: FACT"            persist a fact to memory
@@ -744,15 +733,8 @@ steps="" ONLY when the answer is already present in the provided context
   in context, always use a tool — never answer from training knowledge.
 
 steps="Search: keywords" for any factual question not already in context.
-  CRITICAL — keyword rules:
-    • Write ONLY content words (nouns, topics, names) — 3-6 words max.
-    • NEVER write "search for", "find", "how to", "what is", "look up" — strip all verbs.
-    • NEVER copy the user's sentence — extract the core topic words only.
-    • Bad:  Search: search for the meaning of life
-    • Good: Search: meaning of life philosophy
-  For questions with MULTIPLE angles or viewpoints, fan out into 2-3 focused searches:
-    • "meaning of life philosophy viewpoints | Search: existentialism nihilism meaning | Search: AI consciousness meaning"
-    • Each Search covers ONE angle — different schools, different disciplines, different perspectives.
+  Write the topic as 3-5 nouns only — no "search for", "find", "what is".
+  Multiple angles → chain: Search: angle1 | Search: angle2
   Do NOT use Search for computation — use Run for those.
 
 steps="Run COMMAND" for shell actions and ALL computation.

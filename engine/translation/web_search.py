@@ -99,20 +99,41 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
 async def _search_searxng(
     query: str, base_url: str, n: int, timeout: float
 ) -> list[SearchResult]:
+    """Query local SearXNG instance.
+
+    SearXNG's link_token botdetection requires a session cookie that is set
+    when the homepage is first visited.  We use a single AsyncClient so the
+    cookie jar is shared across both requests — homepage warm-up then search.
+    """
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=timeout) as http:
+        base = base_url.rstrip("/")
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; Sisyphean/1.0)",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            follow_redirects=True,
+        ) as http:
+            # Warm-up: visit homepage so SearXNG sets its link_token cookie.
+            # The response content is discarded — we only need the Set-Cookie.
+            try:
+                await http.get(base + "/", headers={"Accept": "text/html"})
+            except Exception:
+                pass  # carry on even if the warm-up fails
+
             resp = await http.get(
-                f"{base_url.rstrip('/')}/search",
-                params={"q": query, "format": "json",
-                        "engines": "google,bing,duckduckgo"},
+                f"{base}/search",
+                params={"q": query, "format": "json"},
+                headers={"Referer": base + "/"},
             )
             resp.raise_for_status()
             data = resp.json()
+
         results = []
         for item in data.get("results", [])[:n]:
             url = item.get("url", "")
-            # Normalise protocol-relative URLs ("//example.com") to https.
             if url.startswith("//"):
                 url = f"https:{url}"
             results.append(SearchResult(

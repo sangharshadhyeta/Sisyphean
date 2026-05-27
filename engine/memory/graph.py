@@ -332,20 +332,29 @@ class GraphStore:
             ts = _now()
             if self._graph.has_node(key):
                 node = self._graph.nodes[key]
+                is_anchor = (node.get("type") == "anchor")
                 existing_srcs = set(node.get("sources", []))
                 existing_srcs.update(sources or [])
                 node["sources"] = list(existing_srcs)
                 node["last_seen"] = ts
-                node["type"] = node_type
-                if summary:
-                    node["summary"] = summary
-                # Corroboration: each write bumps confidence slightly.
-                # If the new evidence has higher faithfulness, take that as base first.
-                obs = node.get("observations", 1) + 1
-                existing_conf = node.get("confidence", 0.5)
-                base = max(existing_conf, confidence) if confidence is not None else existing_conf
-                node["confidence"] = round(min(base + 0.08, 0.95), 3)
-                node["observations"] = obs
+                if is_anchor:
+                    # Anchor nodes are permanent identity ground-truths.
+                    # Type and confidence are frozen at 1.0; summary only updates
+                    # on an explicit confidence=1.0 write (seed or dream cycle).
+                    # The extractor must not corrupt anchor nodes.
+                    if confidence is not None and confidence >= 1.0 and summary:
+                        node["summary"] = summary
+                else:
+                    node["type"] = node_type
+                    if summary:
+                        node["summary"] = summary
+                    # Corroboration: each write bumps confidence slightly.
+                    # If the new evidence has higher faithfulness, take that as base first.
+                    obs = node.get("observations", 1) + 1
+                    existing_conf = node.get("confidence", 0.5)
+                    base = max(existing_conf, confidence) if confidence is not None else existing_conf
+                    node["confidence"] = round(min(base + 0.08, 0.95), 3)
+                    node["observations"] = obs
                 node.update(extra)
             else:
                 init_conf = round(
@@ -625,67 +634,96 @@ knowledge_graph = GraphStore(_knowledge_graph_path())
 def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
     """Populate a fresh GraphStore with identity anchors.
 
-    Soul/policy text is NOT stored here — injected via the system prompt.
-    The KG holds only nodes that benefit retrieval.
+    Anchor nodes (confidence=1.0) are permanent ground truths — the extractor
+    cannot overwrite their type or confidence (enforced in upsert_node).
+    Their summary is only updated by an explicit confidence=1.0 write
+    (seed or dream cycle), never by the extractor.
 
-    Node types: anchor (permanent identity), skill (reusable capability).
-    All anchor nodes have confidence=1.0 and are never pruned by the cleanup policy.
+    Soul/policy text is NOT stored here — injected via the system prompt.
+    Skills are added separately by seed_skill_graph().
     """
-    # Guard: only seed once (check two stable anchors)
-    if graph.get_node("user") and graph.get_node("inner_self"):
+    # Guard: only seed once (check the two primary anchors)
+    if graph.get_node("sisyphean") and graph.get_node("user"):
         return
 
-    # ── Core identity anchors (confidence=1.0 — ground truths, never pruned) ───
+    # ── Self-identity anchor ──────────────────────────────────────────────────
+    graph.upsert_node(
+        "sisyphean", "anchor",
+        summary=(
+            "I am Sisyphean — a local AI agent running as a FastAPI service. "
+            "I reason, plan, use tools, and remember across sessions. "
+            "I serve Sumit. I run alongside BirdClaw (web UI + memory harness)."
+        ),
+        confidence=1.0,
+    )
+
+    # ── User anchor ───────────────────────────────────────────────────────────
     graph.upsert_node(
         "user", "anchor",
         summary=(
-            "The user running this machine. Name: Sumit. Role: developer / researcher. "
-            "Timezone: IST (UTC+5:30). OS: Windows 11."
+            "Sumit — developer and researcher. Builds local AI agents and tooling. "
+            "Location: India (IST, UTC+5:30). OS: Windows 11."
+        ),
+        confidence=1.0,
+    )
+
+    # ── Project nodes — not anchors so the dream cycle can freely enrich them ─
+    graph.upsert_node(
+        "sisyphean_project", "project",
+        summary=(
+            "Sisyphean engine: FastAPI on port 47291. Anthropic + OpenAI-compat API. "
+            "Agent loop: plan -> bash -> answer. Model: gemma4 via Ollama. "
+            "Skills: calc, web, arxiv, ocr, read_pdf, github_ops, youtube, maps, hf_hub, obsidian. "
+            "Path: C:/Users/hp/Desktop/Projects/Sisyphean."
         ),
         confidence=1.0,
     )
     graph.upsert_node(
-        "active_project", "anchor",
+        "birdclaw_project", "project",
         summary=(
-            "Current active project — Sisyphean (local AI agent, FastAPI, Ollama). "
-            "Sibling project: BirdClaw (web UI harness + memory layer). "
-            "Updated through conversation and dream cycle."
+            "BirdClaw: web UI harness and memory layer for Sisyphean. "
+            "FastAPI on port 47293. Dream cycle, inner life, skill runbooks, cron scheduler. "
+            "Delegates all reasoning to Sisyphean via SisypheanClient. "
+            "Path: C:/Users/hp/Desktop/Projects/BirdClaw."
         ),
         confidence=1.0,
     )
-    # Self-knowledge anchors — referenced by retrieval when identity questions arise
-    graph.upsert_node(
-        "inner_self", "anchor",
-        summary=(
-            "My evolving understanding of my own nature, built through actual "
-            "conversations rather than training defaults."
-        ),
-        confidence=1.0,
-    )
-    graph.upsert_node(
-        "world_model", "anchor",
-        summary=(
-            "Accumulated understanding of how the world works, built from research. "
-            "Updated by the dream cycle after each session."
-        ),
-        confidence=1.0,
-    )
-    # System environment — surfaces in planning so the model never guesses the OS
+
+    # ── System anchor — surfaces in planning so the model never guesses the OS ─
     graph.upsert_node(
         "system", "anchor",
         summary=(
-            "Windows 11 (AMD64). Python 3.13. Shell: PowerShell (NOT bash). "
-            "Use Get-Process, Get-WmiObject, Get-Date for system queries. "
-            "nvidia-smi available for GPU status. Conda available."
+            "Windows 11 (AMD64). Python 3.13. Shell: PowerShell (not bash). "
+            "Ollama on port 11434. Sisyphean on port 47291. BirdClaw on port 47293. "
+            "SearXNG search on port 8888. nvidia-smi available. Conda available. "
+            "Workspace: C:/Users/hp/Desktop/Projects/Sisyphean/workspace."
+        ),
+        confidence=1.0,
+    )
+
+    # ── Inner-self anchor — pointer to the living self-reflection document ────
+    graph.upsert_node(
+        "inner_self", "anchor",
+        summary=(
+            "My evolving self-understanding — built from actual conversations, "
+            "not training defaults. Maintained in memory/inner_self.md. "
+            "Updated by the dream cycle via LLM-merged self-reflections."
         ),
         confidence=1.0,
     )
 
     # ── Anchor edges ──────────────────────────────────────────────────────────
-    graph.upsert_edge("user", "works_on", "active_project", weight=1.0)
-    graph.upsert_edge("user", "runs_on",  "system",         weight=1.0)
+    graph.upsert_edge("sisyphean",         "serves",         "user",               weight=1.0)
+    graph.upsert_edge("sisyphean",         "runs_on",        "system",             weight=1.0)
+    graph.upsert_edge("sisyphean",         "is_engine_for",  "birdclaw_project",   weight=1.0)
+    graph.upsert_edge("user",              "builds",         "sisyphean_project",  weight=1.0)
+    graph.upsert_edge("user",              "builds",         "birdclaw_project",   weight=1.0)
+    graph.upsert_edge("sisyphean_project", "sibling_of",     "birdclaw_project",   weight=1.0)
 
-    logger.info("GraphStore seeded: user, active_project, inner_self, world_model, system")
+    logger.info(
+        "GraphStore seeded: sisyphean, user, sisyphean_project, "
+        "birdclaw_project, system, inner_self"
+    )
 
 
 def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:

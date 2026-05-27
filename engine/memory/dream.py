@@ -218,6 +218,21 @@ async def run_dream(
             logger.error("dream: cleanup pass failed: %s", exc, exc_info=True)
             result.errors = (result.errors or []) + [f"cleanup: {exc}"]
 
+    # ── Confidence decay pass ──────────────────────────────────────────────────
+    # Nodes not seen in > 30 days lose 10 % confidence per dream run.
+    # Prevents stale guesses from outranking fresh knowledge in retrieval.
+    if cleanup:
+        try:
+            from engine.memory.graph import knowledge_graph
+            decayed = _decay_stale_nodes(knowledge_graph, dry_run=dry_run)
+            if decayed:
+                logger.info("dream: decayed confidence on %d stale node(s)", decayed)
+            elif dry_run:
+                logger.info("dream: --dry-run — skipping confidence decay")
+        except Exception as exc:
+            logger.warning("dream: confidence decay pass failed: %s", exc)
+            result.errors = (result.errors or []) + [f"decay: {exc}"]
+
     return result
 
 
@@ -563,6 +578,76 @@ async def _refine_relations(client, graph, max_edges: int = 40) -> int:
         logger.info("dream: refined %d generic 'related_to' edges", refined)
 
     return refined
+
+
+def _decay_stale_nodes(graph, dry_run: bool = False) -> int:
+    """Apply confidence decay to graph nodes not updated in > 30 days.
+
+    Each dream run that visits a stale node multiplies its confidence by 0.9
+    (roughly -50% over 7 months), preventing old guesses from ranking above
+    fresh, better-evidenced knowledge in retrieval.
+
+    Floor: 0.10 — nodes are never fully silenced.
+    Protected: confidence >= 1.0 (anchors), type in {soul, session, system, skill}.
+    Returns the count of nodes whose confidence was reduced.
+    """
+    from datetime import datetime as _dt, timedelta, timezone as _tz
+
+    _SKIP_TYPES = frozenset({"soul", "session", "system", "skill"})
+    _STALE_DAYS = 30
+    _DECAY      = 0.9
+    _MIN_CONF   = 0.10
+
+    now       = _dt.now(_tz.utc)
+    threshold = now - timedelta(days=_STALE_DAYS)
+    decayed   = 0
+
+    try:
+        nodes_snapshot = list(graph._graph.nodes(data=True))
+    except Exception:
+        return 0
+
+    for key, data in nodes_snapshot:
+        if data.get("type", "") in _SKIP_TYPES:
+            continue
+        conf = float(data.get("confidence", 0.5))
+        if conf >= 1.0:
+            continue  # anchor node — protected
+
+        last_seen_raw = data.get("last_seen") or data.get("created_at") or ""
+        if not last_seen_raw:
+            continue
+        try:
+            ls = _dt.fromisoformat(last_seen_raw)
+            if ls.tzinfo is None:
+                ls = ls.replace(tzinfo=_tz.utc)
+        except Exception:
+            continue
+
+        if ls >= threshold:
+            continue  # recently active — no decay needed
+
+        new_conf = round(max(_MIN_CONF, conf * _DECAY), 4)
+        if new_conf >= conf:
+            continue  # already at floor
+
+        name = data.get("name", key)
+        if not dry_run:
+            with graph._lock:
+                graph._graph.nodes[key]["confidence"] = new_conf
+        decayed += 1
+        logger.debug(
+            "dream: decayed %r: conf %.3f -> %.3f (%d days stale)",
+            name[:40], conf, new_conf, (now - ls).days,
+        )
+
+    if decayed and not dry_run:
+        try:
+            graph.save()
+        except Exception as exc:
+            logger.warning("dream: could not save graph after decay: %s", exc)
+
+    return decayed
 
 
 async def _discover_skills(client, graph, workspace: Path) -> int:

@@ -166,6 +166,36 @@ def _build_existing_context(kg, conversation: str) -> str:
         return ""
 
 
+def _fuzzy_match_label(kg, label: str) -> str:
+    """Return the name of an existing node that closely matches *label*.
+
+    Uses Jaccard similarity on ≥3-char lowercase tokens.
+    Threshold: 0.75 — catches label variations like:
+      'Python programming' ↔ 'python-programming'
+      'calc skill'         ↔ 'calc-script'
+      'BirdClaw project'   ↔ 'birdclaw-project'
+
+    Single-token labels (< 2 tokens) are left to the exact-match
+    upsert mechanism — Jaccard over one token is too lossy.
+    Returns *label* unchanged when no close match is found.
+    """
+    label_toks = {w for w in re.findall(r"[a-z0-9]+", label.lower()) if len(w) >= 3}
+    if len(label_toks) < 2:
+        return label
+    best_name, best_j = label, 0.0
+    for node in kg.all_nodes():
+        name = node.get("name") or ""
+        if not name or name.lower() == label.lower():
+            continue
+        name_toks = {w for w in re.findall(r"[a-z0-9]+", name.lower()) if len(w) >= 3}
+        if not name_toks:
+            continue
+        j = len(label_toks & name_toks) / len(label_toks | name_toks)
+        if j > best_j:
+            best_j, best_name = j, name
+    return best_name if best_j >= 0.75 else label
+
+
 def _parse_json(text: str) -> dict | None:
     """Tolerant JSON parser — finds the first {...} block in model output."""
     start = text.find("{")
@@ -285,6 +315,12 @@ class MemoryExtractor:
                     logger.debug("extractor: dropped junk label %r", label[:40])
                     continue
 
+                # Fuzzy dedup: if a close variant already exists, merge into it.
+                deduped = _fuzzy_match_label(kg, label)
+                if deduped != label:
+                    logger.debug("extractor: fuzzy-merged %r -> %r", label[:40], deduped[:40])
+                    label = deduped
+
                 # Merge content into existing node rather than overwriting.
                 # When the LLM reuses an existing label (the dedup happy path),
                 # the new content should enrich, not replace, the stored summary.
@@ -314,48 +350,14 @@ class MemoryExtractor:
                 except Exception as _edge_exc:
                     logger.debug("extractor: type-edge failed: %s", _edge_exc)
 
-            # (2) Intra-fact entity edges: extract capitalised nouns from each
-            #     fact's content and create entity nodes + edges to the fact node.
-            #     This gives "Paris is the capital of France" →
-            #       fact:Paris — related_to → entity:France
-            for final_label, ftype in saved:
-                try:
-                    item_content = next(
-                        (i.get("content", "") for i in data.get("facts", [])
-                         if (i.get("label") or "").strip() == final_label),
-                        ""
-                    )
-                    if not item_content:
-                        continue
-                    # Extract capitalised noun phrases from the fact content
-                    _nouns = re.findall(
-                        r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\b', item_content
-                    )
-                    for noun in _nouns:
-                        if noun.lower() == final_label.lower():
-                            continue
-                        if len(noun) < 3:
-                            continue
-                        # Only create entity node if it doesn't already exist
-                        if not kg.get_node(noun):
-                            kg.upsert_node(noun, "entity",
-                                           summary=f"mentioned with: {final_label}")
-                        kg.upsert_edge(final_label, "related_to", noun, weight=0.6)
-                except Exception:
-                    pass
+            # (2) removed — regex noun extraction created low-confidence stub
+            #     entity nodes that polluted retrieval.  Explicit model-stated
+            #     relations (block 4 below) are the only non-anchor edges written.
 
-            # (3) Co-occurrence edges: facts from the same exchange are related.
-            for i in range(len(saved)):
-                for j in range(i + 1, min(i + 4, len(saved))):
-                    a_lbl, a_type = saved[i]
-                    b_lbl, b_type = saved[j]
-                    if (a_type == b_type
-                            or a_type in ("concept", "project")
-                            or b_type in ("concept", "project")):
-                        try:
-                            kg.upsert_edge(a_lbl, "related_to", b_lbl, weight=0.5)
-                        except Exception:
-                            pass
+            # (3) removed — co-occurrence edges ("these two facts appeared in the
+            #     same conversation") are semantically meaningless and the primary
+            #     source of graph noise.  All edges now come from anchor hub rules
+            #     (block 1) or explicit model-stated relations (block 4).
 
             # ── (4) Explicit relations from the model ─────────────────────────
             # The model now outputs a "relations" array of {from, relation, to}
@@ -370,11 +372,15 @@ class MemoryExtractor:
                     continue
                 if _is_junk_label(r_from) or _is_junk_label(r_to):
                     continue
-                # Ensure both endpoint nodes exist (create stubs if needed)
-                if not kg.get_node(r_from):
-                    kg.upsert_node(r_from, "entity", summary=r_from)
-                if not kg.get_node(r_to):
-                    kg.upsert_node(r_to, "entity", summary=r_to)
+                # Only wire an edge when both nodes already exist.
+                # Stub creation here caused the graph to fill up with one-word
+                # "entity" nodes that were never recalled (no summary, no confidence).
+                if not kg.get_node(r_from) or not kg.get_node(r_to):
+                    logger.debug(
+                        "extractor: skipping relation %r -[%s]-> %r (endpoint missing)",
+                        r_from[:30], r_relation, r_to[:30],
+                    )
+                    continue
                 # Normalise relation to snake_case
                 r_relation = re.sub(r'\s+', '_', r_relation)[:40]
                 kg.upsert_edge(r_from, r_relation, r_to, weight=0.8)

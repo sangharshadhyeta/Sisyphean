@@ -1,4 +1,22 @@
-# Sisyphean
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sangharshadhyeta/Sisyphean/master/assets/sisyphean.png" alt="Sisyphean Logo" width="90" height="90" onerror="this.style.display='none'" />
+</p>
+
+<h1 align="center">Sisyphean</h1>
+
+<p align="center">
+  <strong>Universal local AI engine — Anthropic + OpenAI compatible API.</strong><br/>
+  Reasoning · Planning · Tool execution · Web search — works with Claude Code and BirdClaw.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/compatible-Anthropic%20%7C%20OpenAI-blue?style=flat-square" />
+  <img src="https://img.shields.io/badge/runs-locally-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/works%20with-BirdClaw-purple?style=flat-square" />
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" />
+</p>
+
+---
 
 A local AI agent engine that runs as a persistent background service. It exposes the Anthropic Messages API (`/v1/messages`) and OpenAI Chat Completions (`/v1/chat/completions`), making it a drop-in model provider for Claude Code, BirdClaw, and any OpenAI-compatible client.
 

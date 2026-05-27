@@ -43,7 +43,12 @@ logger = logging.getLogger(__name__)
 _SESSIONS_DIR = Path.home() / ".sisyphean" / "sessions"
 _WATERMARK_FILE = _SESSIONS_DIR / ".memorised"
 
-_PERMANENT_NODE_TYPES = {"policy", "soul", "user", "project"}  # "soul" kept for backward compat
+_PERMANENT_NODE_TYPES = {
+    "anchor",                       # new unified permanent type (user, active_project, system, etc.)
+    "skill",                        # discovered/seeded skills — never expire
+    "policy", "soul",               # backward compat: old soul/policy nodes
+    "user", "project", "self",      # backward compat: old anchor type names
+}
 
 
 # ── Policy dataclass ──────────────────────────────────────────────────────────

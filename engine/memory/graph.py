@@ -625,36 +625,67 @@ knowledge_graph = GraphStore(_knowledge_graph_path())
 def seed_knowledge_graph(graph: GraphStore, policy_text: str) -> None:
     """Populate a fresh GraphStore with identity anchors.
 
-    Soul/policy text is NOT stored here — it is injected via the system prompt
-    by the engine directly. The KG holds only nodes that benefit retrieval.
+    Soul/policy text is NOT stored here — injected via the system prompt.
+    The KG holds only nodes that benefit retrieval.
+
+    Node types: anchor (permanent identity), skill (reusable capability).
+    All anchor nodes have confidence=1.0 and are never pruned by the cleanup policy.
     """
-    # Guard: only seed once (check the stable user node)
+    # Guard: only seed once (check two stable anchors)
     if graph.get_node("user") and graph.get_node("inner_self"):
         return
 
-    # ── Core identity anchors (always confidence=1.0 — ground truths) ─────────
+    # ── Core identity anchors (confidence=1.0 — ground truths, never pruned) ───
     graph.upsert_node(
-        "user", "user",
-        summary="User profile — filled in through conversation and dream cycle.",
+        "user", "anchor",
+        summary=(
+            "The user running this machine. Name: Sumit. Role: developer / researcher. "
+            "Timezone: IST (UTC+5:30). OS: Windows 11."
+        ),
         confidence=1.0,
     )
     graph.upsert_node(
-        "active_project", "project",
-        summary="Current project — to be filled in.",
+        "active_project", "anchor",
+        summary=(
+            "Current active project — Sisyphean (local AI agent, FastAPI, Ollama). "
+            "Sibling project: BirdClaw (web UI harness + memory layer). "
+            "Updated through conversation and dream cycle."
+        ),
         confidence=1.0,
     )
-    # Self-knowledge documents — referenced by retrieval when self-questions arise
+    # Self-knowledge anchors — referenced by retrieval when identity questions arise
     graph.upsert_node(
-        "inner_self", "self",
-        summary="My evolving understanding of my own nature, built through conversation.",
+        "inner_self", "anchor",
+        summary=(
+            "My evolving understanding of my own nature, built through actual "
+            "conversations rather than training defaults."
+        ),
         confidence=1.0,
     )
     graph.upsert_node(
-        "world_model", "self",
-        summary="Accumulated understanding of how the world works, built from research.",
+        "world_model", "anchor",
+        summary=(
+            "Accumulated understanding of how the world works, built from research. "
+            "Updated by the dream cycle after each session."
+        ),
         confidence=1.0,
     )
-    logger.info("GraphStore seeded: user, active_project, inner_self, world_model")
+    # System environment — surfaces in planning so the model never guesses the OS
+    graph.upsert_node(
+        "system", "anchor",
+        summary=(
+            "Windows 11 (AMD64). Python 3.13. Shell: PowerShell (NOT bash). "
+            "Use Get-Process, Get-WmiObject, Get-Date for system queries. "
+            "nvidia-smi available for GPU status. Conda available."
+        ),
+        confidence=1.0,
+    )
+
+    # ── Anchor edges ──────────────────────────────────────────────────────────
+    graph.upsert_edge("user", "works_on", "active_project", weight=1.0)
+    graph.upsert_edge("user", "runs_on",  "system",         weight=1.0)
+
+    logger.info("GraphStore seeded: user, active_project, inner_self, world_model, system")
 
 
 def seed_graph(graph: KnowledgeGraph, policy_text: str) -> None:

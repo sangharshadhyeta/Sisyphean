@@ -26,7 +26,7 @@ from pathlib import Path
 from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
-from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command
+from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command, route_query
 from engine.memory.skills import (
     get_skill_index, get_skill_runbook, get_skill_program,
     get_skill_script_path, save_skill_to_disk, save_skill_program_to_graph,
@@ -429,6 +429,16 @@ class Pipeline:
         top_quality  = "relevant" if len(top_context.split()) > 10 else ("minimal" if top_context else "none")
         _tracker.tree_context_done(task_id, f"top-level extract: {top_quality}")
 
+        # ── Stage 1.5: Route query — lightweight classifier ───────────────────
+        # Separate focused call before think_decompose so the planner receives a
+        # one-line hint rather than trying to simultaneously classify AND plan.
+        # Returns "" on failure — think_decompose then decides freely.
+        # Skip when BirdClaw already planned (bc_plan is not None).
+        _route = ""
+        if bc_plan is None:
+            _route = await route_query(query, self.client)
+            logger.info("pipeline: route=%r for query=%r", _route, query[:60])
+
         # ── Stage 2: Decompose into stages ───────────────────────────────────
         # If BirdClaw already ran generate_plan() (thinking=True) before routing
         # here, use that plan directly — no duplicate LLM planning call.
@@ -447,6 +457,7 @@ class Pipeline:
                 soul_section=soul_section,
                 workspace=self.workspace,
                 skill_index=skill_index,
+                route=_route,
             )
             _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
             logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
@@ -630,10 +641,12 @@ class Pipeline:
             ):
                 # Stage goal is already a concrete command — skip plan_task,
                 # extract the command and emit a bash step directly.
-                # Strip "COMMAND: Run " prefix that small models echo from the format description.
+                # Strip "COMMAND: Run " / "CMD: " prefixes that small models echo from format descriptions.
                 _task_stripped = re.sub(r'^command:\s*', '', task.strip(), flags=re.IGNORECASE)
                 if _task_stripped.lower().startswith("run "):
                     _task_stripped = _task_stripped[4:].strip()
+                # Also strip bare CMD: prefix (model echoes "Run CMD: '12*7'" → strip to '12*7')
+                _task_stripped = re.sub(r'^cmd[\s:]+', '', _task_stripped, flags=re.IGNORECASE).strip()
                 # Extract "; Save: TYPE" suffix before stripping — propagate as _save_after
                 # so _continue auto-inserts a save_memory step once the result is known.
                 _save_m = re.search(r'\s*;\s*[Ss]ave:\s*(\w+)\s*$', _task_stripped)
@@ -1248,8 +1261,8 @@ class Pipeline:
                     cl = canonical.lower()
                     if cl == "bash":
                         cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
-                        # Strip "COMMAND" prefix that models echo from format descriptions
-                        cmd = re.sub(r'^COMMAND[\s:]+', '', cmd, flags=re.IGNORECASE).strip()
+                        # Strip "COMMAND" / "CMD" prefix that models echo from format descriptions
+                        cmd = re.sub(r'^(?:COMMAND|CMD)[\s:]+', '', cmd, flags=re.IGNORECASE).strip()
                         # Extract "; Save: TYPE" before stripping — tag step so _continue
                         # can auto-insert a save_memory step once the result arrives.
                         # Skip if already tagged by the fast-path above.
@@ -3156,15 +3169,12 @@ _OS_NAME = _platform.system()   # "Windows", "Linux", "Darwin" — set once at i
 _BASH_CORRECT_SYSTEM = (
     "A shell command failed. Output ONLY a corrected JSON object: "
     '{\"command\": \"<fixed shell command>\"}\n'
+    f"OS: {_OS_NAME}.\n"
     "Rules:\n"
-    f"- OS is {_OS_NAME}. Fix the command for this OS.\n"
-    "- If the error says 'is not recognized' or 'command not found', the command is\n"
-    f"  likely wrong for {_OS_NAME}. Replace it with the correct {_OS_NAME} equivalent.\n"
-    "  Windows examples: uptime→(Get-Date)-(gcim Win32_OperatingSystem).LastBootUpTime, "
-    "ls→Get-ChildItem, grep→Select-String, find→Get-ChildItem -Recurse.\n"
-    "- Fix the specific error — wrong path, missing module, syntax error, etc.\n"
-    "- Keep the same intent as the original command.\n"
-    "- Do not explain. Do not use markdown. Output only the JSON object."
+    "- Fix the command so it achieves the same goal on this OS.\n"
+    "- If the original command is fundamentally wrong (not recognized, wrong syntax),\n"
+    "  use a completely different approach that achieves the same goal.\n"
+    "- Do not explain. Output only the JSON object."
 )
 
 

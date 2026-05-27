@@ -147,18 +147,6 @@ _STEP_NUMBER_RE = re.compile(
     r'^(?:step\s*\d+\s*[:.)]\s*|\d+\s*[:.)]\s*)',
     re.IGNORECASE,
 )
-# Fast-path patterns — skip the LLM for trivially social messages
-_GREETING_RE = re.compile(
-    r'^\s*(?:hi|hello|hey|howdy|greetings|sup|yo)'
-    r'(?:\s+(?:there|everyone|all|friend))?\s*[!?.]*\s*$',
-    re.IGNORECASE,
-)
-_SOCIAL_RE = re.compile(
-    r'^\s*(?:thanks?(?:\s+you)?|thank\s+you|thx|ty|cheers'
-    r'|ok(?:ay)?|sure|got\s+it|sounds?\s+good|great|cool|nice'
-    r'|bye(?:\s+bye)?|goodbye|see\s+ya?|later)\s*[!?.]*\s*$',
-    re.IGNORECASE,
-)
 
 
 def infer_stage_type(step_text: str) -> str:
@@ -404,7 +392,7 @@ Output only the JSON — no explanation."""
 # step the planner should suggest — small models otherwise emit save_memory
 # for tasks that should run bash.
 _INTERNAL_TOOLS = [
-    ("direct",        "answer directly without any tool call — use for greetings, thanks, simple chat, capability questions"),
+    ("direct",        "ONLY when the answer is already in the provided context (memory, history, recall). Never use if the answer must be looked up or computed."),
     ("web_search",    "search the web for any factual or current information"),
     ("search_memory", "look up previously saved facts or research from past sessions"),
     ("write_plan",    "write a file section-by-section with verify-and-retry — "
@@ -484,8 +472,9 @@ def _build_plan_system(outer_tools: list[dict], skill_index: str = "") -> str:
                 lines.append(f"  run_skill:{_sname} — {_sdesc}")
     lines += [
         "",
-        "Use 'direct' for: hi, hello, thanks, what can you do, are you alive, simple social exchanges.",
-        "Use web_search for any factual question worth knowing — current or timeless.",
+        "Use 'direct' ONLY when the answer is already in the provided context (memory, history, recall).",
+        "Never use 'direct' if the answer must be looked up or computed — use web_search or bash.",
+        "Never answer from training knowledge. Every fact must come from web_search or bash.",
         "Each web_search query must be a short keyword phrase — strip question words.",
         "If the task asks for two dependent things (identify X, then details of X), use two steps.",
         "Research, analysis, or explanation tasks MUST use at least 2 steps (e.g. web_search then direct).",
@@ -604,29 +593,12 @@ Do not explain. Do not pick a different tool. Output the command string only.
 """
 
 
-_CONCRETE_CMD_RE = re.compile(
-    r"^(python\d*|pip\d*|node|npm|npx|go|cargo|make|cmake|gcc|g\+\+|"
-    r"powershell|pwsh|cmd|bash|sh|zsh|Get-|Set-|New-|Remove-|"
-    r"git|docker|kubectl|curl|wget|ls|dir|cd|mkdir|rm|cp|mv|cat|echo|"
-    r"systeminfo|ipconfig|ifconfig|ps|top|htop|nvidia-smi|wmic|tasklist|"
-    r"pytest|unittest|coverage|mypy|ruff|black|flake8)\b",
-    re.IGNORECASE,
-)
-
-
 async def resolve_bash_command(goal: str, client, context: str = "") -> str:
-    """Ask the model what bash command to run for a verify-stage goal.
+    """Ask the model what shell command to run for a verify-stage goal.
 
     Returns the command string, or empty string on failure.
     The tool selection has already been made (bash) — this only resolves WHAT to run.
-    Short-circuits without an LLM call when the goal is already a concrete command.
     """
-    # Goal is already a runnable command — no LLM call needed.
-    goal_stripped = goal.strip()
-    if _CONCRETE_CMD_RE.match(goal_stripped):
-        logger.debug("resolve_bash_command: goal IS the command — skipping LLM: %s", goal_stripped[:80])
-        return goal_stripped
-
     prompt = f"Goal: {goal}"
     if context:
         prompt += f"\nContext: {context[:300]}"
@@ -656,6 +628,77 @@ async def resolve_bash_command(goal: str, client, context: str = "") -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Query router — dedicated first-step classifier
+# ---------------------------------------------------------------------------
+
+_ROUTE_SYSTEM = """\
+Classify this task into one category. Output the category name only — one word, no punctuation.
+
+  direct  — the answer is already present in the provided context (memory, history, recall)
+  bash    — can be computed or executed locally on this machine (no external data needed)
+  search  — requires external data that does not exist on this machine
+  memory  — user wants to save or recall something
+  code    — create or modify a file
+
+If the answer is NOT already in context, never use direct — use bash or search."""
+
+_ROUTE_LABELS = frozenset({"direct", "bash", "search", "memory", "code"})
+
+_ROUTE_HINTS: dict[str, str] = {
+    "bash":   "Router: computation/bash task — plan a Run step.",
+    "search": "Router: factual/research task — plan a Search step.",
+    "memory": "Router: save user preference — plan a Save step.",
+    "code":   "Router: file creation task — plan a Write step.",
+    "direct": "Router: conversational reply — use steps=\"\".",
+}
+
+
+async def route_query(query: str, client) -> str:
+    """Lean router — single focused LLM call, returns one of _ROUTE_LABELS.
+
+    Returns "" on failure so think_decompose falls back to its own judgment.
+    This is an additive step: it biases think_decompose without replacing it.
+    """
+    try:
+        result = await client.generate(
+            [
+                {"role": "system", "content": _ROUTE_SYSTEM},
+                {"role": "user",   "content": query[:200]},
+            ],
+            max_tokens=256,  # thinking=True: reasoning in reasoning field, word in content
+            temperature=0.0,
+            stream=False,
+            thinking=True,
+        )
+        msg = result["choices"][0]["message"]
+        # content has the actual word after thinking
+        # fall back to last word of reasoning if content is empty (Ollama token exhaustion)
+        raw = (msg.get("content") or "").strip().lower()
+        if not raw:
+            reasoning = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip().lower()
+            # take the last non-empty word — models often end reasoning with the answer
+            words = [w for w in re.split(r"\W+", reasoning) if w]
+            if words:
+                raw = words[-1]
+        # Strip think blocks
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Extract first word
+        word = re.split(r"\W+", raw)[0] if raw else ""
+        if word in _ROUTE_LABELS:
+            logger.info("route_query: %r → %s", query[:50], word)
+            return word
+        # Fuzzy fallback for longer outputs
+        for label in _ROUTE_LABELS:
+            if label in raw:
+                logger.info("route_query: %r → %s (fuzzy)", query[:50], label)
+                return label
+    except Exception as exc:
+        logger.debug("route_query failed: %s", exc)
+    logger.debug("route_query: unknown route for %r — think_decompose decides", query[:50])
+    return ""
+
+
 _THINK_DECOMPOSE_SYSTEM = """\
 You are a task router. Output ONLY valid JSON: {"outcome": "...", "steps": "..."}
 
@@ -669,19 +712,17 @@ STEP FORMATS:
 
 ROUTING RULES:
 
-steps="" ONLY for pure social/conversational replies that need no factual lookup,
-  no computation, and no file: greetings (hi/hello/hey), acknowledgements (ok/thanks),
-  capability questions (what can you do?), existential questions (are you alive?).
-  Do NOT use steps="" for any factual question or arithmetic — those always need a tool.
+steps="" ONLY when the answer is already present in the provided context
+  (memory recall, graph, or conversation history). If the answer is not
+  in context, always use a tool — never answer from training knowledge.
 
-steps="Search KEYWORDS" for factual questions that cannot be computed: capitals, people,
-  history, definitions, events, versions, how-to procedures, prices, commands.
-  Do NOT use Search for arithmetic or math — use Run for those.
+steps="Search KEYWORDS" for any factual question not already in context.
+  Do NOT use Search for computation — use Run for those.
 
-steps="Run COMMAND" for shell actions and TEMPORARY scratch work: one-off checks,
-  file system operations, running scripts, installing packages.
+steps="Run COMMAND" for shell actions and TEMPORARY scratch work.
+  For computation: use the calc skill when available (preferred).
+  Otherwise write a small program and run it — never use python -c one-liners.
   Example: steps="Run mkdir test123"
-  Example: steps="Run echo 'import sys; print(int(sys.argv[1])+int(sys.argv[2]))' > WORKSPACE/add.py | Run python WORKSPACE/add.py 5 3"
 
 steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to create
   and keep: Python programs, modules, extractors, full applications, documents,
@@ -713,6 +754,7 @@ async def think_decompose(
     soul_section: str = "",
     workspace: str = "",
     skill_index: str = "",
+    route: str = "",
 ) -> tuple[str, list[dict]]:
     """LLM planning call that decomposes the task into stages.
 
@@ -731,19 +773,15 @@ async def think_decompose(
     The LLM decides routing — greetings, social replies, capability questions
     all return steps="" (direct) based on the prompt instructions.
 
-    Fast-path bypasses LLM for trivial social messages (_GREETING_RE, _SOCIAL_RE)
-    to avoid a wasted model call for "hi", "thanks", "ok", etc.
-
     skill_index: compact bullet list from get_skill_index() — tells the model
     which skills it already has for this task so it can plan a read_skill step
     instead of rediscovering from scratch.
     """
-    # Fast path — skip LLM entirely for trivial social inputs
-    if _GREETING_RE.match(query) or _SOCIAL_RE.match(query):
-        logger.debug("think_decompose: social fast-path for %r", query[:40])
-        return query[:80], [{"type": "direct", "goal": query}]
-
     prompt = f"Task: {query[:300]}"
+    if route and route in _ROUTE_HINTS:
+        # Router hint prepended so think_decompose sees the classification first,
+        # then the task — reduces "direct answer" collapse on small models.
+        prompt = f"{_ROUTE_HINTS[route]}\n{prompt}"
     if workspace:
         prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:
@@ -910,3 +948,44 @@ async def plan_task(
 
     # No steps produced — synthesizer will answer directly from query + context
     return []
+
+
+# ── One-shot code generation ──────────────────────────────────────────────────
+
+_GENERATE_CODE_SYSTEM = """\
+You are a code generator. Output ONLY the raw file content — no markdown fences, \
+no explanation, no commentary. If generating Python, output valid Python. \
+If generating another language, output valid code for that language.
+"""
+
+
+async def _generate_code(task: str, client) -> str:
+    """Generate file content for a write-code task in a single LLM call.
+
+    Used as a fallback when the subtask planner produces no items, and when
+    regenerating file content with epistemic context injected. Returns the
+    generated text, or empty string on failure.
+    """
+    try:
+        result = await client.generate(
+            [
+                {"role": "system", "content": _GENERATE_CODE_SYSTEM},
+                {"role": "user",   "content": task[:2000]},
+            ],
+            max_tokens=1200,
+            temperature=0.2,
+            stream=False,
+            thinking=False,
+        )
+        raw = (result["choices"][0]["message"]["content"] or "").strip()
+        # Strip accidental markdown fences the model sometimes emits
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            raw = "\n".join(
+                line for line in lines
+                if not line.strip().startswith("```")
+            ).strip()
+        return raw
+    except Exception as exc:
+        logger.warning("_generate_code: LLM call failed: %s", exc)
+        return ""

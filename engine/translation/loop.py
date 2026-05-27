@@ -77,12 +77,9 @@ class TranslationLoop:
         system_context: str = "",
     ) -> LoopResponse:
         """Delegate to the core pipeline."""
-        if system_context:
-            import re as _re
-            m = _re.search(r"cwd:\s*([^|]+)", system_context)
-            if m:
-                self.workspace = m.group(1).strip()
-                self._pipeline.workspace = self.workspace
+        # cwd from system_context is the Claude Code project dir — used by the pipeline
+        # for file path resolution (project_dir), NOT for Sisyphean's own workspace.
+        # Workspace stays as configured so skill files and temp files go to the right place.
 
         # No tools → direct generation (bypass pipeline)
         if not available_tools:

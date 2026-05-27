@@ -465,13 +465,14 @@ class Pipeline:
                         outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
         else:
             _tracker.tree_context_running(task_id, "think-decompose")
-            # Spec: think_decompose receives question + skill_hint + user_prefs +
-            # top-3 graph nodes (not capped at 400 chars). Assemble within budget.
+            # Need-to-know: think_decompose gets graph nodes only (no history).
+            # Spec for generate_plan: question, route hint, user_prefs, graph nodes.
+            # top_context (history extract) intentionally excluded.
             _graph_for_decompose = _search_graph(query, self.graph) if self.graph else ""
-            _decompose_ctx = "\n\n".join(p for p in (
-                top_context,
-                f"[Memory]\n{_graph_for_decompose[:300]}" if _graph_for_decompose else "",
-            ) if p)[:_CTX_DECOMPOSE]
+            _decompose_ctx = (
+                f"[Memory]\n{_graph_for_decompose[:_CTX_DECOMPOSE]}"
+                if _graph_for_decompose else ""
+            )
             outcome, stages = await think_decompose(
                 query, self.client,
                 context=_decompose_ctx,
@@ -572,12 +573,11 @@ class Pipeline:
             # Prepend the original query so plan_task always has the full user request,
             # even when the stage goal is a vague placeholder like "check system status".
             original_ctx = f"Original request: {query}" if task != query else ""
-            # recall_ctx: ≤100-word summary from recent history + graph + files
-            # placed first so it's never truncated by downstream context limits.
-            # graph_block removed from here — graph_recall goes as separate graph_nodes
-            # param so stage 2+ context block stays clean (spec: no GraphRAG in task_ctx).
-            recall_block = f"[Recall]\n{recall_ctx}" if recall_ctx else ""
-            task_ctx = "\n\n".join(p for p in (recall_block, original_ctx, task_history, ws_block, project_ctx) if p)
+            # Need-to-know: plan_task gets question + workspace only.
+            # Spec for generate_plan: question, skill_hint, user_prefs, graph nodes, tools.
+            # History (recall_ctx, task_history) and project_ctx NOT listed — excluded.
+            # graph_recall passed separately as graph_nodes (own _CTX_PLAN_GRAPH budget).
+            task_ctx = "\n\n".join(p for p in (original_ctx, ws_block) if p)
             all_extracted.append(task_history)
 
             if graph_recall:
@@ -760,10 +760,11 @@ class Pipeline:
         # verbatim so conversational continuity is never broken by the filter.
         recent_turns = recent_turns_text   # last 2 user+asst pairs (computed in process())
 
-        # memory_ctx first — soul policy, user knowledge, self-concept.
-        # recent_turns second — takes precedence over Jaccard-filtered history.
+        # Need-to-know: synthesis gets soul/memory + recent conversation + filtered history.
+        # project_ctx (CLAUDE.md, cwd) excluded — spec for answer: question, soul,
+        # user_prefs, recent turns, task results. project_ctx is for Claude Code, not synthesis.
         synthesis_ctx = "\n\n".join(
-            p for p in (memory_ctx, recent_turns, synthesis_history, project_ctx) if p
+            p for p in (memory_ctx, recent_turns, synthesis_history) if p
         )
 
         state = PipelineState(
@@ -2046,7 +2047,11 @@ class Pipeline:
                 logger.debug("write_plan: injected %d chars of cross-file sigs for %r",
                              len(_sigs), title[:40])
         else:
-            conv_ctx = state.synthesis_ctx[:800].strip() if state.synthesis_ctx else ""
+            # Need-to-know: write_doc gets research notes only — no synthesis_ctx.
+            # synthesis_ctx contains conversation history which contaminates section
+            # structure (model generates function names from essay headings etc.).
+            # Research notes (notes.md) provide the relevant findings already.
+            conv_ctx = ""
             # Inject session research notes — web_search / web_fetch results
             # written to notes.md during this session's research phase.
             # Uses search_relevant so only the parts pertinent to this section

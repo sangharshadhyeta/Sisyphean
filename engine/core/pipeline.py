@@ -720,19 +720,23 @@ class Pipeline:
                         logger.warning("pipeline: save_memory stage failed: %s", exc)
                 steps = [{"tool": "save_memory", "input": fact, "result": "saved",
                           "summary": f"saved: {fact[:80]}"}]
-            elif re.match(r'^search\s+keywords?\s*', task.strip(), re.IGNORECASE):
-                # "Search KEYWORDS [Platform:] <query>"
-                # Small models echo this literal prefix from the decomposer plan format;
-                # strip it and route directly to web_search.
-                _kw = re.sub(r'^search\s+keywords?\s*', '', task.strip(), flags=re.IGNORECASE)
-                # Strip any leading "Platform: " token (e.g. "arXiv: ", "HuggingFace: ")
-                _kw = re.sub(r'^[A-Za-z0-9_\-]+:\s*', '', _kw).strip()
-                # Strip enclosing quotes
+            elif re.match(r'^search[\s:]', task.strip(), re.IGNORECASE):
+                # "Search: keyword phrase" (new decomposer format) or legacy
+                # "Search KEYWORDS <phrase>" — strip the prefix and use the
+                # remainder as-is; the new prompts already produce clean keywords.
+                _kw = task.strip()
+                # Strip "Search:" / "Search KEYWORDS" / "Search KEYWORD" prefix
+                for _pfx in ("search keywords:", "search keyword:", "search keywords ",
+                              "search keyword ", "search:"):
+                    if _kw.lower().startswith(_pfx):
+                        _kw = _kw[len(_pfx):].strip()
+                        break
+                # Strip enclosing quotes if present
                 if len(_kw) >= 2 and _kw[0] in ('"', "'") and _kw[-1] == _kw[0]:
                     _kw = _kw[1:-1].strip()
                 if not _kw:
                     _kw = task.strip()
-                logger.info("pipeline: Search KEYWORDS literal → web_search: %s", _kw[:80])
+                logger.info("pipeline: Search literal → web_search: %s", _kw[:80])
                 steps = [{"tool": "web_search", "input": _kw}]
             elif task.strip().lower().startswith("run ") or re.match(
                 r'^command:\s*run\s+', task.strip(), re.IGNORECASE

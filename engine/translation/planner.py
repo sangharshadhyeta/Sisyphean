@@ -646,11 +646,11 @@ If the answer is NOT already in context, never use direct — use bash or search
 _ROUTE_LABELS = frozenset({"direct", "bash", "search", "memory", "code"})
 
 _ROUTE_HINTS: dict[str, str] = {
-    "bash":   "Router: computation/bash task — plan a Run step.",
-    "search": "Router: factual/research task — plan a Search step.",
-    "memory": "Router: save user preference — plan a Save step.",
-    "code":   "Router: file creation task — plan a Write step.",
-    "direct": "Router: conversational reply — use steps=\"\".",
+    "bash":   "Hint: this needs computation — plan a Run step (use skill:calc if available).",
+    "search": "Hint: this needs a web lookup — plan a Search step.",
+    "memory": "Hint: user wants to save something — plan a Save step.",
+    "code":   "Hint: user wants a file created — plan a Write step.",
+    "direct": "Hint: purely conversational — steps can be empty.",
 }
 
 
@@ -719,10 +719,9 @@ steps="" ONLY when the answer is already present in the provided context
 steps="Search KEYWORDS" for any factual question not already in context.
   Do NOT use Search for computation — use Run for those.
 
-steps="Run COMMAND" for shell actions and TEMPORARY scratch work.
-  For computation: use the calc skill when available (preferred).
-  Otherwise write a small program and run it — never use python -c one-liners.
-  Example: steps="Run mkdir test123"
+steps="Run COMMAND" for shell actions and ALL computation.
+  For computation: use the calc skill — plan "Run skill:calc EXPRESSION".
+  NEVER use steps="Write..." for computation or expressions — Write is for permanent user files only.
 
 steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to create
   and keep: Python programs, modules, extractors, full applications, documents,
@@ -779,9 +778,9 @@ async def think_decompose(
     """
     prompt = f"Task: {query[:300]}"
     if route and route in _ROUTE_HINTS:
-        # Router hint prepended so think_decompose sees the classification first,
-        # then the task — reduces "direct answer" collapse on small models.
-        prompt = f"{_ROUTE_HINTS[route]}\n{prompt}"
+        # Router hint appended after the task so the model reads the task first,
+        # then receives the classification nudge — prevents prefix confusion.
+        prompt += f"\n{_ROUTE_HINTS[route]}"
     if workspace:
         prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:

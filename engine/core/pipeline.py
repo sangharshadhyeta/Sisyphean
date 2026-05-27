@@ -573,11 +573,23 @@ class Pipeline:
             # Prepend the original query so plan_task always has the full user request,
             # even when the stage goal is a vague placeholder like "check system status".
             original_ctx = f"Original request: {query}" if task != query else ""
-            # Need-to-know: plan_task gets question + workspace only.
-            # Spec for generate_plan: question, skill_hint, user_prefs, graph nodes, tools.
-            # History (recall_ctx, task_history) and project_ctx NOT listed — excluded.
-            # graph_recall passed separately as graph_nodes (own _CTX_PLAN_GRAPH budget).
-            task_ctx = "\n\n".join(p for p in (original_ctx, ws_block) if p)
+            # Plan context: compact per-item caps so all slots survive the
+            # overall _CTX_PLAN truncation.  graph_recall goes separately as
+            # graph_nodes (own _CTX_PLAN_GRAPH budget — never merged here).
+            #   recall    300  — project status: what's been done, graph facts
+            #   question   ~80  — original user request
+            #   history   400  — task-focused conversation (what was tried/decided)
+            #   workspace ~200  — current file listing
+            #   project   300  — CLAUDE.md architecture constraints
+            _recall_snip  = recall_ctx[:300]   if recall_ctx   else ""
+            _history_snip = task_history[:400]  if task_history else ""
+            _project_snip = project_ctx[:300]   if project_ctx  else ""
+            recall_block  = f"[Recall]\n{_recall_snip}"    if _recall_snip  else ""
+            history_block = f"[History]\n{_history_snip}"  if _history_snip else ""
+            project_block = f"[Project]\n{_project_snip}"  if _project_snip else ""
+            task_ctx = "\n\n".join(
+                p for p in (recall_block, original_ctx, history_block, ws_block, project_block) if p
+            )
             all_extracted.append(task_history)
 
             if graph_recall:
@@ -760,11 +772,13 @@ class Pipeline:
         # verbatim so conversational continuity is never broken by the filter.
         recent_turns = recent_turns_text   # last 2 user+asst pairs (computed in process())
 
-        # Need-to-know: synthesis gets soul/memory + recent conversation + filtered history.
-        # project_ctx (CLAUDE.md, cwd) excluded — spec for answer: question, soul,
-        # user_prefs, recent turns, task results. project_ctx is for Claude Code, not synthesis.
+        # Synthesis context: soul/memory + recent turns + filtered history + project snapshot.
+        # project_ctx capped to 300 chars — synthesizer needs architecture awareness
+        # ("entrypoint is main.py", file layout) to answer project-state questions
+        # accurately, but not the full CLAUDE.md.
+        _synth_project = project_ctx[:300] if project_ctx else ""
         synthesis_ctx = "\n\n".join(
-            p for p in (memory_ctx, recent_turns, synthesis_history) if p
+            p for p in (memory_ctx, recent_turns, synthesis_history, _synth_project) if p
         )
 
         state = PipelineState(
@@ -2047,11 +2061,12 @@ class Pipeline:
                 logger.debug("write_plan: injected %d chars of cross-file sigs for %r",
                              len(_sigs), title[:40])
         else:
-            # Need-to-know: write_doc gets research notes only — no synthesis_ctx.
-            # synthesis_ctx contains conversation history which contaminates section
-            # structure (model generates function names from essay headings etc.).
-            # Research notes (notes.md) provide the relevant findings already.
-            conv_ctx = ""
+            # Write_doc: inject capped synthesis_ctx for conversational decisions
+            # about what the doc should contain (e.g. user said "focus on X").
+            # 400 chars — enough for the last 1-2 relevant turns without bloating
+            # the write prompt.  The function-name contamination risk is code-only
+            # (handled in the if-branch above); doc sections use ## headings.
+            conv_ctx = state.synthesis_ctx[:400].strip() if state.synthesis_ctx else ""
             # Inject session research notes — web_search / web_fetch results
             # written to notes.md during this session's research phase.
             # Uses search_relevant so only the parts pertinent to this section

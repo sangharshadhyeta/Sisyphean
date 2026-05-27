@@ -4,7 +4,7 @@
 llm:
   model_path: "C:/llama.cpp/models/gemma4-e2b-q8.gguf"
   model_name: sisyphean-qwen3:latest       # name exposed via /v1/models
-  local_model: "qwen3:0.6b"              # non-empty = use Ollama
+  local_model: "gemma4:latest"               # non-empty = use Ollama
   server:
     host: 127.0.0.1
     port: 8080                         # llama-server default port

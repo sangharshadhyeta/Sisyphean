@@ -434,6 +434,14 @@ class Pipeline:
         # Injected into think_decompose + plan_task so the model sees "I have a
         # skill for this" without loading any full runbook token cost.
         skill_index = get_skill_index(query, self.graph) if self.graph else ""
+        # Guard: only show calc skill when the query contains digits or math operators.
+        # Without this, small models (qwen3:0.6b) pick calc for "latest Python version"
+        # (confuses "Python" with the calc skill) or "create a folder" queries.
+        if skill_index and not any(c in query for c in "0123456789+-*/^%()"):
+            skill_index = "\n".join(
+                line for line in skill_index.splitlines()
+                if "calc" not in line.lower()
+            )
         if skill_index:
             logger.debug("pipeline: skill index hit for %r", query[:40])
 
@@ -658,6 +666,20 @@ class Pipeline:
                 _skill_goal_m = re.match(
                     r'^run\s+skill:(\S+)\s*(.*)', task.strip(), re.IGNORECASE
                 )
+            if _skill_goal_m:
+                _sg_name = _skill_goal_m.group(1)
+                _sg_args = _skill_goal_m.group(2).strip()
+                # Placeholder guard: if args is an ALL_CAPS word the model echoed
+                # from the format description (e.g. "EXPRESSION", "ARGS", "QUERY"),
+                # discard this match — it's template noise, not a real invocation.
+                _PLACEHOLDER_PAT = re.compile(r'^[A-Z][A-Z_\s]*$')
+                if _sg_args and _PLACEHOLDER_PAT.match(_sg_args):
+                    logger.info(
+                        "pipeline: skill goal placeholder guard — args %r looks like "
+                        "a template echo, not a real invocation; discarding",
+                        _sg_args,
+                    )
+                    _skill_goal_m = None
             if _skill_goal_m:
                 _sg_name = _skill_goal_m.group(1)
                 _sg_args = _skill_goal_m.group(2).strip()

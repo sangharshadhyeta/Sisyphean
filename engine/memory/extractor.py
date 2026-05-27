@@ -135,23 +135,36 @@ def _is_junk_label(label: str) -> bool:
     )
 
 
-def _build_existing_context(kg, conversation: str) -> str:
+async def _build_existing_context(
+    kg,
+    conversation: str,
+    embed_client: "EmbeddingClient | None" = None,
+) -> str:
     """Query the graph for nodes relevant to this conversation and format them
     for injection into the extraction prompt.
+
+    Uses semantic (embedding) search when available so the LLM sees the most
+    conceptually relevant existing nodes, not just keyword matches.
+    Falls back to keyword search when the embedding client is unavailable.
 
     The LLM sees these existing labels and is instructed to reuse them rather
     than inventing new names — this prevents semantic duplicates at the source.
     Returns an empty string when the graph is empty or the query fails.
     """
     try:
-        hits = kg.search(conversation[:400], limit=8)
+        if embed_client is not None:
+            hits = await kg.search_by_embedding(
+                conversation[:400], embed_client, limit=8,
+            )
+        else:
+            hits = kg.search(conversation[:400], limit=8)
         if not hits:
             return ""
         lines = []
         for h in hits:
-            name = h.get("name") or h.get("label", "")
+            name    = h.get("name") or h.get("label", "")
             summary = (h.get("summary") or h.get("content", ""))[:120]
-            ntype = h.get("type", "?")
+            ntype   = h.get("type", "?")
             if name and summary:
                 lines.append(f'  "{name}" [{ntype}]: {summary}')
         if not lines:
@@ -166,18 +179,11 @@ def _build_existing_context(kg, conversation: str) -> str:
         return ""
 
 
-def _fuzzy_match_label(kg, label: str) -> str:
-    """Return the name of an existing node that closely matches *label*.
+def _jaccard_match_label(kg, label: str) -> str:
+    """Jaccard fallback dedup — used when the embedding client is unavailable.
 
-    Uses Jaccard similarity on ≥3-char lowercase tokens.
-    Threshold: 0.75 — catches label variations like:
-      'Python programming' ↔ 'python-programming'
-      'calc skill'         ↔ 'calc-script'
-      'BirdClaw project'   ↔ 'birdclaw-project'
-
-    Single-token labels (< 2 tokens) are left to the exact-match
-    upsert mechanism — Jaccard over one token is too lossy.
-    Returns *label* unchanged when no close match is found.
+    Threshold 0.75 on ≥3-char tokens.  Single-token labels are left unchanged
+    (one token is too lossy for Jaccard to be reliable).
     """
     label_toks = {w for w in re.findall(r"[a-z0-9]+", label.lower()) if len(w) >= 3}
     if len(label_toks) < 2:
@@ -194,6 +200,64 @@ def _fuzzy_match_label(kg, label: str) -> str:
         if j > best_j:
             best_j, best_name = j, name
     return best_name if best_j >= 0.75 else label
+
+
+async def _semantic_match_label(
+    kg,
+    label: str,
+    embed_client: "EmbeddingClient | None",
+) -> str:
+    """Return the name of an existing node that semantically matches *label*.
+
+    Strategy
+    --------
+    1. Embed the new label via the embedding client.
+    2. Compare against cached embeddings of all existing nodes.
+       Each node is represented as "<name>: <summary>" (first 200 chars).
+    3. If cosine similarity ≥ 0.82, return the matching node's name so the
+       caller merges into it rather than creating a duplicate.
+    4. Fall back to Jaccard (threshold 0.75) if embeddings are unavailable.
+
+    Threshold 0.82 is intentionally tight — semantic embedding space is rich
+    enough that 0.82 means very close paraphrases, not just topic overlap.
+    Example hits:
+      'prefers dark mode'  ↔  'dark mode preference'          (sim ≈ 0.91)
+      'Python dev'         ↔  'Python developer'              (sim ≈ 0.95)
+    Example misses (correctly rejected):
+      'vim editor'         ↔  'text editor productivity'      (sim ≈ 0.74)
+    """
+    if embed_client is None:
+        return _jaccard_match_label(kg, label)
+
+    from engine.llm.embeddings import cosine_similarity
+
+    label_vec = await embed_client.embed(label)
+    if label_vec is None:
+        # Embedding service down — fall back silently
+        return _jaccard_match_label(kg, label)
+
+    best_name, best_sim = label, 0.0
+    for node in kg.all_nodes():
+        name = node.get("name") or ""
+        if not name or name.lower() == label.lower():
+            continue
+        summary   = (node.get("summary") or "")[:200]
+        node_text = f"{name}: {summary}" if summary else name
+        node_key  = node.get("key", name.lower())
+        node_vec  = await embed_client.embed(node_text, cache_key=node_key)
+        if node_vec is None:
+            continue
+        sim = cosine_similarity(label_vec, node_vec)
+        if sim > best_sim:
+            best_sim, best_name = sim, name
+
+    if best_sim >= 0.82:
+        logger.debug(
+            "extractor: semantic-merged %r → %r (sim=%.3f)",
+            label[:40], best_name[:40], best_sim,
+        )
+        return best_name
+    return label
 
 
 def _parse_json(text: str) -> dict | None:
@@ -217,10 +281,12 @@ class MemoryExtractor:
         graph: KnowledgeGraph,
         store: ArtifactStore,
         client: LlamaClient,
+        embed_client: "EmbeddingClient | None" = None,
     ) -> None:
-        self.graph = graph
-        self.store = store
-        self.client = client
+        self.graph        = graph
+        self.store        = store
+        self.client       = client
+        self.embed_client = embed_client   # None → Jaccard fallback throughout
 
     def extract_later(self, user_message: str, assistant_response: str) -> None:
         """Fire-and-forget: schedule extraction without blocking the response."""
@@ -269,8 +335,9 @@ class MemoryExtractor:
         # Injecting existing relevant nodes lets the model reuse existing labels
         # rather than inventing new ones — the primary dedup mechanism.
         kg = _knowledge_graph()
-        existing_block = _build_existing_context(
-            kg, f"{user_message} {assistant_response}"
+        existing_block = await _build_existing_context(
+            kg, f"{user_message} {assistant_response}",
+            embed_client=self.embed_client,
         )
 
         prompt = _PROMPT.format(
@@ -315,10 +382,11 @@ class MemoryExtractor:
                     logger.debug("extractor: dropped junk label %r", label[:40])
                     continue
 
-                # Fuzzy dedup: if a close variant already exists, merge into it.
-                deduped = _fuzzy_match_label(kg, label)
+                # Semantic dedup: find an existing node that means the same thing.
+                # Uses embedding cosine similarity (≥0.82) when the client is
+                # available; falls back to Jaccard token overlap (≥0.75) otherwise.
+                deduped = await _semantic_match_label(kg, label, self.embed_client)
                 if deduped != label:
-                    logger.debug("extractor: fuzzy-merged %r -> %r", label[:40], deduped[:40])
                     label = deduped
 
                 # Merge content into existing node rather than overwriting.

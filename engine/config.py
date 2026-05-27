@@ -61,6 +61,10 @@ class LLMConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     enabled: bool = False
+    # Ollama embedding model — used when local_model is set in LLMConfig.
+    # Pull with:  ollama pull nomic-embed-text
+    ollama_model: str = "nomic-embed-text"
+    # llama-server embedding config (only used when local_model is NOT set)
     model_path: str = ""
     model_name: str = "sisyphean-embed"
     server: ServerConfig = ServerConfig(port=8081, context_size=2048)

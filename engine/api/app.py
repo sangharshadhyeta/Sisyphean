@@ -16,6 +16,7 @@ from engine.task_tracker import active_tasks
 from engine.config import Config
 from engine.llm.client import LlamaClient
 from engine.llm.context import ContextManager
+from engine.llm.embeddings import EmbeddingClient, EmbeddingCache
 from engine.memory.graph import knowledge_graph, seed_knowledge_graph, sync_personality_to_graph, seed_skill_graph
 from engine.memory.store import ArtifactStore
 from engine.memory.injector import MemoryInjector
@@ -65,10 +66,26 @@ def create_app(config: Config) -> FastAPI:
     mem_path = Path(config.memory.path)
     mem_path.mkdir(parents=True, exist_ok=True)
 
+    # ── Embedding client (Ollama) ─────────────────────────────────────────────
+    # Shared cache so extractor and graph search reuse the same vectors.
+    # Falls back to Jaccard transparently when Ollama embedding is unavailable.
+    _embed_cache  = EmbeddingCache()
+    _ollama_port  = getattr(config.llm.server, "ollama_port", 11434)
+    _embed_model  = getattr(config.embedding, "ollama_model", "nomic-embed-text")
+    embed_client: EmbeddingClient | None = None
+    if config.embedding.enabled:
+        embed_client = EmbeddingClient(
+            ollama_url=f"http://127.0.0.1:{_ollama_port}",
+            model=_embed_model,
+            cache=_embed_cache,
+        )
+        logger.info("EmbeddingClient configured: model=%s", _embed_model)
+
     # Use the module-level GraphStore singleton — single graph shared by
     # injector (reads) and extractor (writes) so extracted facts are immediately
     # visible in the next request's injected context.
     graph = knowledge_graph
+    graph._embed_cache = _embed_cache   # invalidated by upsert_node on summary change
     store = ArtifactStore(
         mem_path / "artifacts.jsonl",
         embedding_model=config.memory.embedding_model,
@@ -79,7 +96,7 @@ def create_app(config: Config) -> FastAPI:
         top_n_nodes=config.memory.top_n_nodes,
         top_n_artifacts=config.memory.top_n_artifacts,
     )
-    extractor = MemoryExtractor(graph, store, client)
+    extractor = MemoryExtractor(graph, store, client, embed_client=embed_client)
 
     budget_tracker = BudgetTracker(mem_path)
     permission_guard = PermissionGuard.from_config(config.permissions)
@@ -177,6 +194,8 @@ def create_app(config: Config) -> FastAPI:
         logger.info("Sisyphean engine started")
         yield
         await client.close()
+        if embed_client is not None:
+            await embed_client.close()
         logger.info("Sisyphean engine stopped")
 
     _model_display = (

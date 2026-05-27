@@ -1,8 +1,9 @@
 """GraphRAG knowledge graph — personality, user context, projects, concepts.
 
 Persisted as JSON with atomic writes (write-to-temp + os.replace).
-Search is keyword-based by default; swap _score() for embedding similarity
-once the embedding server is wired in Stage 3.
+Search: keyword-based (GraphStore.search) + semantic (GraphStore.search_by_embedding).
+Embeddings are computed via EmbeddingClient (Ollama), cached in EmbeddingCache,
+and invalidated whenever a node's summary changes via upsert_node.
 
 Node types
 ----------
@@ -230,7 +231,11 @@ class GraphStore:
     retrieval and NER modules work unchanged.
     """
 
-    def __init__(self, persist_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        persist_path: Path | None = None,
+        embed_cache: "EmbeddingCache | None" = None,
+    ) -> None:
         self._path = persist_path
         self._graph: nx.DiGraph = nx.DiGraph()
         self._lock = threading.Lock()
@@ -238,6 +243,9 @@ class GraphStore:
             _FileLock(str(persist_path) + ".lock", timeout=10)
             if persist_path and _HAS_FILELOCK else None
         )
+        # Optional embedding cache — invalidated whenever a node's summary changes.
+        # Supplied by app.py after the EmbeddingClient is constructed.
+        self._embed_cache: "EmbeddingCache | None" = embed_cache
         if persist_path and persist_path.exists():
             self._load()
 
@@ -356,6 +364,9 @@ class GraphStore:
                     node["confidence"] = round(min(base + 0.08, 0.95), 3)
                     node["observations"] = obs
                 node.update(extra)
+                # Summary changed → stale embedding; drop it so next search re-embeds
+                if summary and self._embed_cache is not None:
+                    self._embed_cache.invalidate(key)
             else:
                 init_conf = round(
                     min(max(confidence, 0.0), 1.0) if confidence is not None else 0.5,
@@ -528,6 +539,48 @@ class GraphStore:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [d for _, d in scored[:effective_limit]]
+
+    async def search_by_embedding(
+        self,
+        query: str,
+        embed_client: "EmbeddingClient",
+        limit: int = 10,
+        node_type: str | None = None,
+    ) -> list[dict]:
+        """Semantic search using cosine similarity over Ollama embeddings.
+
+        Each node is embedded as "<name>: <summary>" and compared against the
+        query embedding.  Results are ranked by cosine × confidence so
+        high-confidence anchor / project nodes surface before speculative facts.
+
+        Falls back to keyword search (self.search) if the embedding client is
+        unavailable — callers never need to branch on availability.
+        """
+        from engine.llm.embeddings import cosine_similarity
+
+        query_vec = await embed_client.embed(query)
+        if query_vec is None:
+            # Embedding unavailable — transparent keyword fallback
+            return self.search(query, limit, node_type=node_type)
+
+        scored: list[tuple[float, dict]] = []
+        for key, data in self._graph.nodes(data=True):
+            if node_type and data.get("type") != node_type:
+                continue
+            name    = data.get("name", key)
+            summary = (data.get("summary") or "")[:300]
+            node_text = f"{name}: {summary}" if summary else name
+            node_vec = await embed_client.embed(node_text, cache_key=key)
+            if node_vec is None:
+                continue
+            sim        = cosine_similarity(query_vec, node_vec)
+            confidence = float(data.get("confidence", 0.5))
+            # Weight by confidence so well-corroborated nodes rank above
+            # low-confidence speculation with high textual similarity
+            scored.append((sim * confidence, {"key": key, **data}))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [d for _, d in scored[:limit]]
 
     def bfs(self, seeds: list[str], depth: int = 2) -> list[dict]:
         """BFS from seed names. Returns reachable nodes within depth with neighbour lists."""

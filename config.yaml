@@ -4,7 +4,7 @@
 llm:
   model_path: "C:/llama.cpp/models/gemma4-e2b-q8.gguf"
   model_name: sisyphean-qwen3:latest       # name exposed via /v1/models
-  local_model: "gemma4:latest"               # non-empty = use Ollama
+  local_model: "qwen3:0.6b"               # non-empty = use Ollama
   server:
     host: 127.0.0.1
     port: 8080                         # llama-server default port
@@ -29,7 +29,8 @@ llm:
     model: "gemma-4-E4B-it-Q8_0.gguf"
 
 embedding:
-  enabled: false                       # set true once you have an embedding model
+  enabled: true
+  ollama_model: "nomic-embed-text"   # run once: ollama pull nomic-embed-text                       # set true once you have an embedding model
   model_path: models/embed.gguf        # e.g. nomic-embed-text-v1.5.Q4_K_M.gguf
   model_name: sisyphean-embed
   server:

@@ -654,19 +654,33 @@ _ROUTE_HINTS: dict[str, str] = {
 }
 
 
-async def route_query(query: str, client) -> str:
+async def route_query(query: str, client, skill_index: str = "") -> str:
     """Lean router — single focused LLM call, returns one of _ROUTE_LABELS.
 
     Returns "" on failure so think_decompose falls back to its own judgment.
     This is an additive step: it biases think_decompose without replacing it.
+
+    skill_index: compact list of skill names + descriptions so the router can
+    choose "direct" (serve from skill cache) vs "bash" (run a skill program).
+    No history, no graph — query + skill names only.
+    max_tokens=256 with thinking=True: NOT subject to context management
+    (router is the exception — it uses all 256 tokens for reasoning).
     """
+    _system = _ROUTE_SYSTEM
+    if skill_index:
+        # Append skill names so router knows what's cached — keeps system prompt
+        # focused (no history, no graph — query + skill names only per spec).
+        _skill_lines = "\n".join(
+            f"  {ln.strip()}" for ln in skill_index.strip().splitlines() if ln.strip()
+        )[:400]
+        _system += f"\n\nAvailable skills (prefer direct/bash if a skill covers this):\n{_skill_lines}"
     try:
         result = await client.generate(
             [
-                {"role": "system", "content": _ROUTE_SYSTEM},
+                {"role": "system", "content": _system},
                 {"role": "user",   "content": query[:200]},
             ],
-            max_tokens=256,  # thinking=True: reasoning in reasoning field, word in content
+            max_tokens=256,  # thinking=True — NOT subject to context management (spec exception)
             temperature=0.0,
             stream=False,
             thinking=True,
@@ -754,6 +768,7 @@ async def think_decompose(
     workspace: str = "",
     skill_index: str = "",
     route: str = "",
+    user_prefs: str = "",
 ) -> tuple[str, list[dict]]:
     """LLM planning call that decomposes the task into stages.
 
@@ -776,15 +791,21 @@ async def think_decompose(
     which skills it already has for this task so it can plan a read_skill step
     instead of rediscovering from scratch.
     """
+    # Context budget: 600 chars total for decomposer (graph nodes + prefs fit here).
+    # Spec: think_decompose receives question + skill_hint + user_prefs + top-3 graph nodes.
+    # Caller pre-assembles context to that budget; we cap here as safety net.
+    _CTX_DECOMPOSE = 600
     prompt = f"Task: {query[:300]}"
     if route and route in _ROUTE_HINTS:
         # Router hint appended after the task so the model reads the task first,
         # then receives the classification nudge — prevents prefix confusion.
         prompt += f"\n{_ROUTE_HINTS[route]}"
+    if user_prefs:
+        prompt += f"\nUser preferences:\n{user_prefs[:200]}"
     if workspace:
         prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:
-        prompt += f"\nContext:\n{context[:300]}"
+        prompt += f"\nContext:\n{context[:_CTX_DECOMPOSE]}"
     if soul_section:
         prompt += f"\nPersonality guidance:\n{soul_section[:150]}"
     # Skills are listed as tool entries in plan_task's system prompt — not injected here.
@@ -795,6 +816,7 @@ async def think_decompose(
                 {"role": "system", "content": _THINK_DECOMPOSE_SYSTEM},
                 {"role": "user",   "content": prompt},
             ],
+            max_tokens=512,  # output budget: JSON plan fits in 512 tokens
             temperature=0.1,
             response_format={"type": "json_object"},  # "{" prefix on llama.cpp; json_object elsewhere
             stream=False,
@@ -843,6 +865,7 @@ async def plan_task(
     user_prefs: str = "",
     workspace: str = "",
     skill_index: str = "",
+    graph_nodes: str = "",
 ) -> list[dict]:
     """Plan a single task → list of {tool, input} steps.
 
@@ -853,12 +876,21 @@ async def plan_task(
     the prompt so the model can choose read_skill:NAME instead of web_search
     when it already has a runbook for this type of task.
     """
+    # Context budgets: plan_task receives focused context from the pipeline.
+    # graph_nodes has its OWN slot (not merged into context) so it's never
+    # truncated by the general context cap — spec: "not capped at 400 chars".
+    _CTX_PLAN       = 1200   # history + workspace snapshot
+    _CTX_PLAN_GRAPH =  600   # dedicated graph nodes slot (separate from history)
     logger.debug("plan_task: LLM planning call for %r", task[:60])
     prompt = f"Task: {task[:200]}"
     if workspace:
         prompt += f"\nWorkspace (write ALL task files here): {workspace}"
     if context:
-        prompt += f"\nContext:\n{context[:400]}"
+        prompt += f"\nContext:\n{context[:_CTX_PLAN]}"
+    if graph_nodes:
+        # Graph nodes in their own dedicated block — not merged with history context.
+        # Spec: top-3 graph nodes relevant to question, not subject to 400-char cap.
+        prompt += f"\nRelevant memory:\n{graph_nodes[:_CTX_PLAN_GRAPH]}"
     if soul_section:
         prompt += f"\nPersonality guidance:\n{soul_section[:200]}"
     if user_prefs:
@@ -874,6 +906,7 @@ async def plan_task(
                 {"role": "system", "content": _build_plan_system(outer_tools, skill_index=skill_index)},
                 {"role": "user",   "content": prompt},
             ],
+            max_tokens=512,  # output budget: step list fits in 512 tokens
             temperature=0.1,
             response_format={"type": "json_object"},  # "{" prefix on llama.cpp; json_object elsewhere
             stream=False,

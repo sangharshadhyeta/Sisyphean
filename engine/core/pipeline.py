@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 
 _STATE_PREFIX = "PIPELINE_STATE:"
 
+# ── Context budgets (chars ≈ 4 chars / token) ─────────────────────────────────
+# These cap context passed INTO each stage so token limits propagate cleanly
+# from one stage's output into the next stage's input.
+# Exception: route_query uses thinking=True + max_tokens=256 — NOT subject to
+# these limits (it's the intentional no-context call per spec).
+_CTX_ROUTE_SKILL    =  400   # skill index appended to route_query system prompt
+_CTX_DECOMPOSE      =  600   # graph nodes + top_context for think_decompose
+_CTX_PLAN           = 1200   # history + workspace snapshot for plan_task
+_CTX_PLAN_GRAPH     =  600   # dedicated graph-nodes slot in plan_task (own budget)
+_CTX_WRITE_RESEARCH = 1200   # research findings injected into write-plan prompt
+_CTX_SYNTH          = 1500   # synthesis context (capped in synthesizer.py)
+
 # Tools whose results should trigger dynamic replanning of subsequent steps.
 # After these run, pre-guessed follow-up steps are replaced with steps derived
 # from what was actually found — the result IS the reasoning.
@@ -434,9 +446,11 @@ class Pipeline:
         # one-line hint rather than trying to simultaneously classify AND plan.
         # Returns "" on failure — think_decompose then decides freely.
         # Skip when BirdClaw already planned (bc_plan is not None).
+        # Spec: router receives skill names + current question only — no history,
+        # no graph. skill_index is the only extra context allowed here.
         _route = ""
         if bc_plan is None:
-            _route = await route_query(query, self.client)
+            _route = await route_query(query, self.client, skill_index=skill_index)
             logger.info("pipeline: route=%r for query=%r", _route, query[:60])
 
         # ── Stage 2: Decompose into stages ───────────────────────────────────
@@ -451,13 +465,21 @@ class Pipeline:
                         outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
         else:
             _tracker.tree_context_running(task_id, "think-decompose")
+            # Spec: think_decompose receives question + skill_hint + user_prefs +
+            # top-3 graph nodes (not capped at 400 chars). Assemble within budget.
+            _graph_for_decompose = _search_graph(query, self.graph) if self.graph else ""
+            _decompose_ctx = "\n\n".join(p for p in (
+                top_context,
+                f"[Memory]\n{_graph_for_decompose[:300]}" if _graph_for_decompose else "",
+            ) if p)[:_CTX_DECOMPOSE]
             outcome, stages = await think_decompose(
                 query, self.client,
-                context=top_context,
+                context=_decompose_ctx,
                 soul_section=soul_section,
                 workspace=self.workspace,
                 skill_index=skill_index,
                 route=_route,
+                user_prefs=user_prefs[:200],
             )
             _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
             logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
@@ -532,10 +554,10 @@ class Pipeline:
                 extract_quality = top_quality
 
             # ── Graph memory recall — check what was already researched ───────
-            # If the knowledge graph has relevant results from previous tasks,
-            # include them so the planner can skip redundant web searches.
+            # graph_recall is passed as a SEPARATE graph_nodes argument to plan_task
+            # (not merged into task_ctx) so it has its own budget and is never
+            # truncated alongside history. Spec: top-3 graph nodes, own slot.
             graph_recall = _search_graph(task, self.graph)
-            graph_block  = f"[Web research from previous tasks]\n{graph_recall}" if graph_recall else ""
 
             # Inject a live workspace snapshot so the planner can see what files
             # already exist before generating a write/edit plan.
@@ -551,13 +573,16 @@ class Pipeline:
             # even when the stage goal is a vague placeholder like "check system status".
             original_ctx = f"Original request: {query}" if task != query else ""
             # recall_ctx: ≤100-word summary from recent history + graph + files
-            # placed first so it's never truncated by downstream context limits
+            # placed first so it's never truncated by downstream context limits.
+            # graph_block removed from here — graph_recall goes as separate graph_nodes
+            # param so stage 2+ context block stays clean (spec: no GraphRAG in task_ctx).
             recall_block = f"[Recall]\n{recall_ctx}" if recall_ctx else ""
-            task_ctx = "\n\n".join(p for p in (recall_block, original_ctx, task_history, graph_block, ws_block, project_ctx) if p)
+            task_ctx = "\n\n".join(p for p in (recall_block, original_ctx, task_history, ws_block, project_ctx) if p)
             all_extracted.append(task_history)
 
             if graph_recall:
-                logger.info("pipeline: graph recall hit for task=%r (%d chars)", task[:50], len(graph_recall))
+                logger.info("pipeline: graph recall hit for task=%r (%d chars) → separate graph_nodes slot",
+                            task[:50], len(graph_recall))
 
             # ── Tool filtering (keyword score, synchronous) ───────────────────
             relevant_tools = filter_tools_for_task(task, available_tools)
@@ -667,16 +692,20 @@ class Pipeline:
                     steps = [{"tool": "bash", "input": cmd}]
                 else:
                     steps = await plan_task(task, relevant_tools or available_tools, self.client,
-                                            context=task_ctx, soul_section=soul_section,
-                                            user_prefs=user_prefs, workspace=self.workspace,
-                                            skill_index=_stage_skill_index)
+                                            context=task_ctx[:_CTX_PLAN],
+                                            soul_section=soul_section,
+                                            user_prefs=user_prefs,
+                                            workspace=self.workspace,
+                                            skill_index=_stage_skill_index,
+                                            graph_nodes=graph_recall)
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
-                                        context=task_ctx,
+                                        context=task_ctx[:_CTX_PLAN],
                                         soul_section=soul_section,
                                         user_prefs=user_prefs,
                                         workspace=self.workspace,
-                                        skill_index=_stage_skill_index)
+                                        skill_index=_stage_skill_index,
+                                        graph_nodes=graph_recall)
 
             # ── Websearch fallback — if plan is empty and no graph recall ──────
             if not steps and stage_type == "research" and not graph_recall:
@@ -1026,6 +1055,12 @@ class Pipeline:
                 # (not docs) and only when the graph is available.
                 if wp_ftype_was == "code" and wp_file_was and self.graph:
                     _inject_file_sigs_to_graph(wp_file_was, self.graph)
+
+                # ── Reflect → write back to graph (spec: reflect WRITES to graph) ──
+                # Persist the write goal and file path so future sessions know
+                # what was built and can recall it without re-researching.
+                if wp_file_was and wp_goal_was:
+                    _save_write_summary_to_graph(self.graph, wp_goal_was, wp_file_was)
 
                 # ── Per-file import verify (project builds) ───────────────────
                 # After each code file is written, verify its imports resolve
@@ -1991,6 +2026,15 @@ class Pipeline:
                 conv_ctx = f"[Recent shell output — shows what already exists]\n{bash_lines}"
             else:
                 conv_ctx = ""
+            # ── Research findings injection (code) ─────────────────────────
+            # Spec: write_code receives research stage FULL summary explicitly.
+            # Cap at _CTX_WRITE_RESEARCH so the write call stays within token limits.
+            _research = _collect_research_for_write(state.results, title, _CTX_WRITE_RESEARCH)
+            if _research:
+                conv_ctx = (f"[Research findings]\n{_research}" +
+                            ("\n\n" + conv_ctx if conv_ctx else "")).strip()
+                logger.debug("write_plan: injected %d chars of research for code item %r",
+                             len(_research), title[:40])
             # ── Cross-file signature injection ──────────────────────────────
             # For multi-file project builds: inject def/class signatures that
             # were extracted from previously-written project files.  This lets
@@ -3887,5 +3931,66 @@ def _get_graph_sigs(goal: str, graph, max_sigs: int = 8) -> str:
     except Exception as exc:
         logger.debug("pipeline: _get_graph_sigs failed: %s", exc)
         return ""
+
+
+def _collect_research_for_write(results: list[dict], item_title: str,
+                                 max_chars: int = 1200) -> str:
+    """Collect research tool results relevant to a write-plan item.
+
+    Spec: write_code / write_doc should receive the research stage's FULL summary
+    explicitly injected, not just the stage goal. This extracts all web_search /
+    search_memory / web_fetch results from state.results and caps to max_chars
+    (_CTX_WRITE_RESEARCH budget) so the write-stage LLM call stays within token limits.
+
+    item_title is used for lightweight relevance filtering — only results whose
+    input query shares terms with the item title are included first; unrelated
+    results are appended to fill the remaining budget.
+    """
+    if not results:
+        return ""
+    _RESEARCH_TOOLS = frozenset({"web_search", "websearch", "search_memory",
+                                  "search_knowledge", "web_fetch"})
+    # Split into relevant (query overlaps with item_title) and other
+    title_words = frozenset(item_title.lower().split())
+    relevant: list[str] = []
+    other:    list[str] = []
+    for r in results:
+        if r.get("tool", "").lower() not in _RESEARCH_TOOLS:
+            continue
+        body = (r.get("result") or "").strip()
+        if not body or len(body) < 30:
+            continue
+        query_words = frozenset((r.get("input") or "").lower().split())
+        snippet = f"[{r['tool']}: {(r.get('input') or '')[:50]}]\n{body[:400]}"
+        if title_words & query_words:
+            relevant.append(snippet)
+        else:
+            other.append(snippet)
+    combined = relevant + other
+    if not combined:
+        return ""
+    return "\n\n".join(combined)[:max_chars]
+
+
+def _save_write_summary_to_graph(graph, goal: str, file_path: str) -> None:
+    """Persist a 'file written' fact to the knowledge graph after write-plan completes.
+
+    Spec: reflect stage WRITES back to graph after completion.
+    This is the closest equivalent — called when all write-plan items are done,
+    storing the file's goal and path so future sessions can recall what was built.
+    """
+    if graph is None:
+        return
+    try:
+        fname = os.path.basename(file_path)
+        node_id = f"file:{fname}"
+        graph.upsert_node(
+            node_id, "research",
+            summary=f"Wrote {fname}: {goal[:120]}",
+            metadata={"file": file_path, "kind": "written_file"},
+        )
+        logger.debug("pipeline: saved write summary to graph: %s", node_id)
+    except Exception as exc:
+        logger.debug("pipeline: _save_write_summary_to_graph failed: %s", exc)
 
 

@@ -76,8 +76,8 @@ class DreamResult:
 
     def log_summary(self) -> None:
         logger.info(
-            "dream: memorised %d sessions → %d facts, %d NER entities",
-            self.sessions_memorised, self.facts_extracted, self.ner_entities,
+            "dream: memorised %d sessions → %d NER entities",
+            self.sessions_memorised, self.ner_entities,
         )
         logger.info(
             "dream: cleaned %d nodes, %d session files (%d KB), %d budget rows",

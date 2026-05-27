@@ -168,21 +168,21 @@ def _searxng_running() -> bool:
 
 
 def _ensure_searxng_settings() -> Path:
-    """Return path to a valid settings.yml, generating a minimal one if needed."""
-    # 1. user-managed file next to source
-    src_settings = _SEARXNG_SRC / "searx" / "settings.yml"
-    if src_settings.exists():
-        return src_settings
-    # 2. per-install file in ~/.birdclaw/
+    """Return path to our managed settings.yml, creating it once if absent.
+
+    We never use the source settings.yml directly — it ships with the default
+    secret_key "ultrasecretkey" which makes SearXNG abort on startup.  Our
+    file uses use_default_settings so it still inherits all engines and UI
+    defaults from the SearXNG package.
+    """
     if _SEARXNG_SETTINGS.exists():
         return _SEARXNG_SETTINGS
-    # 3. generate a minimal file so SearXNG starts on the right port
     import secrets
     _SEARXNG_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     _SEARXNG_SETTINGS.write_text(
         f"use_default_settings: true\n"
         f"server:\n"
-        f"  secret_key: \"{secrets.token_hex(24)}\"\n"
+        f"  secret_key: \"{secrets.token_hex(32)}\"\n"
         f"  bind_address: \"127.0.0.1\"\n"
         f"  port: {_SEARXNG_PORT}\n"
         f"  limiter: false\n"

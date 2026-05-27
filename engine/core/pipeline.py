@@ -721,19 +721,42 @@ class Pipeline:
                 steps = [{"tool": "save_memory", "input": fact, "result": "saved",
                           "summary": f"saved: {fact[:80]}"}]
             elif re.match(r'^search[\s:]', task.strip(), re.IGNORECASE):
-                # "Search: keyword phrase" (new decomposer format) or legacy
-                # "Search KEYWORDS <phrase>" — strip the prefix and use the
-                # remainder as-is; the new prompts already produce clean keywords.
+                # "Search KEYWORDS <phrase>" from decomposer — strip prefix then
+                # clean any question-word crud the model echoed into the placeholder.
                 _kw = task.strip()
-                # Strip "Search:" / "Search KEYWORDS" / "Search KEYWORD" prefix
+                # 1. Strip "Search KEYWORDS" / "Search:" / "Search KEYWORD" prefix
                 for _pfx in ("search keywords:", "search keyword:", "search keywords ",
                               "search keyword ", "search:"):
                     if _kw.lower().startswith(_pfx):
                         _kw = _kw[len(_pfx):].strip()
                         break
-                # Strip enclosing quotes if present
+                else:
+                    # No structured prefix — strip the bare word "search " so we
+                    # don't search for "search for the meaning of life" verbatim.
+                    if _kw.lower().startswith("search "):
+                        _kw = _kw[7:].strip()
+                # 2. Strip enclosing quotes if present
                 if len(_kw) >= 2 and _kw[0] in ('"', "'") and _kw[-1] == _kw[0]:
                     _kw = _kw[1:-1].strip()
+                # 3. Strip leading question-word prefixes that the model echoes when
+                #    it fills the KEYWORDS placeholder with the user's sentence.
+                #    e.g. "search for the meaning of life" → "the meaning of life"
+                #         "find out about Python async" → "Python async"
+                _QPFX = re.compile(
+                    r'^(?:search\s+for\s+|look\s+up\s+|find\s+(?:out\s+)?(?:about\s+)?|'
+                    r'how\s+to\s+|what\s+(?:is|are|was|were)\s+(?:the\s+)?|'
+                    r'who\s+is\s+|where\s+is\s+|when\s+(?:is|was)\s+|'
+                    r'tell\s+me\s+(?:about\s+)?|get\s+(?:me\s+)?(?:info(?:rmation)?\s+(?:about|on)\s+)?)',
+                    re.IGNORECASE,
+                )
+                _prev = None
+                while _prev != _kw:
+                    _prev = _kw
+                    _kw = _QPFX.sub("", _kw, count=1).strip()
+                # 4. Literal placeholder echo ("KEYWORDS" / "KEYWORD") — unusable,
+                #    let plan_task route instead.
+                if _kw.upper() in ("KEYWORDS", "KEYWORD", "SEARCH TERMS", "QUERY", ""):
+                    _kw = ""
                 if not _kw:
                     _kw = task.strip()
                 logger.info("pipeline: Search literal → web_search: %s", _kw[:80])

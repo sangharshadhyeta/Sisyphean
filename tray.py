@@ -186,8 +186,14 @@ def _ensure_searxng_settings() -> Path:
         f"  bind_address: \"127.0.0.1\"\n"
         f"  port: {_SEARXNG_PORT}\n"
         f"  limiter: false\n"
+        f"outgoing:\n"
+        f"  request_timeout: 12.0\n"
+        f"  max_request_timeout: 20.0\n"
         f"search:\n"
-        f"  safe_search: 0\n",
+        f"  safe_search: 0\n"
+        f"  formats:\n"
+        f"    - html\n"
+        f"    - json\n",
         encoding="utf-8",
     )
     return _SEARXNG_SETTINGS

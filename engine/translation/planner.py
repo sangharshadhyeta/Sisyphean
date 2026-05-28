@@ -952,13 +952,14 @@ async def plan_task(
                     logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
                     return steps
 
-            # Standard pipe-or-newline-separated string format
-            # Model may write one step per line; split on both | and \n
+            # Newline-separated steps — | is reserved as write_plan's
+            # intra-step separator (write_plan:file.py|task description)
+            # and must NOT be consumed here as a step boundary.
             steps_raw = str(steps_raw_val or "").strip()
             if steps_raw.startswith("[") or steps_raw.startswith("{"):
                 steps_raw = ""
             steps = []
-            for part in re.split(r'[|\n]', steps_raw):
+            for part in steps_raw.split("\n"):
                 part = part.strip()
                 if ":" in part:
                     tool, _, inp = part.partition(":")

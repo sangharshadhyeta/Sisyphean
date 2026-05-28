@@ -1360,20 +1360,28 @@ class Pipeline:
                 if tool == "write_plan":
                     # Parse "FILENAME|TASK DESCRIPTION" from inp if the model
                     # used the write_plan:file|goal format.  Populate step fields
-                    # so _start_write_plan has file_path, file_type and input.
-                    if "|" in inp and not step.get("file_path"):
-                        _wp_file, _, _wp_task = inp.partition("|")
-                        _wp_file = _wp_file.strip()
-                        _wp_task = _wp_task.strip() or inp
+                    # so _start_write_plan has file_path and input.
+                    # file_type / run_after are inferred by _start_write_plan itself.
+                    if not step.get("file_path"):
+                        if "|" in inp:
+                            # "philosophy_essay.md|Write an essay..." split
+                            _wp_file, _, _wp_task = inp.partition("|")
+                            _wp_file = _wp_file.strip()
+                            _wp_task = _wp_task.strip() or inp
+                        else:
+                            # Bare filename with no description — use query as task
+                            _wp_words = inp.strip().split()
+                            if len(_wp_words) <= 3 and "." in os.path.basename(inp.strip()):
+                                _wp_file = inp.strip()
+                                _wp_task = state.query
+                            else:
+                                _wp_file = ""
+                                _wp_task = inp
                         if _wp_file:
-                            # Resolve to workspace
                             if self.workspace and not os.path.isabs(_wp_file):
                                 _wp_file = os.path.join(self.workspace, _wp_file)
-                            _ext = os.path.splitext(_wp_file)[1].lower()
                             step["file_path"] = _wp_file
                             step["input"]     = _wp_task
-                            step["file_type"] = "code" if _ext in (".py", ".js", ".ts", ".rb", ".go", ".rs") else "doc"
-                            step["run_after"] = step["file_type"] == "code"
                             inp = _wp_task
                     return await self._start_write_plan(step, state, available_tools)
 

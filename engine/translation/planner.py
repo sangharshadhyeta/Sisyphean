@@ -834,7 +834,8 @@ async def think_decompose(
         if isinstance(raw_steps, list):
             plain_steps = [str(s).strip() for s in raw_steps if str(s).strip()]
         else:
-            plain_steps = [s.strip() for s in str(raw_steps).strip().split("|") if s.strip()]
+            # Split on | or newline — model may write one step per line
+            plain_steps = [s.strip() for s in re.split(r'[|\n]', str(raw_steps).strip()) if s.strip()]
 
         # Model explicitly returned steps="" — direct answer, no tool calls needed.
         # Return a "direct" stage so the pipeline skips planning entirely.
@@ -951,12 +952,13 @@ async def plan_task(
                     logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
                     return steps
 
-            # Standard pipe-separated string format
+            # Standard pipe-or-newline-separated string format
+            # Model may write one step per line; split on both | and \n
             steps_raw = str(steps_raw_val or "").strip()
             if steps_raw.startswith("[") or steps_raw.startswith("{"):
                 steps_raw = ""
             steps = []
-            for part in steps_raw.split("|"):
+            for part in re.split(r'[|\n]', steps_raw):
                 part = part.strip()
                 if ":" in part:
                     tool, _, inp = part.partition(":")

@@ -813,23 +813,37 @@ class Pipeline:
                 ws_tool = next((n for n in all_names if n in _WEB_TOOL_NAMES), "web_search")
                 steps = [{"tool": ws_tool, "input": task}]
                 logger.info("pipeline: empty plan → websearch fallback for %r", task[:60])
-            elif not steps and stage_type in ("write_code", "write_doc"):
-                # Write stage with no plan — synthesise a write_plan step directly
-                # so the model can't escape by returning an empty response.
+            elif stage_type in ("write_code", "write_doc"):
                 _ft = "code" if stage_type == "write_code" else "doc"
-                _fn = _extract_filename_from_task(task, _ft)
-                if not _fn:
-                    _fn = _extract_filename_from_task(query, _ft)
-                if _fn:
-                    if self.workspace and not os.path.isabs(_fn):
-                        _fn = os.path.join(self.workspace, _fn)
-                    steps = [{"tool": "write_plan", "input": task,
-                              "file_path": _fn, "file_type": _ft}]
-                    logger.info("pipeline: empty plan for %s → write_plan fallback: %s",
-                                stage_type, _fn)
-                else:
-                    logger.warning("pipeline: empty plan for %s and no filename in %r",
-                                   stage_type, task[:60])
+                _WRITE_TOOLS = frozenset({"write", "write_plan", "edit", "multiedit"})
+                _has_write = any(s.get("tool", "").lower() in _WRITE_TOOLS for s in steps)
+
+                if not steps or not _has_write:
+                    # Either plan is empty OR plan_task returned only bash/read steps
+                    # and forgot the actual file writes (common on 0.6b for multi-file tasks).
+                    # Extract ALL filenames from the task and inject write_plan steps.
+                    _all_fns = _extract_all_filenames_from_task(task, _ft)
+                    if not _all_fns:
+                        _all_fns = _extract_all_filenames_from_task(query, _ft)
+                    if not _all_fns:
+                        # Last resort: single-filename extraction
+                        _fn = _extract_filename_from_task(task, _ft) or _extract_filename_from_task(query, _ft)
+                        if _fn:
+                            _all_fns = [_fn]
+                    if _all_fns:
+                        _write_steps = []
+                        for _fn in _all_fns:
+                            if self.workspace and not os.path.isabs(_fn):
+                                _fn = os.path.join(self.workspace, _fn)
+                            _write_steps.append({"tool": "write_plan", "input": task,
+                                                  "file_path": _fn, "file_type": _ft})
+                        # Prepend write_plan steps; keep any bash/verify steps after
+                        _non_write = [s for s in steps if s.get("tool", "").lower() not in _WRITE_TOOLS]
+                        steps = _write_steps + _non_write
+                        logger.info("pipeline: write stage — injected %d write_plan step(s): %s",
+                                    len(_write_steps), [s["file_path"] for s in _write_steps])
+                    else:
+                        logger.warning("pipeline: write stage with no filename found in %r", task[:60])
             elif not steps and stage_type not in ("direct",) and not graph_recall:
                 # Non-research stage with no plan — let synthesizer handle it
                 logger.info("pipeline: empty plan for %s stage %r", stage_type, task[:60])
@@ -3946,6 +3960,40 @@ def _extract_filename_from_task(task: str, file_type: str) -> str:
         if w.lower() not in skip and len(w) >= 3:
             return w.lower() + ext
     return ""
+
+
+def _extract_all_filenames_from_task(task: str, file_type: str) -> list[str]:
+    """Extract ALL filenames mentioned in a task — returns deduplicated ordered list.
+
+    Used to detect multi-file write tasks like "write calc3.py … then write test_calc3.py"
+    so the pipeline can inject a write_plan step for each file rather than letting the
+    0.6b model forget some of them.
+    """
+    import re as _re
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # 1. Explicit filename patterns with extensions
+    for m in _re.finditer(
+        r'\b([A-Za-z0-9_\-]+\.(py|md|txt|js|ts|json|yaml|yml|html|css|sh|rb|go|rs|java))\b',
+        task,
+    ):
+        fn = m.group(1)
+        if fn.lower() not in seen:
+            seen.add(fn.lower())
+            found.append(fn)
+
+    # 2. Patterns like "named foo" / "called foo" / "file foo" / "to foo"
+    for m in _re.finditer(
+        r'\b(?:in|to|file|named?|called?|as)\s+["\']?([A-Za-z0-9_\-]+\.[a-z]{2,5})["\']?',
+        task, _re.IGNORECASE,
+    ):
+        fn = m.group(1)
+        if fn.lower() not in seen:
+            seen.add(fn.lower())
+            found.append(fn)
+
+    return found
 
 
 def _get_item_text_from_content(content: str, anchor: str, file_type: str) -> str | None:

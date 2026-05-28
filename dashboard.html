@@ -214,7 +214,7 @@ function StepRow({ step, replanBefore=false }) {
               <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
                            fontWeight:600}}>INPUT</div>
               <pre style={{color:'#94a3b8',fontSize:11,margin:0,whiteSpace:'pre-wrap',
-                           wordBreak:'break-all',maxHeight:140,overflowY:'auto',
+                           wordBreak:'break-all',maxHeight:320,overflowY:'auto',
                            fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
                 {step.input}
               </pre>
@@ -225,7 +225,7 @@ function StepRow({ step, replanBefore=false }) {
               <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
                            fontWeight:600}}>OUTPUT</div>
               <pre style={{color:'#6ee7b7',fontSize:11,margin:0,whiteSpace:'pre-wrap',
-                           wordBreak:'break-all',maxHeight:160,overflowY:'auto',
+                           wordBreak:'break-all',maxHeight:380,overflowY:'auto',
                            fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
                 {step.output}
               </pre>
@@ -372,7 +372,7 @@ function ExecutionTimeline({ task }) {
                     detail={synth.status==='running'?'Building answer…':null}>
             <div style={{background:'#0d0f1c',borderRadius:6,padding:'10px 12px',
                          border:'1px solid #1e2235',fontSize:12,color:'#cbd5e1',
-                         whiteSpace:'pre-wrap',maxHeight:200,overflowY:'auto',
+                         whiteSpace:'pre-wrap',maxHeight:500,overflowY:'auto',
                          lineHeight:1.65,fontFamily:'JetBrains Mono,monospace'}}>
               {synth.output}
             </div>

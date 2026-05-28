@@ -44,13 +44,14 @@ class SearchResult:
 # ---------------------------------------------------------------------------
 
 def _get_search_config():
-    """Return (searxng_url, max_results, timeout) from config.yaml if available."""
+    """Return (searxng_url, jina_api_key, max_results, timeout) from config.yaml if available."""
     try:
         from engine.config import load_config
         cfg = load_config()
-        return cfg.search.searxng_url, cfg.search.max_results, cfg.search.timeout
+        return (cfg.search.searxng_url, getattr(cfg.search, "jina_api_key", ""),
+                cfg.search.max_results, cfg.search.timeout)
     except Exception:
-        return "", 5, 15.0
+        return "", "", 5, 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
     if not query or not query.strip():
         return []
 
-    searxng_url, cfg_max, cfg_timeout = _get_search_config()
+    searxng_url, jina_api_key, cfg_max, cfg_timeout = _get_search_config()
     n = max_results or cfg_max
     timeout = cfg_timeout
 
@@ -85,8 +86,8 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
             return results
         logger.debug("web_search: SearXNG miss  query=%r", query[:50])
 
-    # ── Tier 2: Jina AI (free-tier, AI-processed results) ────────────────────
-    results = await _search_jina(query, n, timeout)
+    # ── Tier 2: Jina AI (requires API key since mid-2025) ────────────────────
+    results = await _search_jina(query, n, timeout, jina_api_key)
     if results:
         logger.info("web_search: Jina ok  query=%r  results=%d", query[:50], len(results))
         return results
@@ -148,15 +149,21 @@ async def _search_searxng(
 
 
 async def _search_jina(
-    query: str, n: int, timeout: float
+    query: str, n: int, timeout: float, api_key: str = ""
 ) -> list[SearchResult]:
-    """Jina AI Reader search — free tier, no API key required.
+    """Jina AI Reader search — requires a free API key (jina.ai) since mid-2025.
 
     Endpoint: GET https://s.jina.ai/{encoded_query}
     Returns clean, AI-processed content from the top web results.
     Results are marked is_ai_synthesized=True so the synthesizer
     can skip its LLM call and return the content directly.
+
+    Set search.jina_api_key in config.yaml to enable this tier.
+    Without a key the request returns 401 and is skipped silently.
     """
+    if not api_key:
+        logger.debug("_search_jina: no API key configured — skipping (set search.jina_api_key)")
+        return []
     try:
         import httpx
         from urllib.parse import quote
@@ -166,12 +173,16 @@ async def _search_jina(
 
         headers = {
             "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
             "User-Agent": "Sisyphean/1.0",
             "X-Respond-With": "no-references",  # omit inline citations for cleaner text
         }
 
         async with httpx.AsyncClient(timeout=timeout) as http:
             resp = await http.get(url, headers=headers)
+            if resp.status_code == 401:
+                logger.warning("_search_jina: 401 Unauthorized — check search.jina_api_key in config.yaml")
+                return []
             resp.raise_for_status()
             data = resp.json()
 

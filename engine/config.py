@@ -104,14 +104,14 @@ class SearchConfig(BaseModel):
     """Web search backend configuration.
 
     Priority order when executing a search:
-      1. SearXNG  — fast, private, supports Google/Bing/DDG simultaneously.
-                   Requires a local SearXNG instance. Set searxng_url to enable.
-      2. DuckDuckGo package (ddgs / duckduckgo_search) — if installed.
-      3. DuckDuckGo Instant Answers API — pure httpx, no extra package, limited results.
+      1. SearXNG  — fast, private, self-hosted. Set searxng_url to enable.
+      2. Jina AI  — free tier requires an API key (get one at jina.ai).
+                   Set jina_api_key to enable. Returns AI-processed results.
     """
-    searxng_url: str = ""   # e.g. "http://localhost:8888" — empty = skip SearXNG
-    max_results: int = 5
-    timeout: float = 15.0
+    searxng_url:   str   = ""    # e.g. "http://localhost:8888" — empty = skip SearXNG
+    jina_api_key:  str   = ""    # optional; jina.ai free key enables tier-2 search
+    max_results:   int   = 5
+    timeout:       float = 15.0
 
 
 class DebugConfig(BaseModel):

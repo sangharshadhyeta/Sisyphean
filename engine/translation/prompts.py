@@ -234,7 +234,7 @@ def action_prompt(
         '  {"action":"save_memory","note":"..."}',
     ]
     if has_bash:
-        lines.append('  {"action":"bash","command":"..."}')
+        lines.append('  {"action":"bash","command":"..."}  # shell only; use read_file to read files')
     lines.append('  {"action":"answer","text":"..."}')
     if current_step_text:
         lines.append(f"\nCurrent focus: {current_step_text}")

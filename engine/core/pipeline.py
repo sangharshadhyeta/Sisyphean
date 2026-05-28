@@ -26,7 +26,7 @@ from pathlib import Path
 from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
-from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command, route_query
+from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command, route_query, reflect_on_stage
 from engine.memory.skills import (
     get_skill_index, get_skill_runbook, get_skill_program,
     get_skill_script_path, save_skill_to_disk, save_skill_program_to_graph,
@@ -1771,6 +1771,31 @@ class Pipeline:
             context=synth_ctx,
         )
         elapsed_ms = int((_time.time() - t0) * 1000)
+
+        # ── Synthesis reflection gate ──────────────────────────────────────────
+        # One cheap LLM call: did the answer actually address the query?
+        # If "deepen", re-synthesize once with the identified gap injected as
+        # extra context so the model can fill in what was missing.
+        # steps_remaining=1 biases the gate to prefer "done" unless clearly inadequate.
+        _synth_gate = await reflect_on_stage(
+            outcome=state.query,
+            stage_type="synthesis",
+            stage_summary=answer[:400],
+            client=self.client,
+            steps_remaining=1,
+        )
+        if _synth_gate.get("decision") == "deepen":
+            _gap = _synth_gate.get("goal", "")
+            logger.info("pipeline: synthesis gate → deepen: %s", _gap[:80])
+            _retry_ctx = (synth_ctx + (f"\n\nGap: {_gap}" if _gap else ""))[:1600]
+            _retry_answer = await synthesize(
+                state.query, state.soul_section, state.user_prefs,
+                state.results, self.client, context=_retry_ctx,
+            )
+            if _retry_answer:
+                answer = _retry_answer
+                logger.info("pipeline: synthesis retry → %d chars", len(answer))
+
         _tracker.tree_synthesizer_done(state.task_id, answer[:200])
         _tracker.finish_task(state.task_id, "done")
 

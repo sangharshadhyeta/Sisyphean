@@ -165,6 +165,11 @@ def infer_stage_type(step_text: str) -> str:
 
     if not s:
         return "direct"
+    # "Read FILEPATH" steps — model asked to read an existing file; route to
+    # research so plan_task picks the outer Read tool (not bash cat/type).
+    # startswith avoids false positives from substrings like "thread" or "already".
+    if s.startswith("read "):
+        return "research"
     # Skill steps are always "direct" — run_skill converts to bash in _execute;
     # read_skill is an internal graph lookup. Neither should trigger web_search.
     if s.startswith("run skill:") or s.startswith("run_skill:") or s.startswith("run skill "):
@@ -721,6 +726,7 @@ You are a task router. Output ONLY valid JSON: {"outcome": "...", "steps": "..."
 STEP FORMATS:
   steps=""                   answer directly — no tool needed
   steps="Search KEYWORDS"    web search — write real search terms
+  steps="Read FILEPATH"      read an existing file from disk
   steps="Run COMMAND"        run a shell command
   steps="Write FILENAME"     create a code or document file
   steps="Save: FACT"         persist a fact to memory
@@ -734,6 +740,8 @@ steps="" ONLY when the answer is already present in the provided context
 
 steps="Search KEYWORDS" for any factual question not already in context.
   Do NOT use Search for computation — use Run for those.
+
+steps="Read FILEPATH" to read an existing file — use the full path. Never use Run+cat/type to read files.
 
 steps="Run COMMAND" for shell actions and ALL computation.
   For computation: use the calc skill — plan "Run skill:calc EXPRESSION".

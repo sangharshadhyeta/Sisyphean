@@ -821,8 +821,11 @@ class Pipeline:
                 if not _fn:
                     _fn = _extract_filename_from_task(query, _ft)
                 if _fn:
-                    if self.workspace and not os.path.isabs(_fn):
-                        _fn = os.path.join(self.workspace, _fn)
+                    # User-requested files go to project_dir (where BirdClaw was
+                    # started); fall back to workspace when running standalone.
+                    _base_dir = project_dir or self.workspace
+                    if _base_dir and not os.path.isabs(_fn):
+                        _fn = os.path.join(_base_dir, _fn)
                     steps = [{"tool": "write_plan", "input": task,
                               "file_path": _fn, "file_type": _ft}]
                     logger.info("pipeline: empty plan for %s → write_plan fallback: %s",
@@ -1378,8 +1381,11 @@ class Pipeline:
                                 _wp_file = ""
                                 _wp_task = inp
                         if _wp_file:
-                            if self.workspace and not os.path.isabs(_wp_file):
-                                _wp_file = os.path.join(self.workspace, _wp_file)
+                            # User-requested files go to project_dir; fall back
+                            # to workspace when running standalone (no project_dir).
+                            _base_dir = state.project_dir or self.workspace
+                            if _base_dir and not os.path.isabs(_wp_file):
+                                _wp_file = os.path.join(_base_dir, _wp_file)
                             step["file_path"] = _wp_file
                             step["input"]     = _wp_task
                             inp = _wp_task
@@ -1984,6 +1990,21 @@ class Pipeline:
                 existing = Path(file_path).read_text(encoding="utf-8")
             except Exception:
                 pass
+            if existing:
+                _notice = (
+                    f"File already exists ({len(existing):,} chars) — "
+                    f"updating: skipping sections already present, adding missing ones."
+                )
+                logger.info("pipeline: write_plan: %s  file=%s", _notice, file_path)
+                # Track as read so epistemic state reflects the check
+                _fp_key = file_path
+                if not any(r.get("path") == _fp_key for r in state.files_read):
+                    state.files_read.append({"path": _fp_key, "head": existing[:150]})
+                # Add a visible result entry so synthesis / dashboard shows the check
+                state.results.append({
+                    "tool": "read_file", "input": _fp_key,
+                    "result": _notice, "summary": _notice,
+                })
 
         logger.info("pipeline: write_plan start  goal=%r  file=%s  type=%s",
                     task[:60], file_path, file_type)

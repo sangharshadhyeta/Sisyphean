@@ -102,23 +102,27 @@ async def _search_searxng(
 ) -> list[SearchResult]:
     """Query local SearXNG instance.
 
-    SearXNG's link_token botdetection requires a session cookie that is set
-    when the homepage is first visited.  We use a single AsyncClient so the
-    cookie jar is shared across both requests — homepage warm-up then search.
+    SearXNG's botdetection rejects requests that lack X-Forwarded-For /
+    X-Real-IP headers (it expects them when sitting behind a proxy).  We
+    pass X-Forwarded-For: 127.0.0.1 to satisfy the check.  We also use a
+    persistent AsyncClient so any session cookies set by the homepage are
+    automatically included in the follow-up search request.
     """
     try:
         import httpx
         base = base_url.rstrip("/")
+        _hdrs = {
+            "User-Agent":       "Mozilla/5.0 (compatible; Sisyphean/1.0)",
+            "Accept-Language":  "en-US,en;q=0.9",
+            "X-Forwarded-For":  "127.0.0.1",
+            "X-Real-IP":        "127.0.0.1",
+        }
         async with httpx.AsyncClient(
             timeout=timeout,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; Sisyphean/1.0)",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
+            headers=_hdrs,
             follow_redirects=True,
         ) as http:
-            # Warm-up: visit homepage so SearXNG sets its link_token cookie.
-            # The response content is discarded — we only need the Set-Cookie.
+            # Warm-up: visit homepage to pick up any session cookie.
             try:
                 await http.get(base + "/", headers={"Accept": "text/html"})
             except Exception:

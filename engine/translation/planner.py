@@ -827,7 +827,10 @@ async def think_decompose(
         raw  = result["choices"][0]["message"]["content"].strip()
         data = parse_format_response(raw)
         if not data:
-            return query[:80], []
+            # Unparseable response — route to synthesizer for a direct answer
+            # (ask for clarification or answer from context) rather than
+            # falling back to keyword-based stage guessing.
+            return query[:80], [{"type": "direct", "goal": query}]
 
         outcome  = (data.get("outcome") or query[:80]).strip()
         raw_steps = data.get("steps") or ""
@@ -854,7 +857,7 @@ async def think_decompose(
 
     except Exception as exc:
         logger.warning("think_decompose failed: %s", exc)
-        return query[:80], []
+        return query[:80], [{"type": "direct", "goal": query}]
 
 
 

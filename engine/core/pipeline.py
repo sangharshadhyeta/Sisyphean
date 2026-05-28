@@ -508,9 +508,11 @@ class Pipeline:
                         [(s["type"], s["goal"][:40]) for s in stages])
 
         # Fall back only if think_decompose raised an exception (it now explicitly
-        # returns a "direct" stage when the model decides steps="").
+        # returns a "direct" stage when the model decides steps="" or parsing fails).
+        # Use "direct" so the synthesizer handles the query (clarify / answer from
+        # context) rather than guessing a write/verify stage from keyword substrings.
         if not stages:
-            stages = [{"type": infer_stage_type(query), "goal": query}]
+            stages = [{"type": "direct", "goal": query}]
 
         # ── Project expansion: write_project stages → per-file write_code stages ──
         # When think_decompose returns a single write_project/write_code stage for a

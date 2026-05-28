@@ -1431,6 +1431,38 @@ class Pipeline:
                     )
                     tool_id = f"toolu_{uuid.uuid4().hex[:16]}"
                     cl = canonical.lower()
+
+                    # ── Intercept file-read bash commands → Read tool ─────────
+                    # `type <path>` (Windows CMD) and `cat <path>` are pure file
+                    # reads — bash doesn't have `type` and running `cat` on a
+                    # Windows absolute path fails in WSL/git-bash.  Redirect to
+                    # the Read outer tool which works cross-platform.
+                    if cl == "bash":
+                        _pre_cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
+                        _pre_cmd = re.sub(r'^(?:COMMAND|CMD)[\s:]+', '', _pre_cmd,
+                                          flags=re.IGNORECASE).strip()
+                        _cat_m = re.match(
+                            r'^(?:type|cat)\s+"?\'?(.+?)\'?"?\s*$', _pre_cmd, re.IGNORECASE
+                        )
+                        if _cat_m:
+                            _rpath = _cat_m.group(1).strip().strip('"').strip("'")
+                            if state.project_dir and not os.path.isabs(_rpath):
+                                _rpath = os.path.join(state.project_dir, _rpath)
+                            logger.info(
+                                "pipeline: bash type/cat → redirected to Read: %s", _rpath
+                            )
+                            # Redirect: treat as Read tool
+                            _read_canonical = next(
+                                (t.get("name", "Read") for t in available_tools
+                                 if t.get("name", "").lower() in ("read", "read_file")),
+                                "Read",
+                            )
+                            canonical = _read_canonical
+                            cl = "read"
+                            inp = _rpath
+                            step["file_path"] = _rpath
+                            step["input"] = _rpath
+
                     if cl == "bash":
                         cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
                         # Strip "COMMAND" / "CMD" prefix that models echo from format descriptions

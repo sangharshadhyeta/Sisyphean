@@ -316,13 +316,45 @@ async def plan(
                 return True
         return False
 
-    if not raw_items or _is_vague(raw_items) or _has_doc_leak(raw_items):
+    def _has_invalid_code_anchors(items: list[dict]) -> bool:
+        """True when any code anchor is not a valid Python identifier.
+
+        Python function/class names cannot contain spaces or special chars.
+        When the model echoes the full task description as the anchor
+        (e.g. "Write a small program to give me daily updates on AI"),
+        the writer would emit `def Write a small program...` which is a
+        SyntaxError.  Catch this structurally — no content hardcoding.
+        """
+        if file_type != "code":
+            return False
+        for item in items:
+            anchor = item.get("anchor", "").strip()
+            if not re.match(r'^[A-Za-z_]\w*$', anchor):
+                return True
+        return False
+
+    if not raw_items or _is_vague(raw_items) or _has_doc_leak(raw_items) or _has_invalid_code_anchors(raw_items):
         if raw_items:
             logger.warning(
                 "SubtaskPlanner: vague/wrong items detected (%s) — retrying with strict prompt",
                 [i.get("title") for i in raw_items],
             )
         raw_items = await _call_planner(client, prompt, strict_sys)
+
+    # For code: drop any items whose anchor is not a valid Python identifier
+    # even after the retry.  Invalid anchors (containing spaces) cause the
+    # writer to emit `def write a small program...` which is a SyntaxError.
+    # Dropping them leaves items=[] in _start_write_plan, which falls through
+    # to the single-shot _generate_code path that writes correct Python.
+    if file_type == "code" and raw_items:
+        valid = [it for it in raw_items if re.match(r'^[A-Za-z_]\w*$', it.get("anchor", "").strip())]
+        if not valid:
+            logger.warning(
+                "SubtaskPlanner: all code anchors still invalid after retry (%s) — "
+                "dropping to trigger single-shot fallback",
+                [i.get("anchor") for i in raw_items],
+            )
+            raw_items = []
 
     if not raw_items:
         logger.warning("SubtaskPlanner returned no items after retry — single-item fallback")
@@ -340,6 +372,13 @@ async def plan(
                 # Take text up to first "needs"/"must"/"should"/"is" verb
                 _anchor = re.split(r'\b(?:needs|must|should|is |has |lacks)\b',
                                    _deepen_rest, maxsplit=1)[0].strip()[:60]
+        # For code: if the fallback anchor isn't a valid Python identifier
+        # (e.g. the full task description slipped through), convert it to
+        # snake_case so the writer doesn't emit `def write a program...`.
+        if file_type == "code" and not re.match(r'^[A-Za-z_]\w*$', _anchor):
+            _parts = re.findall(r'[A-Za-z]+', _anchor)[:5]
+            _anchor = "_".join(p.lower() for p in _parts)[:40] or "main_program"
+            logger.info("SubtaskPlanner: sanitised fallback anchor → %r", _anchor)
         raw_items = [{"title": _anchor, "anchor": _anchor, "kind": default_kind, "min_chars": 400}]
 
     return SubtaskManifest(

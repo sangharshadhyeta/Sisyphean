@@ -239,6 +239,10 @@ class PipelineState:
     # ── Bash retry state ──────────────────────────────────────────────────────
     bash_retry_count: int = 0  # consecutive bash failures on current step
     last_bash_error:  str = ""  # traceback from most recent bash failure (cleared after fix edit)
+    # ── Rescue plan flag ──────────────────────────────────────────────────────
+    # Set True after one rescue-plan attempt so we never loop infinitely.
+    # Rescue runs once per outer query when the initial plan produced no results.
+    rescue_attempted: bool = False
 
     def to_json(self) -> str:
         return json.dumps({
@@ -272,6 +276,7 @@ class PipelineState:
             } if self.wp_items else {},
             "brc": self.bash_retry_count,
             "lbe": self.last_bash_error[:400],
+            "ra":  self.rescue_attempted,
         })
 
     @classmethod
@@ -301,8 +306,9 @@ class PipelineState:
         obj.wp_run_after   = wp.get("run",   False)
         obj.wp_retry_count = wp.get("rc",    0)
         obj.wp_resume_ctx  = wp.get("rctx",  "")
-        obj.bash_retry_count = d.get("brc", 0)
-        obj.last_bash_error  = d.get("lbe", "")
+        obj.bash_retry_count  = d.get("brc", 0)
+        obj.last_bash_error   = d.get("lbe", "")
+        obj.rescue_attempted  = d.get("ra",  False)
         return obj
 
 
@@ -1721,6 +1727,37 @@ class Pipeline:
         # _SYSTEM_NO_RESULTS) handle framing; context helps the model answer in-thread
         # (e.g. "do you think you're alive?" benefits from the prior philosophy turns).
         synth_ctx = state.synthesis_ctx
+
+        # ── Rescue plan ───────────────────────────────────────────────────────────
+        # Initial think_decompose runs early with ~800 chars of context.
+        # By consolidation time synthesis_ctx has 1500 chars: memory, graph, history.
+        # When the initial plan produced nothing (direct stage → no results), give
+        # the model one second chance with that richer context.  Non-direct stages
+        # are appended to sub_tasks and _execute() re-enters the execution loop —
+        # outer tool roundtrips (Read, Bash) are handled naturally by the existing
+        # Claude Code continuation mechanism.
+        if not has_real_results and synth_ctx and not state.rescue_attempted:
+            _, _rescue_stages = await think_decompose(
+                state.query, self.client, context=synth_ctx[:800]
+            )
+            _rescue_actionable = [s for s in _rescue_stages if s.get("type") != "direct"]
+            if _rescue_actionable:
+                state.rescue_attempted = True
+                for _rs in _rescue_actionable:
+                    _rs_task  = _rs.get("goal", state.query)
+                    _rs_type  = _rs.get("type", "research")
+                    _rs_steps = await plan_task(
+                        _rs_task, available_tools, self.client,
+                        context=synth_ctx[:400],
+                        workspace=self.workspace,
+                    )
+                    state.sub_tasks.append({"task": _rs_task, "type": _rs_type, "steps": _rs_steps})
+                logger.info(
+                    "pipeline: rescue plan → %d actionable stage(s): %s",
+                    len(_rescue_actionable),
+                    [s.get("type") for s in _rescue_actionable],
+                )
+                return await self._execute(state, available_tools)
 
         result_summary = "; ".join(r.get("summary", "")[:60] for r in state.results[-3:])
         _tracker.tree_synthesizer_running(state.task_id, result_summary)

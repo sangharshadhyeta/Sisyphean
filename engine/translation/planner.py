@@ -747,16 +747,10 @@ steps="Run COMMAND" for shell actions and ALL computation.
   For computation: use the calc skill — plan "Run skill:calc EXPRESSION".
   NEVER use steps="Write..." for computation or expressions — Write is for permanent user files only.
 
-steps="Write FILENAME" ONLY for PERMANENT files the user explicitly asked to create
-  and keep: Python programs, modules, extractors, full applications, documents,
-  essays, reports. These go through the incremental write+verify pipeline.
-  Use a descriptive filename that matches the deliverable.
+steps="Write FILENAME" to create or rewrite a file — use the full path.
+  Never use Run+vim/nano/editor to edit files — always use Write.
   WORKSPACE RULE: The workspace path is given in the prompt. ALL files MUST live
   inside that workspace directory — never use a bare filename.
-  PARAMETERIZE: any program written for reuse MUST accept inputs via sys.argv (or
-  argparse), never hardcoded values. Task "sum 5 and 3" → write sum.py that reads
-  sys.argv[1] and sys.argv[2], then Run python WORKSPACE/sum.py 5 3.
-  Programs with baked-in constants are one-offs; programs that read sys.argv are skills.
 
 steps="Save: FACT" only when the user says: remember / save / note / keep in mind.
 

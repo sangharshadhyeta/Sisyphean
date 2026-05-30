@@ -302,8 +302,18 @@ def _build_timeline_node(
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     short_id = session_id[:8]
-    node_name = f"session:{date_str}:{short_id}"
     tools_str = ", ".join(tools_used[:6]) if tools_used else "none"
+
+    # Node name = the query itself so keyword/semantic search can find it.
+    # Short session suffix keeps multiple "hi" sessions from colliding.
+    # e.g. "can you search for the meaning of life [abc12345]"
+    import re as _re
+    _query_slug = _re.sub(r"\s+", " ", first_user).strip()[:60]
+    node_name = (
+        f"{_query_slug} [{short_id}]"
+        if _query_slug
+        else f"session:{date_str}:{short_id}"
+    )
 
     # Summary: LLM prose first, fall back to first user message as label
     if llm_summary:

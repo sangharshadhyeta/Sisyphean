@@ -147,6 +147,25 @@ async def run_dream(
             logger.error("dream: memorise pass failed: %s", exc, exc_info=True)
             result.errors = (result.errors or []) + [f"memorise: {exc}"]
 
+    # ── Topic clustering pass ─────────────────────────────────────────────────
+    # Finds isolated fact/research/concept nodes that were created in the same
+    # time window (same search session) and links them with related_to edges +
+    # a shared parent concept node.  Without this, every web-search result node
+    # floats alone with no edges, so the propagation bonus in graph.search()
+    # never fires and related concepts can't surface each other.
+    if memorise:
+        try:
+            from engine.memory.graph import knowledge_graph
+            if not dry_run:
+                linked = _cluster_isolated_nodes(knowledge_graph)
+                if linked:
+                    logger.info("dream: cluster pass linked %d isolated node(s)", linked)
+            else:
+                logger.info("dream: --dry-run — skipping topic clustering")
+        except Exception as exc:
+            logger.warning("dream: topic clustering pass failed: %s", exc)
+            result.errors = (result.errors or []) + [f"cluster: {exc}"]
+
     # ── Relation refinement pass ─────────────────────────────────────────────
     # Takes 'related_to' placeholder edges and replaces them with specific
     # verb-phrase relation labels via tiny focused LLM prompts.
@@ -578,6 +597,141 @@ async def _refine_relations(client, graph, max_edges: int = 40) -> int:
         logger.info("dream: refined %d generic 'related_to' edges", refined)
 
     return refined
+
+
+def _cluster_isolated_nodes(graph) -> int:
+    """Link isolated research/fact nodes from the same session into a topic cluster.
+
+    Nodes with degree=0 (no edges) that were created within the same 15-minute
+    window are almost certainly from the same multi-step web search.  This pass:
+      1. Groups them into time buckets.
+      2. Finds words shared by the majority of labels → topic name.
+      3. Creates a parent concept node for the topic (if 3+ members).
+      4. Adds bidirectional related_to edges between every pair in the cluster.
+      5. Adds part_of edges from each member to the parent.
+
+    This gives graph.search()'s propagation bonus something to follow — a query
+    about "Existentialism" will now also surface "Absurdism" and "Theism" through
+    the shared topic node rather than each floating as an unreachable island.
+
+    Returns the number of nodes linked (clusters × members − 1).
+    """
+    import re as _re
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    _CLUSTER_TYPES = frozenset({"fact", "research", "concept", "entity", "url"})
+    _STOP = frozenset({
+        "the", "a", "an", "and", "or", "of", "in", "on", "at", "to",
+        "is", "are", "was", "for", "with", "that", "this", "it", "its",
+        "how", "what", "why", "can", "does", "has", "have", "been",
+        "meaning", "means", "mean", "view", "views", "perspective",
+    })
+    _WINDOW_MIN = 15
+
+    # Collect isolated content nodes with parseable timestamps
+    candidates: list[tuple[str, dict, _dt]] = []
+    try:
+        nodes_snapshot = list(graph._graph.nodes(data=True))
+    except Exception:
+        return 0
+
+    for key, data in nodes_snapshot:
+        if data.get("type", "") not in _CLUSTER_TYPES:
+            continue
+        if graph._graph.degree(key) > 0:
+            continue  # already connected — skip
+        ts_raw = data.get("created_at") or data.get("last_seen") or ""
+        try:
+            ts = _dt.fromisoformat(str(ts_raw))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_tz.utc)
+            candidates.append((key, data, ts))
+        except Exception:
+            continue
+
+    if len(candidates) < 2:
+        return 0
+
+    candidates.sort(key=lambda x: x[2])
+
+    # Group into 15-minute buckets
+    buckets: list[list[tuple[str, dict, _dt]]] = []
+    current: list[tuple[str, dict, _dt]] = [candidates[0]]
+    t0 = candidates[0][2]
+    for item in candidates[1:]:
+        if (item[2] - t0) <= _td(minutes=_WINDOW_MIN):
+            current.append(item)
+        else:
+            if len(current) >= 2:
+                buckets.append(current)
+            current = [item]
+            t0 = item[2]
+    if len(current) >= 2:
+        buckets.append(current)
+
+    if not buckets:
+        return 0
+
+    linked = 0
+
+    for bucket in buckets:
+        keys = [k for k, _, _ in bucket]
+
+        # Find majority-shared words across node names to name the topic
+        word_counts: dict[str, int] = {}
+        for k, data, _ in bucket:
+            name = data.get("name", k)
+            for w in _re.findall(r"[a-z]{4,}", name.lower()):
+                if w not in _STOP:
+                    word_counts[w] = word_counts.get(w, 0) + 1
+        threshold = max(2, len(bucket) // 2)
+        topic_words = sorted(
+            (w for w, c in word_counts.items() if c >= threshold),
+            key=lambda w: -word_counts[w],
+        )[:4]
+        topic_name = " ".join(topic_words) if topic_words else ""
+
+        # Create parent concept node when we have a clear topic and 3+ members
+        parent_key = None
+        if topic_name and len(bucket) >= 3:
+            parent_key = topic_name.lower().replace(" ", "_")
+            if not graph._graph.has_node(parent_key):
+                graph.upsert_node(
+                    topic_name,
+                    node_type="concept",
+                    summary=f"Topic cluster covering: {', '.join(d.get('name', k)[:40] for k, d, _ in bucket[:5])}",
+                    confidence=0.6,
+                )
+                logger.debug("dream: cluster — created topic node %r", topic_name)
+
+        # Bidirectional related_to between all pairs
+        for i, k1 in enumerate(keys):
+            for k2 in keys[i + 1:]:
+                if not graph._graph.has_edge(k1, k2):
+                    graph.upsert_edge(k1, "related_to", k2, weight=1.0)
+                    linked += 1
+                if not graph._graph.has_edge(k2, k1):
+                    graph.upsert_edge(k2, "related_to", k1, weight=1.0)
+
+        # part_of edges to parent
+        if parent_key and graph._graph.has_node(parent_key):
+            for k in keys:
+                if not graph._graph.has_edge(k, parent_key):
+                    graph.upsert_edge(k, "part_of", parent_key, weight=1.0)
+
+        logger.debug(
+            "dream: cluster — %d nodes in bucket%s",
+            len(keys),
+            f" → topic '{topic_name}'" if topic_name else "",
+        )
+
+    if linked:
+        try:
+            graph.save()
+        except Exception as exc:
+            logger.warning("dream: could not save graph after clustering: %s", exc)
+
+    return linked
 
 
 def _decay_stale_nodes(graph, dry_run: bool = False) -> int:

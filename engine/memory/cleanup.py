@@ -153,7 +153,7 @@ def _cleanup_graph(
     except ImportError:
         return
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=policy.node_retention_days)
+    now = datetime.now(timezone.utc)
     to_remove: list[str] = []
 
     for key, data in list(kg._graph.nodes(data=True)):
@@ -169,7 +169,25 @@ def _cleanup_graph(
                 last_seen = last_seen.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        if last_seen < cutoff:
+
+        # Confidence-gated retention — the half-life decay sets the pace;
+        # cleanup only removes a node once its confidence has fallen far enough.
+        #   conf ≥ 0.50 → protected (3× retention): still being recalled
+        #   conf ∈ [0.20, 0.50) → extended (2× retention): mid-decay
+        #   conf ∈ [0.12, 0.20) → normal retention: low but not at floor
+        #   conf < 0.12 → floor reached, clean up in ½ normal retention
+        conf = float(data.get("confidence", 0.5))
+        if conf >= 0.50:
+            cutoff_days = policy.node_retention_days * 3
+        elif conf >= 0.20:
+            cutoff_days = policy.node_retention_days * 2
+        elif conf >= 0.12:
+            cutoff_days = policy.node_retention_days
+        else:
+            cutoff_days = max(policy.node_retention_days // 2, 30)
+
+        age_days = (now - last_seen).days
+        if age_days >= cutoff_days:
             to_remove.append(key)
 
     for key in to_remove:

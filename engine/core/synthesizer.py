@@ -24,7 +24,11 @@ _SYSTEM_WITH_RESULTS = (
     "- If context is provided, use it to understand references to prior conversation.\n"
     "- If soul guidance is given, follow it.\n"
     "- Output your reply ONLY. Do not write 'Thinking Process', reasoning steps, or analysis headers.\n"
-    "- Be direct. No hollow openers ('Great question!', 'Certainly!'). No '/think'."
+    "- Be direct. No hollow openers ('Great question!', 'Certainly!'). No '/think'.\n"
+    "- HONESTY RULE: NEVER claim to have created, written, executed, or run any file or\n"
+    "  command unless a bash or write tool result appears in the Results section below.\n"
+    "  If only web_search results are present, describe what was found — do NOT pretend\n"
+    "  to have done work that has not happened. Say what you found, not what you 'did'."
 )
 
 # Used when there are no tool results — the results-focused instruction confuses small models.
@@ -32,7 +36,7 @@ _SYSTEM_NO_RESULTS = (
     "You are Sisyphean. No tools have run for this request.\n"
     "Rules:\n"
     "- Do NOT describe or claim actions you have not taken.\n"
-    "- If you cannot complete the task from context alone, say so and ask what you need.\n"
+    "- Reply naturally from context. If something is genuinely missing, name it briefly.\n"
     "- If soul guidance is given, follow it.\n"
     "- No hollow openers. No '/think'."
 )
@@ -75,8 +79,10 @@ async def synthesize(
             tool = r.get("tool", "")
             inp  = r.get("input", "")[:60]
             res  = (r.get("result") or r.get("summary") or "")[:80]
-            if tool in ("write", "edit", "bash") and res:
-                outer_done.append(f"[{tool}: {inp}] → {res}")
+            if tool in ("write", "edit", "bash"):
+                # Always record bash/write/edit completions — empty output means
+                # the command succeeded silently (e.g. mkdir, file write with no stdout).
+                outer_done.append(f"[{tool}: {inp}] → {res or '(done)'}")
             continue
         if r.get("result") is None:
             continue
@@ -108,8 +114,10 @@ async def synthesize(
     prompt = "\n\n".join(p for p in parts if p.strip())
 
     # Switch system prompt based on whether there are actual results to synthesize.
-    # The results-focused instruction confuses small models when there's nothing to cite.
-    has_results = bool(good or weak)
+    # Include failed results in the check: _SYSTEM_NO_RESULTS says "no tools ran"
+    # which contradicts the failed-step text already in the prompt body and causes
+    # small models to hallucinate rather than report the failure honestly.
+    has_results = bool(good or weak or failed)
     system = _SYSTEM_WITH_RESULTS if has_results else _SYSTEM_NO_RESULTS
 
     for _attempt in range(2):

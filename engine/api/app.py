@@ -260,6 +260,11 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/", tags=["info"])
     async def root():
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/dashboard")
+
+    @app.get("/api/info", tags=["info"])
+    async def api_info():
         return {
             "name": "Sisyphean",
             "version": "0.1.0",
@@ -458,11 +463,52 @@ def create_app(config: Config) -> FastAPI:
             return HTMLResponse(_DASHBOARD_HTML.read_text(encoding="utf-8"))
         return HTMLResponse("<h1>Dashboard not found. Place dashboard.html in project root.</h1>")
 
-    # Redirect / to dashboard
-    @app.get("/", tags=["info"])
-    async def root_redirect():
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url="/dashboard")
+
+    # ── Debug trace ──────────────────────────────────────────────────────
+
+    @app.get("/debug/trace", tags=["debug"])
+    async def debug_trace(task_id: str | None = None):
+        """Return per-step pipeline trace for the last (or specified) request.
+
+        Each event: {ts, stage, key, value}
+        Stages: start | route | route_override | decompose | plan |
+                step | step_done | outer_tool | tool_result |
+                replan | synthesize | answer
+        """
+        from engine.trace import get_trace, latest_task_id
+        tid = task_id or latest_task_id()
+        events = get_trace(tid)
+        return {"task_id": tid, "events": events}
+
+    # ── SSE event stream ────────────────────────────────────────────────────
+
+    @app.get("/api/stream", tags=["info"])
+    async def api_stream(request: Request):
+        """Server-Sent Events stream — pushes trace + activity events live."""
+        import asyncio as _asyncio
+        import json as _json
+        from engine import sse_bus as _bus
+        from fastapi.responses import StreamingResponse as _SR
+
+        async def _generate():
+            q = _bus.subscribe()
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await _asyncio.wait_for(q.get(), timeout=15.0)
+                        yield f"data: {_json.dumps(event)}\n\n"
+                    except _asyncio.TimeoutError:
+                        yield 'data: {"type":"ping"}\n\n'
+            finally:
+                _bus.unsubscribe(q)
+
+        return _SR(
+            _generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # ── Anthropic Messages API ───────────────────────────────────────────────
 

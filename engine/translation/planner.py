@@ -173,9 +173,9 @@ def infer_stage_type(step_text: str) -> str:
     # Skill steps are always "direct" — run_skill converts to bash in _execute;
     # read_skill is an internal graph lookup. Neither should trigger web_search.
     if s.startswith("run skill:") or s.startswith("run_skill:") or s.startswith("run skill "):
-        return "direct"
+        return "skill"
     if s.startswith("read skill:") or s.startswith("read_skill:") or s.startswith("read skill "):
-        return "direct"
+        return "skill"
     if s.startswith("save:") or s.startswith("save_memory:") or s.startswith("save_memory "):
         return "save_memory"
     if any(k in s for k in _RESEARCH_KW):
@@ -194,28 +194,36 @@ def infer_stage_type(step_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _PLAN_SYSTEM = """\
-Output a JSON plan. Format exactly:
-{"outcome": "one sentence success criteria", "steps": "step1 | step2 | step3"}
-Steps are pipe-separated plain English actions.
-Use plain verbs: Run, Search, Write, Read, Summarise, Verify.
-Scale steps to complexity:
-- 1 step: simple direct queries (time, math, single bash command, greeting)
-- 2-3 steps: research tasks (Search topic | Summarise findings), single-file edits
-- 3-5 steps: complex tasks (reports, multi-part research, code pipelines, audits)
+You are a task planner. Describe WHAT needs to be accomplished — not HOW.
+Output exactly: {"outcome": "one-sentence success criteria", "steps": "goal1 | goal2 | goal3"}
+
+Steps are pipe-separated natural-language goals.
+Do NOT name tools, commands, file paths, or implementation details.
+
+GOOD steps: "Find the capital of France" | "Calculate 100 divided by 4" | "Build a Fibonacci module"
+BAD steps:  "Search for capital" | "Run python calc.py" | "Write fibonacci.py using loops"
+
+CRITICAL — WORKFLOW UNITY:
+A continuous workflow (create → run → report, research → write → verify) is ONE goal, not many.
+Only split into multiple goals when the work is genuinely independent.
+
+WRONG (over-split): "Write a counter script" | "Execute the script" | "Report the result"
+RIGHT (unified):    "Build and run a counter script that prints its result"
+
+WRONG (over-split): "Research hashlib" | "Write hasher.py" | "Test hasher.py"
+RIGHT (unified):    "Research hashlib and build a working hasher module"
+
+Scale to complexity:
+- 1 step: greetings, factual questions, calculations, single continuous workflows
+- 2 steps: tasks with a clearly separate research phase AND a separate creation phase
+- 3+ steps: genuinely independent deliverables (e.g. "build X, then separately build Y")
+
 RULES:
-- Research, analysis, and explanation tasks MUST have at least 2 steps: gather then synthesise.
-- Complex tasks (reports, code pipelines, audits, multi-part research) MUST have at least 3 steps.
-- NEVER plan a step that asks the user for input. If info is needed, answer immediately instead.
-- Use 'Write' steps ONLY when the user explicitly asks for a file/document/report to be saved.
-- For web research: use 'Search' or 'Fetch' steps.
-- Use 'Run' steps (bash) for queries about the CURRENT state of this machine: running \
-processes, GPU/CPU/memory usage, hardware info, disk space, network status, uptime. \
-These require a shell command — never use 'Search' for live local machine data.
-- In 'Run' step text write the exact command to execute. Never prefix a command with \
-'python' unless it is a .py script (e.g. 'python myscript.py'). Standalone tools like \
-nvidia-smi, systeminfo, ipconfig run directly without any prefix.
-OPTIONAL: Add "budgets": "12 | 60 | 8" (pipe-count must match steps) ONLY when a step
-needs more than the default (research=12, write_doc=10, write_code=12, verify=8, reflect=5).
+- If steps share data or one step feeds into the next → keep them as ONE goal
+- Greetings and social replies → single step: "Respond to the user"
+- Never plan a step that asks the user for input
+- For tasks needing live local machine data (processes, disk, memory, hardware) →
+  describe what information is needed, e.g. "Find current disk usage on this machine"
 """
 
 async def make_plan(goal: str, client, workspace: str = "") -> Plan:
@@ -348,7 +356,8 @@ def _parse_plan(raw: str, goal: str) -> Plan:
 
     stages: list[Stage] = []
     for i, step_text in enumerate(plain_steps):
-        stage_type = infer_stage_type(step_text)
+        # S1 stages are type-free — WHAT, not HOW.
+        # Type is assigned by S2 (think_decompose) and confirmed by S3 (plan_task).
         budget = 0
         if i < len(budget_list):
             try:
@@ -356,9 +365,9 @@ def _parse_plan(raw: str, goal: str) -> Plan:
             except ValueError:
                 pass
         stages.append(Stage(
-            type=stage_type,
+            type="",           # intentionally blank — S2 classifies
             goal=step_text,
-            budget=budget or STAGE_BUDGETS.get(stage_type, 10),
+            budget=budget or 12,
         ))
 
     if not stages:
@@ -642,13 +651,13 @@ async def resolve_bash_command(goal: str, client, context: str = "") -> str:
 _ROUTE_SYSTEM = """\
 Classify this task into one category. Output the category name only — one word, no punctuation.
 
-  direct  — the answer is already present in the provided context (memory, history, recall)
+  direct  — a social reply or acknowledgement (hi, thanks, ok). Training knowledge is NOT context.
   bash    — can be computed or executed locally on this machine (no external data needed)
-  search  — requires external data that does not exist on this machine
+  search  — requires a factual lookup, current data, or anything not computable locally
   memory  — user wants to save or recall something
   code    — create or modify a file
 
-If the answer is NOT already in context, never use direct — use bash or search."""
+Use direct ONLY for greetings and social replies. Any factual or informational question uses search."""
 
 _ROUTE_LABELS = frozenset({"direct", "bash", "search", "memory", "code"})
 
@@ -661,7 +670,8 @@ _ROUTE_HINTS: dict[str, str] = {
 }
 
 
-async def route_query(query: str, client, skill_index: str = "") -> str:
+async def route_query(query: str, client, skill_index: str = "",
+                      context_summary: str = "") -> str:
     """Lean router — single focused LLM call, returns one of _ROUTE_LABELS.
 
     Returns "" on failure so think_decompose falls back to its own judgment.
@@ -669,23 +679,30 @@ async def route_query(query: str, client, skill_index: str = "") -> str:
 
     skill_index: compact list of skill names + descriptions so the router can
     choose "direct" (serve from skill cache) vs "bash" (run a skill program).
-    No history, no graph — query + skill names only.
+
+    context_summary: 1-2 sentence summary of intent + recent history from
+    generate_task_context — fed to the router so it can make an informed
+    decision for continuation queries ("ok", "run it", "and for 3.12?") that
+    are ambiguous in isolation.
     max_tokens=256 with thinking=True: NOT subject to context management
     (router is the exception — it uses all 256 tokens for reasoning).
     """
     _system = _ROUTE_SYSTEM
     if skill_index:
-        # Append skill names so router knows what's cached — keeps system prompt
-        # focused (no history, no graph — query + skill names only per spec).
         _skill_lines = "\n".join(
             f"  {ln.strip()}" for ln in skill_index.strip().splitlines() if ln.strip()
         )[:400]
         _system += f"\n\nAvailable skills (prefer direct/bash if a skill covers this):\n{_skill_lines}"
+    # Append context summary to the user message so the router sees what is
+    # happening in the conversation before making its decision.
+    _user_msg = query[:200]
+    if context_summary:
+        _user_msg += f"\n\nConversation context: {context_summary[:300]}"
     try:
         result = await client.generate(
             [
                 {"role": "system", "content": _system},
-                {"role": "user",   "content": query[:200]},
+                {"role": "user",   "content": _user_msg},
             ],
             max_tokens=256,  # thinking=True — NOT subject to context management (spec exception)
             temperature=0.0,
@@ -723,44 +740,43 @@ async def route_query(query: str, client, skill_index: str = "") -> str:
 _THINK_DECOMPOSE_SYSTEM = """\
 You are a task router. Output ONLY valid JSON: {"outcome": "...", "steps": "..."}
 
-STEP FORMATS:
-  steps=""                   answer directly — no tool needed
-  steps="Search KEYWORDS"    web search — write real search terms
-  steps="Read FILEPATH"      read an existing file from disk
-  steps="Run COMMAND"        run a shell command
-  steps="Write FILENAME"     create a code or document file
-  steps="Save: FACT"         persist a fact to memory
-  steps="STEP1 | STEP2"      chain multiple steps with a pipe
+PRIMARY RULE — CHAINING:
+Count every distinct action in the task. Produce one step per action, chained with |
+in execution order. Two actions = two steps. Three actions = three steps.
+Never collapse multiple actions into a single step.
+
+AVAILABLE STEP TYPES (pick the right one for each action):
+  Search KEYWORDS    web search — concise keyword phrase, not a question
+  Read FILEPATH      read an existing file (full path)
+  Write FILENAME     create or overwrite a file (always full workspace path)
+  Run COMMAND        run a shell command or script
+  Save: FACT         persist a fact to memory
+  (empty)            answer directly from provided context — no tool needed
 
 ROUTING RULES:
 
 steps="" ONLY when the answer is already present in the provided context
-  (memory recall, graph, or conversation history). If the answer is not
-  in context, always use a tool — never answer from training knowledge.
+  (memory recall, graph, or conversation history). Never answer from training knowledge.
 
-steps="Search KEYWORDS" for any factual question not already in context.
-  Do NOT use Search for computation — use Run for those.
+Search for any factual question not already in context. Do NOT use Search for computation.
 
-steps="Read FILEPATH" to read an existing file — use the full path. Never use Run+cat/type to read files.
+Read to open an existing file — use the full path. Never use Run+cat/type to read files.
 
-steps="Run COMMAND" for shell actions and ALL computation.
-  For computation: use the calc skill — plan "Run skill:calc EXPRESSION".
-  NEVER use steps="Write..." for computation or expressions — Write is for permanent user files only.
+Run for shell actions and ALL computation.
+  For computation: use the calc skill — Run skill:calc EXPRESSION.
+  NEVER use Write for computation or expressions — Write is for permanent user files only.
 
-steps="Write FILENAME" to create or rewrite a file — use the full path.
-  Never use Run+vim/nano/editor to edit files — always use Write.
-  WORKSPACE RULE: The workspace path is given in the prompt. ALL files MUST live
-  inside that workspace directory — never use a bare filename.
+Write to create or rewrite a file — always the full workspace path.
+  Never use Run+editor to edit files.
+  WORKSPACE RULE: ALL files MUST live inside the workspace directory in the prompt.
 
-steps="Save: FACT" only when the user says: remember / save / note / keep in mind.
+Save only when the user says: remember / save / note / keep in mind.
 
 SKILL-FIRST — check before planning new stages:
 If "Relevant skills" are listed below the task, scan them first.
-  • skill tagged [runnable] → plan a single step: "Run skill:SKILL-NAME"
-    (this re-executes the saved program; no web search, no write pipeline needed)
-  • text-only skill (no [runnable] tag) → plan "Read skill:SKILL-NAME" as first step,
-    then only add Search / Write steps for gaps the runbook does not cover
-Only fall through to full search/write planning when NO skill matches this task type.
+  • skill tagged [runnable] → single step: "Run skill:SKILL-NAME"
+  • text-only skill → "Read skill:SKILL-NAME" first, then add steps for any gaps
+Only fall through to full planning when NO skill matches this task type.
 """
 
 
@@ -957,14 +973,21 @@ async def plan_task(
                     logger.debug("plan_task: LLM returned step list → %d step(s)", len(steps))
                     return steps
 
-            # Newline-separated steps — | is reserved as write_plan's
-            # intra-step separator (write_plan:file.py|task description)
-            # and must NOT be consumed here as a step boundary.
+            # Step separators:
+            #   \n  — primary separator; model should output one step per line
+            #   " | " (space-pipe-space) — the format the system prompt advertises;
+            #          model commonly uses this.  Split on it in addition to \n so
+            #          multi-step outputs like "web_search:q | bash:cmd" are parsed
+            #          correctly instead of polluting the first step's input.
+            # NOTE: plain "|" without surrounding spaces is reserved for write_plan's
+            #       file|goal intra-step format (write_plan:file.py|task) and must NOT
+            #       be treated as a step boundary here.
             steps_raw = str(steps_raw_val or "").strip()
             if steps_raw.startswith("[") or steps_raw.startswith("{"):
                 steps_raw = ""
             steps = []
-            for part in steps_raw.split("\n"):
+            _step_parts = re.split(r'\n| \| ', steps_raw)
+            for part in _step_parts:
                 part = part.strip()
                 if ":" in part:
                     tool, _, inp = part.partition(":")

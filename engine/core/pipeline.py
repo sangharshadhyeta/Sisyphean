@@ -26,7 +26,13 @@ from pathlib import Path
 from engine.core.synthesizer import synthesize
 from engine.core.recall import Recall
 from engine.core.context_extractor import extract_for_task, filter_tools_for_task
-from engine.translation.planner import split_deep, plan_task, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command, route_query, reflect_on_stage
+from engine.trace import trace as _trace
+from engine.core.context_builder import (
+    generate_task_context, interpret_context,
+    format_for_decompose, format_for_planning, format_for_synthesis,
+    _MAX_CTX_ITER,
+)
+from engine.translation.planner import split_deep, plan_task, make_plan, think_decompose, infer_stage_type, parse_format_response, resolve_bash_command, reflect_on_stage
 from engine.memory.skills import (
     get_skill_index, get_skill_runbook, get_skill_program,
     get_skill_script_path, save_skill_to_disk, save_skill_program_to_graph,
@@ -185,6 +191,99 @@ WHEN TO USE web_fetch:
 If the result already fully answers the task, reply: {"steps": ""}"""
 
 
+def _update_working_memory(state: "PipelineState") -> None:
+    """Update task_context.done/failed from live epistemic state.
+
+    Pure Python, no LLM. Called after each step result so every subsequent
+    plan_task() call sees what has actually happened in this execution so far.
+    This is the small-model substitute for a large model's implicit working memory —
+    the planner always knows what's done, what failed, and what was found.
+    """
+    if not state.task_context:
+        return
+
+    done_parts: list[str] = []
+
+    # Sub-tasks already completed (by idx) — highest signal for the planner
+    if state.current_task_idx > 0:
+        completed = [
+            st.get("task", "")[:50]
+            for st in state.sub_tasks[:state.current_task_idx]
+        ]
+        if completed:
+            done_parts.append("completed: " + "; ".join(completed))
+
+    # Files written this session
+    if state.files_written:
+        names = [os.path.basename(f) for f in state.files_written[-4:]]
+        done_parts.append("wrote: " + ", ".join(names))
+
+    # Commands run with brief outcome
+    if state.commands_run:
+        ran = [
+            (r.get("brief") or r.get("cmd", ""))[:50].replace("\n", " ").strip()
+            for r in state.commands_run[-3:]
+        ]
+        if ran:
+            done_parts.append("ran: " + "; ".join(ran))
+
+    # Good research results
+    found = [
+        r["summary"][:60]
+        for r in state.results[-6:]
+        if r.get("_quality") in ("good", "weak")
+        and not r.get("outer")
+        and r.get("tool") in ("web_search", "websearch", "search_memory",
+                               "web_fetch", "fetch_url")
+        and r.get("summary")
+    ]
+    if found:
+        done_parts.append("found: " + "; ".join(found[-2:]))
+
+    if done_parts:
+        state.task_context["done"] = "; ".join(done_parts)
+
+    # Update failed from recent bash/tool errors so planner avoids repeating them
+    errors = [
+        f"{r.get('tool','?')}: {r.get('input','')[:40]} → {r.get('summary','')[:50]}"
+        for r in state.results[-4:]
+        if r.get("_quality") == "error"
+        and r.get("tool") in ("bash", "powershell", "web_search", "websearch")
+    ]
+    if errors:
+        state.task_context["failed"] = "; ".join(errors[-2:])
+
+
+def _infer_type_from_steps(steps: list[dict], goal: str = "") -> str:
+    """Infer stage type from plan_task output (first tool selected).
+
+    Replaces keyword-based infer_stage_type for S3 routing — stage type now
+    reflects what the model actually chose, not what keywords predicted.
+    """
+    for step in steps:
+        tool = step.get("tool", "").lower()
+        if tool == "write_plan":
+            inp   = step.get("input", "")
+            fname = step.get("file_path", "")
+            if not fname and "|" in inp:
+                fname = inp.split("|")[0].strip()
+            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            return "write_doc" if ext in ("md", "txt", "rst", "html") else "write_code"
+        elif tool in ("bash", "powershell", "shell"):
+            return "verify"
+        elif tool in ("web_search", "websearch", "web_fetch", "fetch_url"):
+            return "research"
+        elif tool in ("read", "glob", "grep"):
+            return "research"
+        elif tool == "direct":
+            return "direct"
+        elif tool == "save_memory":
+            return "save_memory"
+        elif tool in ("write", "edit", "multiedit"):
+            return "edit"
+    return infer_stage_type(goal) if goal else "direct"
+
+
 def _result_quality(result: dict) -> str:
     """Grade a step result: 'good' | 'weak' | 'empty' | 'error'."""
     content = str(result.get("result", "")).strip()
@@ -204,6 +303,7 @@ def _result_quality(result: dict) -> str:
 @dataclass
 class PipelineState:
     query: str = ""
+    planned_outcome: str = ""  # success criteria declared by S1 (think_decompose)
     soul_section: str = ""
     user_prefs: str = ""
     # All planned sub-tasks: list of {task: str, steps: [{tool, input}]}
@@ -240,13 +340,33 @@ class PipelineState:
     bash_retry_count: int = 0  # consecutive bash failures on current step
     last_bash_error:  str = ""  # traceback from most recent bash failure (cleared after fix edit)
     # ── Rescue plan flag ──────────────────────────────────────────────────────
-    # Set True after one rescue-plan attempt so we never loop infinitely.
-    # Rescue runs once per outer query when the initial plan produced no results.
     rescue_attempted: bool = False
+    # ── Unified task context (from context_builder) ───────────────────────────
+    task_context: dict = field(default_factory=dict)
+    # ── Context rebuild loop ──────────────────────────────────────────────────
+    # Each failed stage appends {stage, received, attempted, failed, needed}.
+    # When synthesis is insufficient, the pipeline re-calls interpret_context
+    # with the accumulated feedback, re-plans, and re-executes.
+    feedback_log:  list[dict] = field(default_factory=list)
+    ctx_iteration: int = 0   # how many context rebuilds have fired this query
 
     def to_json(self) -> str:
+        tc = self.task_context
+        tc_compact = {
+            "int":  tc.get("intent",      "")[:150],
+            "don":  tc.get("done",        "")[:150],
+            "fld":  tc.get("failed",      "")[:100],
+            "con":  tc.get("constraints", "")[:100],
+            "sta":  tc.get("state",       "")[:100],
+            "mem":  tc.get("memory",          "")[:400],
+            "ht":   tc.get("history_turns",   "")[:300],
+            "wf":   tc.get("workspace_files", [])[:12],
+            "wr":   tc.get("workspace_root",  ""),
+            "proj": tc.get("project_ctx",     "")[:200],
+        } if tc else {}
         return json.dumps({
             "q":    self.query,
+            "po":   self.planned_outcome[:200],
             "ss":   self.soul_section[:400],
             "up":   self.user_prefs[:200],
             "st":   self.sub_tasks,
@@ -256,6 +376,7 @@ class PipelineState:
             "sctx": self.synthesis_ctx[:600],
             "tid":  self.task_id,
             "pd":   self.project_dir,
+            "tc":   tc_compact,
             # Epistemic state — capped to keep JSON size manageable
             "fr":  [{"path": r["path"], "head": r.get("head", "")[:150]}
                     for r in self.files_read[-10:]],
@@ -277,6 +398,11 @@ class PipelineState:
             "brc": self.bash_retry_count,
             "lbe": self.last_bash_error[:400],
             "ra":  self.rescue_attempted,
+            "fb":  [{"s": f.get("stage",""), "r": f.get("received","")[:120],
+                     "a": f.get("attempted","")[:80], "f": f.get("failed","")[:120],
+                     "n": f.get("needed","")[:80]}
+                    for f in self.feedback_log[-5:]],
+            "ci":  self.ctx_iteration,
         })
 
     @classmethod
@@ -284,6 +410,7 @@ class PipelineState:
         d = json.loads(s)
         obj = cls()
         obj.query             = d.get("q",   "")
+        obj.planned_outcome   = d.get("po",  "")
         obj.soul_section      = d.get("ss",  "")
         obj.user_prefs        = d.get("up",  "")
         obj.sub_tasks         = d.get("st",  [])
@@ -309,6 +436,26 @@ class PipelineState:
         obj.bash_retry_count  = d.get("brc", 0)
         obj.last_bash_error   = d.get("lbe", "")
         obj.rescue_attempted  = d.get("ra",  False)
+        tc = d.get("tc", {})
+        if tc:
+            obj.task_context = {
+                "intent":          tc.get("int",  ""),
+                "done":            tc.get("don",  ""),
+                "failed":          tc.get("fld",  ""),
+                "constraints":     tc.get("con",  ""),
+                "state":           tc.get("sta",  ""),
+                "memory":          tc.get("mem",  ""),
+                "history_turns":   tc.get("ht",   ""),
+                "workspace_files": tc.get("wf",   []),
+                "workspace_root":  tc.get("wr",   ""),
+                "project_ctx":     tc.get("proj", ""),
+                "query":           d.get("q",     ""),
+            }
+        obj.feedback_log  = [{"stage": f.get("s",""), "received": f.get("r",""),
+                               "attempted": f.get("a",""), "failed": f.get("f",""),
+                               "needed": f.get("n","")}
+                              for f in d.get("fb", [])]
+        obj.ctx_iteration = d.get("ci", 0)
         return obj
 
 
@@ -380,12 +527,20 @@ class Pipeline:
         if env_line and "[Project context]" not in env_line:
             project_ctx = "\n\n".join(p for p in (env_line, project_ctx) if p)
 
-        # Extract working directory for the Write tool's file_path resolution.
-        # translate_system() puts "cwd: /path/to/project" in the first line.
+        # Extract working directory from the harness system prompt.
+        # BirdClaw sends:  "cwd: /harness/workspace | session: ..."
+        # Claude Code sends: "cwd: /project/root | ..."
+        # The harness-provided cwd IS the workspace files should be written to.
         project_dir = ""
         m_cwd = re.search(r"cwd:\s*([^|]+)", env_line)
         if m_cwd:
             project_dir = m_cwd.group(1).strip().replace("/", os.sep)
+
+        # Effective workspace: always prefer the harness-provided path so files
+        # land in the harness's workspace, not Sisyphean's own ./workspace dir.
+        # self.workspace is kept only for Sisyphean-internal files (notes, logs,
+        # skill scripts) — never exposed to the planner when a harness is present.
+        effective_workspace = project_dir or self.workspace
 
         # Format full conversation history — gemma4 has 131k context, let it decide
         # what's relevant rather than pre-filtering with bigrams.
@@ -408,7 +563,8 @@ class Pipeline:
                                  history_text=history_text, project_ctx=project_ctx,
                                  project_dir=project_dir, bc_plan=bc_plan,
                                  recall_ctx=recall_ctx, memory_ctx=memory_ctx,
-                                 recent_turns_text=recent_turns_text)
+                                 recent_turns_text=recent_turns_text,
+                                 raw_history=raw_history)
 
     # ── Fresh request ─────────────────────────────────────────────────────────
 
@@ -418,8 +574,10 @@ class Pipeline:
                      bc_plan: "tuple[str, list[dict]] | None" = None,
                      recall_ctx: str = "",
                      memory_ctx: str = "",
-                     recent_turns_text: str = "") -> LoopResponse:
+                     recent_turns_text: str = "",
+                     raw_history: "list[dict] | None" = None) -> LoopResponse:
         from engine.soul.router import load_user_prefs, parse_soul_sections, match_soul_section
+        effective_workspace = project_dir or self.workspace
 
         task_id = _tracker.start_task(session_id=session_id, user_message=query)
 
@@ -440,47 +598,31 @@ class Pipeline:
         # Injected into think_decompose + plan_task so the model sees "I have a
         # skill for this" without loading any full runbook token cost.
         skill_index = get_skill_index(query, self.graph) if self.graph else ""
-        # Guard: only show calc skill when the query contains digits or math operators.
-        # Without this, small models (qwen3:0.6b) pick calc for "latest Python version"
-        # (confuses "Python" with the calc skill) or "create a folder" queries.
-        if skill_index and not any(c in query for c in "0123456789+-*/^%()"):
-            skill_index = "\n".join(
-                line for line in skill_index.splitlines()
-                if "calc" not in line.lower()
-            )
         if skill_index:
             logger.debug("pipeline: skill index hit for %r", query[:40])
 
-        # ── Stage 1: Extract top-level context before splitting ───────────────
+        # ── S0: Context ────────────────────────────────────────────────────────
+        # Build full task context first — intent, done, failed, constraints,
+        # memory, workspace.  Every downstream stage receives a slice of this.
         _tracker.tree_context_running(task_id, query)
-        top_context = await extract_for_task(query, history_text, self.client)
-        top_quality  = "relevant" if len(top_context.split()) > 10 else ("minimal" if top_context else "none")
-        _tracker.tree_context_done(task_id, f"top-level extract: {top_quality}")
 
-        # ── Stage 1.5: Route query — lightweight classifier ───────────────────
-        # Separate focused call before think_decompose so the planner receives a
-        # one-line hint rather than trying to simultaneously classify AND plan.
-        # Returns "" on failure — think_decompose then decides freely.
-        # Skip when BirdClaw already planned (bc_plan is not None).
-        # Spec: router receives skill names + current question only — no history,
-        # no graph. skill_index is the only extra context allowed here.
-        _route = ""
-        if bc_plan is None:
-            # Pre-classify pure arithmetic before LLM routing — qwen3:0.6b
-            # misroutes "100/4" as web_search (slash looks like a URL path).
-            # Force "bash" so think_decompose plans a calc skill step instead.
-            _ARITH_PAT = re.compile(r'^[\d\s\+\-\*\/\.\(\)\^%]+$')
-            if _ARITH_PAT.match(query.strip()):
-                _route = "bash"
-                logger.info("pipeline: arithmetic fast-route=bash for %r", query[:40])
-            else:
-                _route = await route_query(query, self.client, skill_index=skill_index)
-            logger.info("pipeline: route=%r for query=%r", _route, query[:60])
+        _trace(task_id, "start", "query", query[:120])
 
-        # ── Stage 2: Decompose into stages ───────────────────────────────────
-        # If BirdClaw already ran generate_plan() (thinking=True) before routing
-        # here, use that plan directly — no duplicate LLM planning call.
-        # Otherwise fall back to think_decompose() (standalone Sisyphean path).
+        task_ctx = await generate_task_context(
+            query=query, raw_history=raw_history or [],
+            memory_ctx=memory_ctx, recall_ctx=recall_ctx,
+            workspace=self.workspace, project_ctx=project_ctx,
+            client=self.client, route="",
+        )
+
+        top_context = task_ctx.get("task_summary") or task_ctx.get("history_turns", "")
+        top_quality = "relevant" if task_ctx.get("task_summary") else ("minimal" if top_context else "none")
+        _tracker.tree_context_done(task_id, "context ready")
+
+        # ── S1: Plan ──────────────────────────────────────────────────────────
+        # make_plan() decides the high-level approach: what needs to happen and
+        # in what order.  Returns a Plan(outcome, stages) grounded in task_ctx.
+        # BirdClaw supplies its own plan — skip S1+S2 and use it directly.
         if bc_plan is not None:
             outcome, stages = bc_plan
             _tracker.tree_context_running(task_id, "birdclaw-plan")
@@ -488,37 +630,50 @@ class Pipeline:
             logger.info("pipeline: using BirdClaw plan — outcome=%r stages=%s",
                         outcome[:60], [(s["type"], s["goal"][:40]) for s in stages])
         else:
-            _tracker.tree_context_running(task_id, "think-decompose")
-            # Decompose context: task grounding (400 chars) + graph nodes (400 chars).
-            # top_context is essential — without it qwen3:0.6b returns 0 stages for
-            # multi-step write tasks ("write X then run Y") and the pipeline falls back
-            # to a single wrong bash step.  Cap tightly so it doesn't flood the call.
-            _graph_for_decompose = _search_graph(query, self.graph) if self.graph else ""
-            _decompose_parts = []
-            if top_context:
-                _decompose_parts.append(f"[Context]\n{top_context[:400]}")
-            if _graph_for_decompose:
-                _decompose_parts.append(f"[Memory]\n{_graph_for_decompose[:400]}")
-            _decompose_ctx = "\n\n".join(_decompose_parts)
-            outcome, stages = await think_decompose(
-                query, self.client,
-                context=_decompose_ctx,
-                soul_section=soul_section,
-                workspace=self.workspace,
-                skill_index=skill_index,
-                route=_route,
-                user_prefs=user_prefs[:200],
-            )
-            _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
-            logger.info("pipeline: outcome=%r stages=%s", outcome[:60],
-                        [(s["type"], s["goal"][:40]) for s in stages])
+            _tracker.tree_context_running(task_id, "plan")
+            _plan_ctx = format_for_planning(task_ctx)
+            _hi_plan = await make_plan(query, self.client, workspace=effective_workspace)
+            outcome  = _hi_plan.outcome
+            _tracker.tree_context_done(task_id, f"planned {len(_hi_plan.stages)} stage(s)")
+            logger.info("pipeline: S1 plan: outcome=%r stages=%s",
+                        outcome[:60], [(s.type, s.goal[:40]) for s in _hi_plan.stages])
+            _trace(task_id, "plan", f"goals({len(_hi_plan.stages)})",
+                   " | ".join(s.goal[:50] for s in _hi_plan.stages))
 
-        # Fall back only if think_decompose raised an exception (it now explicitly
-        # returns a "direct" stage when the model decides steps="" or parsing fails).
-        # Use "direct" so the synthesizer handles the query (clarify / answer from
-        # context) rather than guessing a write/verify stage from keyword substrings.
-        if not stages:
-            stages = [{"type": "direct", "goal": query}]
+            # ── S2: Decompose ─────────────────────────────────────────────────
+            # think_decompose() is applied to every S1 goal to produce concrete
+            # typed sub-stages.  S1 goals are type-free natural language — S2
+            # is the first place types (research, write_code, verify…) appear.
+            _tracker.tree_context_running(task_id, "decompose")
+            stages = []
+            # Always include the original query in decompose context so specific
+            # details (filenames, values, paths) survive S1's abstraction.
+            _decompose_ctx = f"Original request: {query[:200]}\n\n" + format_for_decompose(task_ctx)
+
+            for _ps in _hi_plan.stages:
+                _, _sub = await think_decompose(
+                    _ps.goal, self.client,
+                    context=_decompose_ctx,
+                    soul_section=soul_section,
+                    workspace=effective_workspace,
+                    skill_index=skill_index,
+                    user_prefs=user_prefs[:200],
+                )
+                if _sub:
+                    stages.extend(_sub)
+                    _trace(task_id, "decompose", _ps.goal[:50],
+                           " | ".join(f"{s['type']}:{s['goal'][:35]}" for s in _sub))
+                else:
+                    # think_decompose returned nothing — keep goal as direct
+                    stages.append({"type": "direct", "goal": _ps.goal})
+
+            if not stages:
+                stages = [{"type": "direct", "goal": query}]
+                _trace(task_id, "decompose", "fallback", "no stages → direct")
+
+            _tracker.tree_context_done(task_id, f"decomposed into {len(stages)} stage(s)")
+            logger.info("pipeline: S2 decompose: %d concrete stage(s) from %d plan stage(s)",
+                        len(stages), len(_hi_plan.stages))
 
         # ── Project expansion: write_project stages → per-file write_code stages ──
         # When think_decompose returns a single write_project/write_code stage for a
@@ -543,7 +698,7 @@ class Pipeline:
                 else query
             )
             try:
-                _proj_files = await _plan_project(self.client, _proj_goal, self.workspace)
+                _proj_files = await _plan_project(self.client, _proj_goal, effective_workspace)
             except Exception as _pe:
                 logger.warning("pipeline: project planner failed (%s) — single-stage fallback", _pe)
                 _proj_files = []
@@ -591,35 +746,17 @@ class Pipeline:
 
             # Inject a live workspace snapshot so the planner can see what files
             # already exist before generating a write/edit plan.
-            ws_snap = _workspace_snapshot(self.workspace) if self.workspace else ""
+            # Always use the harness workspace (effective_workspace) so the model
+            # sees the right directory and writes files there.
+            ws_snap = _workspace_snapshot(effective_workspace) if effective_workspace else ""
             if ws_snap:
                 ws_block = f"[Workspace — write ALL task files here]\n{ws_snap}"
-            elif self.workspace:
-                ws_block = f"[Workspace — write ALL task files here: {self.workspace}]"
+            elif effective_workspace:
+                ws_block = f"[Workspace — write ALL task files here: {effective_workspace}]"
             else:
                 ws_block = ""
 
-            # Prepend the original query so plan_task always has the full user request,
-            # even when the stage goal is a vague placeholder like "check system status".
-            original_ctx = f"Original request: {query}" if task != query else ""
-            # Plan context: compact per-item caps so all slots survive the
-            # overall _CTX_PLAN truncation.  graph_recall goes separately as
-            # graph_nodes (own _CTX_PLAN_GRAPH budget — never merged here).
-            #   recall    300  — project status: what's been done, graph facts
-            #   question   ~80  — original user request
-            #   history   400  — task-focused conversation (what was tried/decided)
-            #   workspace ~200  — current file listing
-            #   project   300  — CLAUDE.md architecture constraints
-            _recall_snip  = recall_ctx[:300]   if recall_ctx   else ""
-            _history_snip = task_history[:400]  if task_history else ""
-            _project_snip = project_ctx[:300]   if project_ctx  else ""
-            recall_block  = f"[Recall]\n{_recall_snip}"    if _recall_snip  else ""
-            history_block = f"[History]\n{_history_snip}"  if _history_snip else ""
-            project_block = f"[Project]\n{_project_snip}"  if _project_snip else ""
-            task_ctx = "\n\n".join(
-                p for p in (recall_block, original_ctx, history_block, ws_block, project_block) if p
-            )
-            all_extracted.append(task_history)
+            all_extracted.append(task_ctx.get("history_turns", ""))
 
             if graph_recall:
                 logger.info("pipeline: graph recall hit for task=%r (%d chars) → separate graph_nodes slot",
@@ -633,27 +770,16 @@ class Pipeline:
             # can skip the LLM for well-understood stage types.
             stage_type = stage.get("type", "")
 
-            # Stage-type tool restriction — show only tools relevant to the stage.
-            # Reduces model confusion on small models (BirdClaw A2 principle).
-            _WRITE_TOOL_NAMES = frozenset({"write", "edit"})
-            _READ_TOOL_NAMES  = frozenset({"read", "glob", "grep"})
-            if stage_type == "verify":
-                # Verify: bash only — no web search, no file writes
-                relevant_tools = [t for t in relevant_tools
-                                  if t.get("name", "").lower() not in
-                                  _WEB_TOOL_NAMES | _WRITE_TOOL_NAMES]
-            elif stage_type == "research":
-                # Research: web + file reads — no writes or bash
-                relevant_tools = [t for t in relevant_tools
-                                  if t.get("name", "").lower() not in
-                                  {"bash", "powershell"} | _WRITE_TOOL_NAMES]
-            elif stage_type in ("write_code", "write_doc", "edit"):
-                # Write/edit: bash + file tools — no web search
-                relevant_tools = [t for t in relevant_tools
-                                  if t.get("name", "").lower() not in _WEB_TOOL_NAMES]
+            # Planning context: structured slice from the unified task context.
+            # Built after stage_type is known so format_for_planning can use it.
+            plan_context = format_for_planning(task_ctx, stage_type=stage_type)
+            if ws_block:
+                plan_context = plan_context + "\n\n" + ws_block
+            if task != query:
+                plan_context = f"Original request: {query}\n\n" + plan_context
 
-            filtered_names = [t.get("name", "") for t in relevant_tools]
-            logger.info("pipeline: task=%r filtered_tools=%s", task[:60], filtered_names)
+            available_names = [t.get("name", "") for t in relevant_tools]
+            logger.info("pipeline: task=%r available_tools=%s", task[:60], available_names)
 
             # ── Stage-type skill filter ───────────────────────────────────────
             # Mirror the tool filter: hide skills that can't be used in this
@@ -728,90 +854,28 @@ class Pipeline:
                         logger.warning("pipeline: save_memory stage failed: %s", exc)
                 steps = [{"tool": "save_memory", "input": fact, "result": "saved",
                           "summary": f"saved: {fact[:80]}"}]
-            elif re.match(r'^search[\s:]', task.strip(), re.IGNORECASE):
-                # "Search KEYWORDS <phrase>" from decomposer — strip prefix then
-                # clean any question-word crud the model echoed into the placeholder.
-                _kw = task.strip()
-                # 1. Strip "Search KEYWORDS" / "Search:" / "Search KEYWORD" prefix
-                for _pfx in ("search keywords:", "search keyword:", "search keywords ",
-                              "search keyword ", "search:"):
-                    if _kw.lower().startswith(_pfx):
-                        _kw = _kw[len(_pfx):].strip()
-                        break
-                else:
-                    # No structured prefix — strip the bare word "search " so we
-                    # don't search for "search for the meaning of life" verbatim.
-                    if _kw.lower().startswith("search "):
-                        _kw = _kw[7:].strip()
-                # 2. Strip enclosing quotes if present
-                if len(_kw) >= 2 and _kw[0] in ('"', "'") and _kw[-1] == _kw[0]:
-                    _kw = _kw[1:-1].strip()
-                # 3. Strip leading question-word prefixes that the model echoes when
-                #    it fills the KEYWORDS placeholder with the user's sentence.
-                #    e.g. "search for the meaning of life" → "the meaning of life"
-                #         "find out about Python async" → "Python async"
-                _QPFX = re.compile(
-                    r'^(?:search\s+for\s+|look\s+up\s+|find\s+(?:out\s+)?(?:about\s+)?|'
-                    r'how\s+to\s+|what\s+(?:is|are|was|were)\s+(?:the\s+)?|'
-                    r'who\s+is\s+|where\s+is\s+|when\s+(?:is|was)\s+|'
-                    r'tell\s+me\s+(?:about\s+)?|get\s+(?:me\s+)?(?:info(?:rmation)?\s+(?:about|on)\s+)?)',
-                    re.IGNORECASE,
-                )
-                _prev = None
-                while _prev != _kw:
-                    _prev = _kw
-                    _kw = _QPFX.sub("", _kw, count=1).strip()
-                # 4. Literal placeholder echo ("KEYWORDS" / "KEYWORD") — unusable,
-                #    let plan_task route instead.
-                if _kw.upper() in ("KEYWORDS", "KEYWORD", "SEARCH TERMS", "QUERY", ""):
-                    _kw = ""
-                if not _kw:
-                    _kw = task.strip()
-                logger.info("pipeline: Search literal → web_search: %s", _kw[:80])
-                steps = [{"tool": "web_search", "input": _kw}]
-            elif task.strip().lower().startswith("run ") or re.match(
-                r'^command:\s*run\s+', task.strip(), re.IGNORECASE
-            ):
-                # Stage goal is already a concrete command — skip plan_task,
-                # extract the command and emit a bash step directly.
-                # Strip "COMMAND: Run " / "CMD: " prefixes that small models echo from format descriptions.
-                _task_stripped = re.sub(r'^command:\s*', '', task.strip(), flags=re.IGNORECASE)
-                if _task_stripped.lower().startswith("run "):
-                    _task_stripped = _task_stripped[4:].strip()
-                # Also strip bare CMD: prefix (model echoes "Run CMD: '12*7'" → strip to '12*7')
-                _task_stripped = re.sub(r'^cmd[\s:]+', '', _task_stripped, flags=re.IGNORECASE).strip()
-                # Extract "; Save: TYPE" suffix before stripping — propagate as _save_after
-                # so _continue auto-inserts a save_memory step once the result is known.
-                _save_m = re.search(r'\s*;\s*[Ss]ave:\s*(\w+)\s*$', _task_stripped)
-                _task_stripped = re.sub(r'\s*;\s*[Ss]ave:\s*\w+\s*$', '', _task_stripped).strip()
-                cmd = _sub_workspace(_normalize_python_c(_task_stripped), self.workspace)
-                logger.info("pipeline: direct-run stage → bash: %s", cmd[:80])
-                _bash_step: dict = {"tool": "bash", "input": cmd}
-                if _save_m:
-                    _bash_step["_save_after"] = _save_m.group(1).lower()
-                steps = [_bash_step]
             elif stage_type == "verify":
                 # Tool already decided by think_decompose: bash.
                 # Only ask "what command?" — don't re-do tool selection via plan_task.
-                cmd = await resolve_bash_command(task, self.client, context=task_ctx)
+                cmd = await resolve_bash_command(task, self.client, context=plan_context)
                 if cmd:
-                    cmd = _sub_workspace(_normalize_python_c(cmd), self.workspace)
+                    cmd = _sub_workspace(_normalize_python_c(cmd), effective_workspace)
                     logger.info("pipeline: verify stage → bash: %s", cmd[:80])
                     steps = [{"tool": "bash", "input": cmd}]
                 else:
                     steps = await plan_task(task, relevant_tools or available_tools, self.client,
-                                            context=task_ctx[:_CTX_PLAN],
+                                            context=plan_context[:_CTX_PLAN],
                                             soul_section=soul_section,
                                             user_prefs=user_prefs,
-                                            workspace=self.workspace,
+                                            workspace=effective_workspace,
                                             skill_index=_stage_skill_index,
                                             graph_nodes=graph_recall)
             else:
                 steps = await plan_task(task, relevant_tools or available_tools, self.client,
-                                        context=task_ctx[:_CTX_PLAN],
+                                        context=plan_context[:_CTX_PLAN],
                                         soul_section=soul_section,
                                         user_prefs=user_prefs,
-                                        workspace=self.workspace,
+                                        workspace=effective_workspace,
                                         skill_index=_stage_skill_index,
                                         graph_nodes=graph_recall)
 
@@ -829,9 +893,7 @@ class Pipeline:
                 if not _fn:
                     _fn = _extract_filename_from_task(query, _ft)
                 if _fn:
-                    # User-requested files go to project_dir (where BirdClaw was
-                    # started); fall back to workspace when running standalone.
-                    _base_dir = project_dir or self.workspace
+                    _base_dir = effective_workspace
                     if _base_dir and not os.path.isabs(_fn):
                         _fn = os.path.join(_base_dir, _fn)
                     steps = [{"tool": "write_plan", "input": task,
@@ -845,49 +907,46 @@ class Pipeline:
                 # Non-research stage with no plan — let synthesizer handle it
                 logger.info("pipeline: empty plan for %s stage %r", stage_type, task[:60])
 
+            # S3 (Route): update stage_type to reflect what plan_task actually chose.
+            # This is the authoritative type used for budget allocation and flow control.
+            if steps and stage_type not in ("direct", "save_memory"):
+                _inferred = _infer_type_from_steps(steps, task)
+                if _inferred != stage_type:
+                    logger.info("pipeline: stage_type %s→%s for %r",
+                                stage_type, _inferred, task[:50])
+                    stage_type = _inferred
+
             sub_tasks.append({"task": task, "type": stage_type, "steps": steps})
             steps_preview = " → ".join(f"[{s['tool']}] {s['input'][:30]}" for s in steps[:4])
             logger.info("pipeline: task=%r steps=%s", task[:60],
                         [(s["tool"], s["input"][:40]) for s in steps])
-            _log("llm", f"plan: {task[:40]}", steps_preview, session_id=task_id,
-                 data={"action": "plan", "task": task[:120],
+            _trace(task_id, "route", stage_type,
+                   f"task={task[:50]} | steps={[s['tool']+':'+s['input'][:30] for s in steps]}")
+            _log("llm", f"route: {task[:40]}", steps_preview, session_id=task_id,
+                 data={"action": "route", "task": task[:120],
                        "steps": [{"tool": s["tool"], "input": s["input"][:80]} for s in steps]})
 
         _tracker.tree_plan_done(task_id, sub_tasks)
 
-        # Synthesis context — extract what's relevant to the original query.
-        # If there's only one sub-task its extracted context is already good;
-        # for multi-task queries re-run extraction against the full query.
-        if len(tasks) == 1 and all_extracted:
-            synthesis_history = all_extracted[0]
-        else:
-            synthesis_history = await extract_for_task(query, history_text, self.client)
-
-        # ── Recent turns — always included, Jaccard-independent ───────────────
-        # extract_for_task() filters by lexical similarity; follow-up questions
-        # ("based on this, do you think you are alive?") have near-zero overlap
-        # with the previous turn's topic ("meaning of life") so the context gets
-        # dropped even though it's essential.  Always include the last 2 turns
-        # verbatim so conversational continuity is never broken by the filter.
-        recent_turns = recent_turns_text   # last 2 user+asst pairs (computed in process())
-
-        # Synthesis context: soul/memory + recent turns + filtered history + project snapshot.
-        # project_ctx capped to 300 chars — synthesizer needs architecture awareness
-        # ("entrypoint is main.py", file layout) to answer project-state questions
-        # accurately, but not the full CLAUDE.md.
-        _synth_project = project_ctx[:300] if project_ctx else ""
-        synthesis_ctx = "\n\n".join(
-            p for p in (memory_ctx, recent_turns, synthesis_history, _synth_project) if p
+        # Synthesis context — built from the unified task context.
+        # format_for_synthesis() assembles memory + history + project + live activity.
+        # No extra extract_for_task() call needed; the template already has everything.
+        synthesis_history = all_extracted[0] if (len(tasks) == 1 and all_extracted) else ""
+        synthesis_ctx = format_for_synthesis(
+            task_ctx,
+            synthesis_history=synthesis_history,
         )
 
         state = PipelineState(
             query=query,
             soul_section=soul_section,
             user_prefs=user_prefs,
+            planned_outcome=outcome,
             sub_tasks=sub_tasks,
             synthesis_ctx=synthesis_ctx,
             task_id=task_id,
             project_dir=project_dir,
+            task_context=task_ctx,
         )
         return await self._execute(state, available_tools)
 
@@ -907,11 +966,6 @@ class Pipeline:
             item_anchor = written_item.get("anchor", item_title)
             item_min    = written_item.get("min_chars", 200)
 
-            # Always track the file — Write returns empty result, Edit returns a message.
-            # We track regardless so epistemic state stays accurate.
-            if state.wp_file and state.wp_file not in state.files_written:
-                state.files_written.append(state.wp_file)
-
             for tr in tool_results:
                 logger.info("pipeline.wp_continue: item=%d/%d result=%s",
                             state.wp_idx, len(state.wp_items), tr[:60])
@@ -919,6 +973,35 @@ class Pipeline:
                     state.task_id, state.current_task_idx,
                     "write", item_title, tr[:120], status="done",
                 )
+
+                # ── Write failure detection ───────────────────────────────────
+                # Write returns empty result on success; an "Error:" string means it failed.
+                # Common cause: file path outside the harness's allowed workspace roots.
+                # Recovery: redirect to self.workspace (Sisyphean's own workspace which
+                # the running harness always permits).
+                _write_err = (
+                    tr.strip().lower().startswith("error:")
+                    or "permission denied" in tr.lower()
+                    or "outside workspace" in tr.lower()
+                )
+                if _write_err:
+                    logger.warning("pipeline.wp_write: failed (%s) — redirecting to self.workspace",
+                                   tr[:80])
+                    _trace(state.task_id, "write_fail", item_title, tr[:100])
+                    # Redirect wp_file to Sisyphean's own workspace so the retry succeeds
+                    if self.workspace and state.wp_file:
+                        _new_wp_file = os.path.join(
+                            self.workspace, os.path.basename(state.wp_file)
+                        )
+                        logger.info("pipeline.wp_write: redirected %s → %s",
+                                    state.wp_file, _new_wp_file)
+                        state.wp_file = _new_wp_file
+                    # Retry by NOT advancing wp_idx — same item, new path
+                    return await self._execute(state, available_tools)
+
+            # Only track the file after a successful write (no error in any result)
+            if state.wp_file and state.wp_file not in state.files_written:
+                state.files_written.append(state.wp_file)
 
             # ── Verify the item that was just written ─────────────────────────
             _MAX_ITEM_RETRIES = 2
@@ -988,6 +1071,8 @@ class Pipeline:
             # Empty stdout from bash/write means the command succeeded silently
             if not tr and outer_input:
                 tr = f"Completed successfully: {outer_input[:80]}"
+            _trace(state.task_id, "tool_result", outer_tool,
+                   f"input={outer_input[:50]} | result={tr[:80]}")
             result_entry = {
                 "tool": outer_tool,
                 "input": outer_input,
@@ -1016,9 +1101,39 @@ class Pipeline:
                 file_path = outer_step.get("file_path") or outer_input[:200]
                 if state.project_dir and not os.path.isabs(file_path):
                     file_path = os.path.join(state.project_dir, file_path)
-                if file_path not in state.files_written:
-                    state.files_written.append(file_path)
-                    logger.debug("epistemic: wrote %s", file_path)
+
+                # Detect write failures — never silently mark a failed write as done
+                _write_err = (
+                    tr.strip().lower().startswith("error:")
+                    or "permission denied" in tr.lower()
+                    or "outside workspace" in tr.lower()
+                )
+                if _write_err:
+                    logger.warning("pipeline: write outer failed (%s) — retrying with self.workspace",
+                                   tr[:80])
+                    _trace(state.task_id, "write_fail", os.path.basename(file_path), tr[:100])
+                    result_entry["_quality"] = "error"
+                    # If path error: redirect to self.workspace and re-run this step
+                    if self.workspace and state.bash_retry_count < 2:
+                        _new_path = os.path.join(self.workspace, os.path.basename(file_path))
+                        outer_step["file_path"] = _new_path
+                        outer_step["input"]     = outer_step.get("input", outer_input)
+                        try:
+                            sub = state.sub_tasks[state.current_task_idx]
+                            sub["steps"].insert(state.current_step_idx + 1, {
+                                "tool":      "write",
+                                "input":     outer_step.get("input", outer_input),
+                                "file_path": _new_path,
+                            })
+                        except (IndexError, KeyError):
+                            pass
+                        state.bash_retry_count += 1
+                        state.results.pop()   # discard failed result
+                    # Do NOT add to files_written
+                else:
+                    if file_path not in state.files_written:
+                        state.files_written.append(file_path)
+                        logger.debug("epistemic: wrote %s", file_path)
             elif outer_tool in ("bash", "powershell"):
                 brief = tr[:120].replace("\n", " ").strip()
                 state.commands_run.append({"cmd": outer_input[:100], "brief": brief})
@@ -1058,6 +1173,38 @@ class Pipeline:
                         tb_info["file"] if tb_info else "",
                         state.project_dir, self.workspace,
                     ) if tb_info else ""
+
+                    # ── Import-verify special case ────────────────────────────
+                    # The import check runs:
+                    #   python -c "import sys; sys.path.insert(...); import calc3; print('import OK: calc3')"
+                    # Its traceback points to File "<string>", not the broken module.
+                    # Recover the module name from the known marker "import OK: <name>"
+                    # that the verify command always embeds — no pattern matching needed.
+                    if not fix_file and outer_step.get("_import_verify"):
+                        _marker = "import OK: "
+                        _mi = outer_input.find(_marker)
+                        if _mi != -1:
+                            _after  = outer_input[_mi + len(_marker):]
+                            # Module name ends at the next ' or " or end-of-string
+                            _end    = min(
+                                (_after.find(c) for c in ("'", '"', ")", "\n")
+                                 if _after.find(c) != -1),
+                                default=len(_after),
+                            )
+                            _mod = _after[:_end].strip()
+                            if _mod:
+                                for _base in (self.workspace, state.project_dir):
+                                    if _base:
+                                        _candidate = os.path.join(_base, f"{_mod}.py")
+                                        if os.path.isfile(_candidate):
+                                            fix_file = _candidate
+                                            logger.warning(
+                                                "pipeline: import_verify failed for %s.py "
+                                                "— resolved fix_file: %s",
+                                                _mod, _candidate,
+                                            )
+                                            _trace(state.task_id, "import_fix", _mod, _candidate)
+                                            break
 
                     if fix_file:
                         # Smart fix: Read broken file → LLM generates Edit → re-run
@@ -1099,6 +1246,15 @@ class Pipeline:
                             state.current_step_idx -= 1  # re-run same step
                             state.results.pop()          # discard failed result
                         else:
+                            # All retries exhausted — log to feedback_log so the
+                            # context loop can re-interpret with this failure info.
+                            state.feedback_log.append({
+                                "stage":     "bash",
+                                "received":  format_for_planning(state.task_context)[:120] if state.task_context else "",
+                                "attempted": outer_input[:100],
+                                "failed":    tr[:200],
+                                "needed":    "working command for this task and OS",
+                            })
                             state.bash_retry_count = 0
                 else:
                     state.bash_retry_count = 0
@@ -1118,6 +1274,9 @@ class Pipeline:
                 state.task_id, state.current_task_idx,
                 _display_tool, outer_input, tr[:200], status="done",
             )
+
+        # Update working memory so the next plan_task() call sees current progress
+        _update_working_memory(state)
 
         # Advance step index
         state.current_step_idx += 1
@@ -1184,7 +1343,7 @@ class Pipeline:
                 # Only runs for clean module names (no hyphens, no path separators).
                 if wp_ftype_was == "code" and wp_file_was:
                     _mod = os.path.splitext(os.path.basename(wp_file_was))[0]
-                    _ws  = self.workspace or state.project_dir or ""
+                    _ws  = state.project_dir or self.workspace or ""
                     if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', _mod) and _ws:
                         _verify_cmd = (
                             f'python -c "import sys; sys.path.insert(0, r\'{_ws}\'); '
@@ -1261,6 +1420,10 @@ class Pipeline:
                 tool  = step.get("tool", "").strip().lower()
                 inp   = step.get("input", "").strip()
 
+                _trace(state.task_id, "step",
+                       f"{stage_type}/{state.current_task_idx}.{state.current_step_idx}",
+                       f"{tool}: {inp[:80]}")
+
                 # ── Graph-first: warm path ────────────────────────────────────
                 # Serve from graph if available. Recency scoring ranks fresh nodes
                 # higher — no time-gate. If model judged memory stale/partial and
@@ -1284,6 +1447,9 @@ class Pipeline:
                             state.task_id, state.current_task_idx,
                             "search_memory", inp, result["summary"], status="done",
                         )
+                        _trace(state.task_id, "step_done",
+                               f"{tool}/{state.current_task_idx}.{state.current_step_idx}",
+                               f"graph-cache hit: {mem[:60]}")
                         state.current_step_idx += 1
                         continue
 
@@ -1389,8 +1555,6 @@ class Pipeline:
                                 _wp_file = ""
                                 _wp_task = inp
                         if _wp_file:
-                            # User-requested files go to project_dir; fall back
-                            # to workspace when running standalone (no project_dir).
                             _base_dir = state.project_dir or self.workspace
                             if _base_dir and not os.path.isabs(_wp_file):
                                 _wp_file = os.path.join(_base_dir, _wp_file)
@@ -1441,7 +1605,8 @@ class Pipeline:
                     cl = canonical.lower()
 
                     if cl == "bash":
-                        cmd = _sub_workspace(_normalize_python_c(inp), self.workspace)
+                        _eff_ws = state.project_dir or self.workspace
+                        cmd = _sub_workspace(_normalize_python_c(inp), _eff_ws)
                         # Strip "COMMAND" / "CMD" prefix that models echo from format descriptions
                         cmd = re.sub(r'^(?:COMMAND|CMD)[\s:]+', '', cmd, flags=re.IGNORECASE).strip()
                         # Extract "; Save: TYPE" before stripping — tag step so _continue
@@ -1453,11 +1618,28 @@ class Pipeline:
                                 step["_save_after"] = _sm.group(1).lower()
                         cmd = re.sub(r'\s*;\s*[Ss]ave:\s*\w+\s*$', '', cmd).strip()
                         # Safety net: if cmd writes/runs relative files, cd to workspace first
-                        if self.workspace:
-                            cmd = _apply_workspace_to_cmd(cmd, self.workspace)
+                        if _eff_ws:
+                            cmd = _apply_workspace_to_cmd(cmd, _eff_ws)
                         tool_input = {"command": cmd}
+                        # Update inp so the dashboard and state record the final command,
+                        # not the raw plan text (e.g. stripped "COMMAND mkdir x" → "mkdir x").
+                        inp = cmd
+                        step["input"] = cmd
                     elif cl == "write":
-                        file_path = step.get("file_path") or inp[:120]
+                        file_path = step.get("file_path")
+                        if not file_path:
+                            # Model sometimes formats write steps as "path|content"
+                            # (copies the write_plan separator convention).
+                            # Split on the first un-spaced pipe to recover both parts.
+                            # Space-padded pipes (" | ") are step separators and are
+                            # already consumed by the step parser before we get here.
+                            if "|" in inp:
+                                _pipe_idx = inp.index("|")
+                                file_path = inp[:_pipe_idx].strip()
+                                inp = inp[_pipe_idx + 1:].strip()
+                                step["input"] = inp
+                            else:
+                                file_path = inp[:120]
                         if not file_path or not file_path.strip():
                             # Malformed write step with no file path — skip it
                             logger.warning("pipeline: skipping write step with empty file_path")
@@ -1558,6 +1740,9 @@ class Pipeline:
                         "name": canonical,
                         "input": tool_input,
                     }
+                    _trace(state.task_id, "outer_tool",
+                           f"{tool}/{state.current_task_idx}.{state.current_step_idx}",
+                           f"→ Claude Code: {inp[:80]}")
                     return LoopResponse(
                         content=[state_block, tool_block],
                         stop_reason="tool_use",
@@ -1611,6 +1796,7 @@ class Pipeline:
                                        inp[:40], quality)
 
                 state.results.append(result)
+                _update_working_memory(state)
                 summary = result.get("summary", "")
                 _tracker.tree_subtask_step(
                     state.task_id, state.current_task_idx,
@@ -1618,6 +1804,9 @@ class Pipeline:
                 )
                 logger.info("pipeline: internal tool=%s quality=%s → %s",
                             tool, quality, summary[:60])
+                _trace(state.task_id, "step_done",
+                       f"{tool}/{state.current_task_idx}.{state.current_step_idx}",
+                       f"quality={quality} | {summary[:80]}")
 
                 # ── Persist research to notes.md ──────────────────────────────
                 # Mirrors BirdClaw_Old: every informational tool result is
@@ -1688,6 +1877,9 @@ class Pipeline:
                             "pipeline: replan after %s — %d pre-guessed step(s) → %d result-driven step(s)",
                             tool, old_count, len(new_steps),
                         )
+                        _trace(state.task_id, "replan", tool,
+                               f"{old_count}→{len(new_steps)} steps: "
+                               + " | ".join(s['tool']+':'+s['input'][:30] for s in new_steps[:3]))
                         _log("stage", "replan", f"{old_count} → {len(new_steps)} steps",
                              session_id=state.task_id,
                              data={"stage": "replan", "tool": tool,
@@ -1726,40 +1918,98 @@ class Pipeline:
         # NOT env/cwd. The dual synthesizer system prompts (_SYSTEM_WITH_RESULTS vs
         # _SYSTEM_NO_RESULTS) handle framing; context helps the model answer in-thread
         # (e.g. "do you think you're alive?" benefits from the prior philosophy turns).
-        synth_ctx = state.synthesis_ctx
-
-        # ── Rescue plan ───────────────────────────────────────────────────────────
-        # Initial think_decompose runs early with ~800 chars of context.
-        # By consolidation time synthesis_ctx has 1500 chars: memory, graph, history.
-        # When the initial plan produced nothing (direct stage → no results), give
-        # the model one second chance with that richer context.  Non-direct stages
-        # are appended to sub_tasks and _execute() re-enters the execution loop —
-        # outer tool roundtrips (Read, Bash) are handled naturally by the existing
-        # Claude Code continuation mechanism.
-        if not has_real_results and synth_ctx and not state.rescue_attempted:
-            _, _rescue_stages = await think_decompose(
-                state.query, self.client, context=synth_ctx[:800]
+        # Rebuild synthesis context with live session activity (files written,
+        # commands run) from the now-complete execution.  task_context was built
+        # upfront; format_for_synthesis() adds whatever happened during execution.
+        if state.task_context:
+            synth_ctx = format_for_synthesis(
+                state.task_context,
+                files_written=state.files_written,
+                commands_run=state.commands_run,
             )
-            _rescue_actionable = [s for s in _rescue_stages if s.get("type") != "direct"]
-            if _rescue_actionable:
-                state.rescue_attempted = True
-                for _rs in _rescue_actionable:
-                    _rs_task  = _rs.get("goal", state.query)
-                    _rs_type  = _rs.get("type", "research")
-                    _rs_steps = await plan_task(
-                        _rs_task, available_tools, self.client,
-                        context=synth_ctx[:400],
-                        workspace=self.workspace,
-                    )
-                    state.sub_tasks.append({"task": _rs_task, "type": _rs_type, "steps": _rs_steps})
+        else:
+            synth_ctx = state.synthesis_ctx
+
+        # ── Context rebuild loop ──────────────────────────────────────────────────
+        # Fires only when execution produced no real results — gated on
+        # has_real_results so a successful re-run never re-enters the loop even
+        # if old bash-failure entries still sit in feedback_log.
+        # Each iteration gives interpret_context a richer picture of what was
+        # tried and what broke, so the next plan is more targeted.
+        # GUARD: skip for queries where all stages were "direct" or "save_memory" —
+        # those are correct with zero results by design (greetings, memory writes).
+        _all_direct = all(
+            st.get("type") in ("direct", "save_memory")
+            for st in state.sub_tasks
+        )
+        if not has_real_results and state.ctx_iteration < _MAX_CTX_ITER and not _all_direct:
+            # Log synthesis-level failure so interpret sees what was attempted
+            state.feedback_log.append({
+                "stage":     "synthesis",
+                "received":  format_for_planning(state.task_context)[:120] if state.task_context else "",
+                "attempted": "execute planned stages",
+                "failed":    "no actionable results from any stage",
+                "needed":    "concrete data from tools to answer the query",
+            })
+            state.ctx_iteration += 1
+            logger.info(
+                "pipeline: context loop iter=%d — %d feedback entries",
+                state.ctx_iteration, len(state.feedback_log),
+            )
+
+            # Build extra grounded data from live session state so
+            # interpret_context sees what actually happened, not just history.
+            _results_summary = "; ".join(
+                r.get("summary", r.get("result", "")[:60])[:60]
+                for r in state.results[-4:] if r.get("result") or r.get("summary")
+            )
+            _done_summary = "; ".join(state.files_written[-3:]) + (
+                "; ran " + "; ".join(r.get("cmd","")[:40] for r in state.commands_run[-2:])
+                if state.commands_run else ""
+            )
+            _extra = {
+                "done_summary":    _done_summary,
+                "results_summary": _results_summary,
+            }
+
+            # Re-interpret with feedback — produces new intent/done/failed/constraints/state
+            _new_ctx = await interpret_context(
+                state.query,
+                {
+                    "query":           state.query,
+                    "history_turns":   state.task_context.get("history_turns", ""),
+                    "memory":          state.task_context.get("memory", "") or synth_ctx[:400],
+                    "workspace_root":  state.task_context.get("workspace_root", ""),
+                    "workspace_files": state.task_context.get("workspace_files", []),
+                    "project_ctx":     state.task_context.get("project_ctx", ""),
+                    **_extra,
+                },
+                self.client,
+                feedback=state.feedback_log,
+            )
+            state.task_context.update(_new_ctx)
+
+            # Re-plan with the enriched context
+            _loop_plan_ctx = format_for_planning(state.task_context)
+            _loop_steps = await plan_task(
+                state.query, available_tools, self.client,
+                context=_loop_plan_ctx[:_CTX_PLAN],
+                workspace=state.project_dir or self.workspace,
+            )
+            if _loop_steps:
+                state.sub_tasks.append({
+                    "task":  state.query,
+                    "type":  "research",
+                    "steps": _loop_steps,
+                })
                 logger.info(
-                    "pipeline: rescue plan → %d actionable stage(s): %s",
-                    len(_rescue_actionable),
-                    [s.get("type") for s in _rescue_actionable],
+                    "pipeline: context loop iter=%d → %d new step(s)",
+                    state.ctx_iteration, len(_loop_steps),
                 )
                 return await self._execute(state, available_tools)
 
         result_summary = "; ".join(r.get("summary", "")[:60] for r in state.results[-3:])
+        _trace(state.task_id, "synthesize", f"results({len(state.results)})", result_summary[:120])
         _tracker.tree_synthesizer_running(state.task_id, result_summary)
         t0 = _time.time()
         answer = await synthesize(
@@ -1772,34 +2022,95 @@ class Pipeline:
         )
         elapsed_ms = int((_time.time() - t0) * 1000)
 
-        # ── Synthesis reflection gate ──────────────────────────────────────────
-        # One cheap LLM call: did the answer actually address the query?
-        # Only runs when there are real tool results to evaluate — skipped for
-        # no-result turns so the gate can't give a "done" verdict on a response
-        # that was produced without executing any tools.
-        # steps_remaining=1 biases the gate to prefer "done" unless clearly inadequate.
-        if has_real_results:
-            _synth_gate = await reflect_on_stage(
-                outcome=state.query,
+        # ── S5→S1 feedback loop ───────────────────────────────────────────────
+        # Synthesizer checks whether the declared outcome was actually achieved.
+        # If not, we feed the gap back to Stage 1 (re-decompose) rather than
+        # returning a partial answer.  The tools used don't matter — only whether
+        # the path led to the outcome.
+        if (
+            state.planned_outcome
+            and has_real_results
+            and not _all_direct
+            and state.ctx_iteration < _MAX_CTX_ITER
+        ):
+            _reflection = await reflect_on_stage(
+                outcome=state.planned_outcome,
                 stage_type="synthesis",
-                stage_summary=answer[:400],
+                stage_summary=answer,
                 client=self.client,
-                steps_remaining=1,
+                steps_remaining=_MAX_CTX_ITER - state.ctx_iteration,
             )
-            if _synth_gate.get("decision") == "deepen":
-                _gap = _synth_gate.get("goal", "")
-                logger.info("pipeline: synthesis gate → deepen: %s", _gap[:80])
-                _retry_ctx = (synth_ctx + (f"\n\nGap: {_gap}" if _gap else ""))[:1600]
-                _retry_answer = await synthesize(
-                    state.query, state.soul_section, state.user_prefs,
-                    state.results, self.client, context=_retry_ctx,
+            if _reflection.get("decision") == "deepen":
+                _gap = _reflection.get("goal", "")
+                logger.info("pipeline: S5→S1 feedback — outcome not met, gap=%r iter=%d",
+                            _gap[:60], state.ctx_iteration)
+                _trace(state.task_id, "s5_feedback", "deepen", _gap[:80])
+                state.feedback_log.append({
+                    "stage":     "synthesis",
+                    "received":  answer[:120],
+                    "attempted": "complete pipeline execution",
+                    "failed":    f"outcome not fully achieved: {_gap}",
+                    "needed":    _gap or "complete the declared outcome",
+                })
+                state.ctx_iteration += 1
+
+                # S0: re-interpret context with the gap feedback
+                _new_ctx = await interpret_context(
+                    state.query,
+                    {
+                        "query":           state.query,
+                        "history_turns":   state.task_context.get("history_turns", ""),
+                        "memory":          state.task_context.get("memory", ""),
+                        "workspace_root":  state.task_context.get("workspace_root", ""),
+                        "workspace_files": state.task_context.get("workspace_files", []),
+                        "project_ctx":     state.task_context.get("project_ctx", ""),
+                        "done_summary":    answer[:200],
+                        "results_summary": "; ".join(
+                            r.get("summary", r.get("result", ""))[:50]
+                            for r in state.results[-4:] if r.get("result") or r.get("summary")
+                        ),
+                    },
+                    self.client,
+                    feedback=state.feedback_log,
                 )
-                if _retry_answer:
-                    answer = _retry_answer
-                    logger.info("pipeline: synthesis retry → %d chars", len(answer))
+                state.task_context.update(_new_ctx)
+
+                # S1→S2: re-decompose focused on the gap
+                _gap_query = _gap or state.query
+                _new_outcome, _new_stages = await think_decompose(
+                    _gap_query, self.client,
+                    context=format_for_decompose(state.task_context),
+                    workspace=state.project_dir or self.workspace,
+                )
+                if _new_outcome:
+                    state.planned_outcome = _new_outcome
+
+                # S3: plan each new stage and add to sub_tasks
+                _added = 0
+                for _ns in _new_stages:
+                    if _ns.get("type") in ("direct", "save_memory"):
+                        continue
+                    _ns_ctx = format_for_planning(state.task_context, stage_type=_ns["type"])
+                    _ns_steps = await plan_task(
+                        _ns["goal"], available_tools, self.client,
+                        context=_ns_ctx[:_CTX_PLAN],
+                        workspace=state.project_dir or self.workspace,
+                    )
+                    if _ns_steps:
+                        _ns_type = _infer_type_from_steps(_ns_steps, _ns["goal"])
+                        state.sub_tasks.append({"task": _ns["goal"], "type": _ns_type,
+                                                "steps": _ns_steps})
+                        logger.info("pipeline: S5→S1 added stage type=%s goal=%r",
+                                    _ns_type, _ns["goal"][:50])
+                        _added += 1
+
+                if _added:
+                    return await self._execute(state, available_tools)
+                # No new actionable stages — proceed with current answer
 
         _tracker.tree_synthesizer_done(state.task_id, answer[:200])
         _tracker.finish_task(state.task_id, "done")
+        _trace(state.task_id, "answer", f"{len(answer)}chars", answer[:120])
 
         # ── Write task log (mirrors BirdClaw_Old's BIRDCLAW.md post-task write) ─
         _write_task_log(

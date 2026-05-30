@@ -1,1093 +1,585 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sisyphean Engine</title>
-  <link rel="icon" type="image/x-icon" href="/assets/favicon.ico" />
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'Fira Code', 'monospace'] } } }
-    }
-  </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
-  <style>
-    * { box-sizing: border-box; }
-    body { background: #0a0c14; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; margin: 0; }
-    .dot-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-    .card { background: #12152a; border: 1px solid #1e2235; border-radius: 12px; }
-    .stat-val { font-size: 2rem; font-weight: 600; line-height: 1; }
-    .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:.7rem; font-weight:600; }
-    /* Status dots */
-    .status-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; display:inline-block; }
-    .dot-pending  { background:#374151; }
-    .dot-running  { background:#22c55e; animation:pulse 1.2s ease-in-out infinite; }
-    .dot-done     { background:#6366f1; }
-    .dot-failed   { background:#ef4444; }
-    /* Scrollbars */
-    ::-webkit-scrollbar { width: 4px; height: 4px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 4px; }
-    /* Execution timeline */
-    .tl-ph  { transition: background .12s; }
-    .tl-ph:hover  { background: #141728 !important; }
-    .tl-sr  { transition: background .12s; }
-    .tl-sr:hover  { background: #0d0f1c !important; }
-    /* Memory graph */
-    .mg-node { cursor: pointer; }
-    .mg-node circle { transition: r .15s; }
-    .mg-node:hover circle { r: 7; }
-    /* Activity row */
-    .ev-row { border-bottom: 1px solid #1a1d2e; }
-    .ev-row:last-child { border-bottom: none; }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sisyphean</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; }
+body {
+  background: #0a0c14;
+  color: #e2e8f0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  overflow: hidden;
+}
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3d4160; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:none} }
+.pulse  { animation: pulse  1.8s ease-in-out infinite; }
+.fadein { animation: fadeIn 0.15s ease-out; }
+</style>
 </head>
-<body class="min-h-screen">
+<body>
 <div id="root"></div>
-
 <script type="text/babel">
-const { useState, useEffect, useCallback, useRef, useMemo } = React;
+const { useState, useEffect, useReducer, useRef, memo } = React;
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-function formatUptime(s) {
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
-  return `${h}h ${m}m`;
-}
-function timeAgo(ts) {
-  const d = Math.round(Date.now()/1000 - ts);
-  if (d < 5) return 'just now';
-  if (d < 60) return `${d}s ago`;
-  if (d < 3600) return `${Math.floor(d/60)}m ago`;
-  return `${Math.floor(d/3600)}h ago`;
-}
-function elapsedFmt(ms) {
-  if (!ms) return '';
-  return ms >= 1000 ? `${(ms/1000).toFixed(1)}s` : `${ms}ms`;
-}
+// ── Colour tables ──────────────────────────────────────────────────────────
 
-// ── Tool / type colours ────────────────────────────────────────────────────────
-const SKILL_COLOR = '#f472b6'; // pink — matches graph node type "skill"
 const TOOL_COLOR = {
-  web_search:'#06b6d4', websearch:'#06b6d4', web_fetch:'#0891b2', webfetch:'#0891b2',
-  search_memory:'#0ea5e9', search_knowledge:'#0ea5e9', search_soul:'#8b5cf6',
-  save_memory:'#ec4899', remember:'#ec4899',
-  answer:'#a855f7', synthesize:'#34d399',
-  bash:'#eab308', write:'#7c3aed', write_plan:'#6d28d9',
-  write_code:'#22c55e', write_doc:'#6ab0f5', write_project:'#f59e0b',
-  import_check:'#34d399', fix_read:'#fb923c',
-  read:'#10b981', glob:'#34d399', grep:'#6ee7b7', edit:'#f59e0b',
-  plan:'#818cf8', planner:'#818cf8',
-  run_skill: SKILL_COLOR,
-  default:'#475569',
+  web_search:'#06b6d4', websearch:'#06b6d4',
+  web_fetch:'#0891b2',  webfetch:'#0891b2',
+  search_memory:'#38bdf8', search_knowledge:'#38bdf8',
+  save_memory:'#ec4899',
+  bash:'#eab308', powershell:'#d97706', shell:'#eab308',
+  write:'#7c3aed', write_plan:'#6d28d9',
+  write_code:'#22c55e', write_doc:'#6ab0f5',
+  read:'#10b981', glob:'#34d399', grep:'#6ee7b7',
+  edit:'#f59e0b', multiedit:'#f59e0b',
+  run_skill:'#f472b6', direct:'#475569',
 };
-// If a step is flagged is_skill=true, always use pink regardless of the type name.
-function tc(t, isSkill){ if(isSkill) return SKILL_COLOR; return TOOL_COLOR[(t||'').toLowerCase()] || TOOL_COLOR.default; }
 
-const NODE_TYPE_COLOR = {
+// Stage names match pipeline trace labels exactly — new stages appear automatically
+// S0 context → S1 plan (make_plan) → S2 decompose (think_decompose/stage) → S3 route (plan_task/step) → S4 execute → S5 synthesize
+const STAGE = {
+  start:       { icon:'◆', color:'#818cf8', badge:'START'   },
+  plan:        { icon:'⊞', color:'#6366f1', badge:'PLAN'    },  // S1: make_plan high-level output
+  decompose:   { icon:'⊡', color:'#8b5cf6', badge:'DECOMP'  },  // S2: think_decompose per stage
+  route:       { icon:'⇒', color:'#60a5fa', badge:'ROUTE'   },  // S3: plan_task tool selection
+  step:        { icon:'●', color:'#f59e0b', badge:'RUN'     },  // S4: step executing
+  step_done:   { icon:'✓', color:'#34d399', badge:'DONE'    },  // S4: step completed
+  outer_tool:  { icon:'⬆', color:'#ca8a04', badge:'CALL'    },  // S4: outer tool dispatched
+  tool_result: { icon:'⬇', color:'#16a34a', badge:'RECV'    },  // S4: result received
+  replan:      { icon:'↺', color:'#f97316', badge:'REPLAN'  },  // S4→S2: subtask feedback
+  s5_feedback: { icon:'⟳', color:'#ec4899', badge:'OUTCOME' },  // S5→S1: outcome feedback
+  import_fix:  { icon:'⚑', color:'#f97316', badge:'FIX'     },
+  synthesize:  { icon:'◎', color:'#06b6d4', badge:'SYNTH'   },  // S5
+  answer:      { icon:'✦', color:'#34d399', badge:'ANSWER'  },  // S5 output
+};
+
+// Fallback for unknown future stages
+function stageMeta(stage) {
+  return STAGE[stage] || { icon:'·', color:'#475569', badge: stage.toUpperCase().slice(0,8) };
+}
+
+const NODE_COLOR = {
   soul:'#a78bfa', policy:'#a78bfa', user:'#34d399', project:'#f59e0b',
   fact:'#60a5fa', concept:'#38bdf8', entity:'#818cf8', skill:'#f472b6',
   system:'#94a3b8', session:'#64748b', preference:'#a3e635',
   url:'#fb923c', research:'#22d3ee',
 };
-function ntc(t){ return NODE_TYPE_COLOR[t] || '#475569'; }
 
-// ── Status badge ───────────────────────────────────────────────────────────────
-function StatusBadge({ running, mock, llmReady }) {
-  if (!running) return <span className="tag bg-red-900/60 text-red-300">Offline</span>;
-  if (mock)     return <span className="tag bg-yellow-900/60 text-yellow-300">Mock mode</span>;
-  if (!llmReady) return (
-    <span className="tag bg-red-900/60 text-red-300 flex items-center gap-1">
-      <span className="w-2 h-2 rounded-full bg-red-400 inline-block"></span>
-      Model unavailable
-    </span>
-  );
-  return (
-    <span className="tag bg-emerald-900/60 text-emerald-300 flex items-center gap-1">
-      <span className="w-2 h-2 rounded-full bg-emerald-400 dot-pulse inline-block"></span>
-      Running
-    </span>
-  );
+// ── Utilities ──────────────────────────────────────────────────────────────
+
+function fmtTime(s) {
+  if (!s || s < 0) return '';
+  if (s < 60)   return `${s.toFixed(1)}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m${Math.round(s%60)}s`;
+  return `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
+}
+function uptime(s) {
+  if (!s) return '0s';
+  if (s < 60)   return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m`;
+  return `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
+}
+function toolColor(key, value) {
+  // Try to extract a tool name from key ("bash/0.1") or value ("bash: cmd")
+  const from = (s) => { const m=s.match(/^([a-z_]+)[:/\s]/); return m?m[1]:null; };
+  const name = from(key) || from(value||'');
+  if (name && TOOL_COLOR[name]) return TOOL_COLOR[name];
+  for (const [k,v] of Object.entries(TOOL_COLOR))
+    if ((key+' '+(value||'')).toLowerCase().includes(k)) return v;
+  return null;
+}
+function findLastIdx(arr, pred) {
+  for (let i=arr.length-1; i>=0; i--) if(pred(arr[i])) return i;
+  return -1;
+}
+function stepIdx(key) { const m=key.match(/\/(\d+\.\d+)$/); return m?m[1]:key; }
+
+// ── Task state helpers ─────────────────────────────────────────────────────
+
+function makeRow(e) {
+  return { id:`${e.stage}:${e.key}:${e.ts}`, stage:e.stage, key:e.key,
+           value:e.value, ts:e.ts, status:'done', extra:'' };
 }
 
-// ── Stat card ──────────────────────────────────────────────────────────────────
-function StatCard({ label, value, sub, color = 'text-emerald-400' }) {
-  return (
-    <div className="card p-4 flex flex-col gap-1">
-      <span className="text-slate-500 text-xs uppercase tracking-widest">{label}</span>
-      <span className={`stat-val ${color}`}>{value}</span>
-      {sub && <span className="text-slate-600 text-xs">{sub}</span>}
-    </div>
-  );
-}
+function applyTrace(task, e) {
+  if (!task) task = { id:'', query:'', startedAt:0, status:'running', rows:[], answer:'' };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXECUTION TIMELINE  (replaces flowchart — full step-by-step live feed)
-// ═══════════════════════════════════════════════════════════════════════════════
+  if (e.stage === 'start')
+    return { ...task, id:e.task_id, query:e.value, startedAt:e.ts, status:'running' };
 
-// Live braille spinner
-function Spinner({ color='#22c55e' }) {
-  const F = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-  const [i,setI] = useState(0);
-  useEffect(()=>{ const t=setInterval(()=>setI(x=>(x+1)%F.length),90); return ()=>clearInterval(t); },[]);
-  return <span style={{color,fontFamily:'JetBrains Mono,monospace'}}>{F[i]}</span>;
-}
+  if (e.stage === 'answer')
+    return { ...task, status:'done', answer:e.value,
+             elapsed: e.ts-(task.startedAt||e.ts),
+             rows:[...task.rows, makeRow(e)] };
 
-function SIcon({ status, size=12 }) {
-  if (status==='running') return <Spinner />;
-  if (status==='done')    return <span style={{color:'#6366f1',fontSize:size}}>✓</span>;
-  if (status==='failed')  return <span style={{color:'#ef4444',fontSize:size}}>✗</span>;
-  return <span style={{color:'#2d3148',fontSize:size}}>○</span>;
-}
-
-// Phase bar — header strip with left-border colour accent, optionally collapsible
-function PhaseBar({ label, status, color, detail, children }) {
-  const [open, setOpen] = useState(true);
-  const hasKids = children !== null && children !== undefined && children !== false;
-  return (
-    <div style={{marginBottom:8}}>
-      <div className="tl-ph" onClick={()=>hasKids&&setOpen(o=>!o)}
-        style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',borderRadius:6,
-                background:'#0d0f1c',borderLeft:`3px solid ${color}`,
-                cursor:hasKids?'pointer':'default',userSelect:'none'}}>
-        <span style={{flexShrink:0,fontFamily:'monospace',width:14}}><SIcon status={status}/></span>
-        <span style={{color,fontWeight:700,fontSize:10,letterSpacing:1.2,
-                      textTransform:'uppercase',flexShrink:0}}>{label}</span>
-        {detail && <span style={{color:'#475569',fontSize:11,flex:1,overflow:'hidden',
-                                 textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{detail}</span>}
-        {hasKids && <span style={{color:'#374151',fontSize:9,marginLeft:'auto',flexShrink:0}}>
-          {open?'▾':'▸'}</span>}
-      </div>
-      {hasKids && open && <div style={{paddingLeft:14,paddingTop:4}}>{children}</div>}
-    </div>
-  );
-}
-
-// Single tool-call step: icon + tool name + args preview; click to expand input/output
-function StepRow({ step, replanBefore=false }) {
-  const [open, setOpen] = useState(false);
-  const col = tc(step.type||'', step.is_skill);
-  const hasDetail = step.input || step.output;
-  const dur = (step.finished_at && step.started_at)
-    ? `${step.finished_at - step.started_at}s` : null;
-
-  return (
-    <>
-      {replanBefore && (
-        <div style={{display:'flex',alignItems:'center',gap:6,padding:'3px 8px',
-                     margin:'6px 0 4px',borderRadius:4,
-                     background:'#1c180a',border:'1px solid #eab30840'}}>
-          <span style={{color:'#eab308',fontSize:12}}>↩</span>
-          <span style={{color:'#92400e',fontSize:10,letterSpacing:.8,fontWeight:600}}>REPLANNED</span>
-        </div>
-      )}
-      <div className="tl-sr" onClick={()=>hasDetail&&setOpen(o=>!o)}
-        style={{display:'flex',alignItems:'flex-start',gap:8,padding:'5px 8px',borderRadius:6,
-                background:open?'#0d0f1c':'transparent',
-                borderLeft:`2px solid ${col}55`,marginBottom:2,
-                cursor:hasDetail?'pointer':'default'}}>
-        <span style={{width:14,flexShrink:0,marginTop:1,fontFamily:'monospace'}}><SIcon status={step.status}/></span>
-        <span style={{color:col,fontWeight:600,fontSize:11,flexShrink:0,minWidth:74}}>{step.type}</span>
-        {step.input && (
-          <span style={{color:'#475569',fontSize:11,flex:1,overflow:'hidden',
-                        textOverflow:open?'clip':'ellipsis',
-                        whiteSpace:open?'pre-wrap':'nowrap',wordBreak:'break-all'}}>
-            {step.input}
-          </span>
-        )}
-        {dur && <span style={{color:'#374151',fontSize:10,flexShrink:0,paddingLeft:4}}>{dur}</span>}
-        {hasDetail && <span style={{color:'#374151',fontSize:9,flexShrink:0,paddingLeft:2}}>{open?'▴':'▾'}</span>}
-      </div>
-      {open && hasDetail && (
-        <div style={{marginLeft:22,marginBottom:6,background:'#0a0c14',borderRadius:6,
-                     border:'1px solid #1e2235',padding:'8px 10px'}}>
-          {step.input && (
-            <div style={{marginBottom:step.output?8:0}}>
-              <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
-                           fontWeight:600}}>INPUT</div>
-              <pre style={{color:'#94a3b8',fontSize:11,margin:0,whiteSpace:'pre-wrap',
-                           wordBreak:'break-all',maxHeight:320,overflowY:'auto',
-                           fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
-                {step.input}
-              </pre>
-            </div>
-          )}
-          {step.output && (
-            <div>
-              <div style={{color:'#374151',fontSize:9,letterSpacing:1,marginBottom:3,
-                           fontWeight:600}}>OUTPUT</div>
-              <pre style={{color:'#6ee7b7',fontSize:11,margin:0,whiteSpace:'pre-wrap',
-                           wordBreak:'break-all',maxHeight:380,overflowY:'auto',
-                           fontFamily:'JetBrains Mono,monospace',lineHeight:1.5}}>
-                {step.output}
-              </pre>
-            </div>
-          )}
-        </div>
-      )}
-    </>
-  );
-}
-
-// Sub-task section (when planner split into multiple sub-tasks)
-const SUB_COLORS = ['#06b6d4','#34d399','#f59e0b','#a855f7','#f472b6','#60a5fa','#fb923c'];
-
-function SubTaskSection({ sub, idx }) {
-  const [open, setOpen] = useState(true);
-  const steps = sub.steps || [];
-  const col = SUB_COLORS[idx % SUB_COLORS.length];
-  return (
-    <div style={{marginBottom:8}}>
-      <div className="tl-ph" onClick={()=>setOpen(o=>!o)}
-        style={{display:'flex',alignItems:'center',gap:8,padding:'5px 10px',borderRadius:6,
-                background:'#0f1221',borderLeft:`2px solid ${col}`,cursor:'pointer',
-                userSelect:'none',marginBottom:4}}>
-        <span style={{width:14,flexShrink:0,fontFamily:'monospace'}}><SIcon status={sub.status}/></span>
-        <span style={{color:col,fontSize:11,fontWeight:600,flexShrink:0}}>{idx+1}.</span>
-        <span style={{color:'#cbd5e1',fontSize:12,flex:1,overflow:'hidden',
-                      textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{sub.text}</span>
-        <span style={{color:'#374151',fontSize:9,flexShrink:0}}>{open?'▾':'▸'}</span>
-      </div>
-      {open && (
-        <div style={{paddingLeft:14}}>
-          {steps.length===0 && sub.status==='pending' && (
-            <div style={{color:'#374151',fontSize:11,padding:'3px 8px',fontStyle:'italic'}}>
-              Waiting to start…
-            </div>
-          )}
-          {steps.map((s,i) => {
-            const replanBefore = s.replan===true && (i===0 || !steps[i-1].replan);
-            return <StepRow key={i} step={s} replanBefore={replanBefore}/>;
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Full execution timeline for one task — phases → steps → outputs, everything expandable
-function ExecutionTimeline({ task }) {
-  const tree    = task.tree    || {};
-  const ext     = tree.extractor   || {};
-  const planner = tree.planner     || {};
-  const synth   = tree.synthesizer || {};
-  const subs    = planner.sub_tasks || [];
-  const isSingle = subs.length === 1;
-  const now = Math.round(Date.now()/1000);
-  const elapsed = task.finished_at
-    ? `${task.finished_at - task.started_at}s`
-    : `${now - (task.started_at||now)}s`;
-
-  return (
-    <div style={{padding:'12px 16px',overflowY:'auto',height:'100%',boxSizing:'border-box'}}>
-
-      {/* ── Task prompt ────────────────────────────────────────────── */}
-      <div style={{marginBottom:14,paddingBottom:12,borderBottom:'1px solid #1a1d2e'}}>
-        <div style={{display:'flex',alignItems:'flex-start',gap:8}}>
-          <span className={task.status==='running'?'dot-pulse':''}
-            style={{width:8,height:8,borderRadius:'50%',flexShrink:0,marginTop:4,
-                    display:'inline-block',
-                    background:task.status==='running'?'#22c55e':
-                               task.status==='failed'?'#ef4444':'#6366f1'}}/>
-          <div style={{flex:1}}>
-            <div style={{color:'#e2e8f0',fontSize:13,fontWeight:600,lineHeight:1.5,marginBottom:2}}>
-              {task.user_message}
-            </div>
-            <div style={{color:'#374151',fontSize:10}}>
-              {elapsed} · session {task.session}
-              {task.status !== 'running' && (
-                <span style={{color: task.status==='done'?'#6366f1':'#ef4444',marginLeft:8,
-                              fontWeight:600,textTransform:'uppercase',fontSize:9}}>
-                  {task.status}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* ── Context (memory extraction) ────────────────────────────── */}
-      {ext.status && ext.status !== 'pending' && (
-        <PhaseBar label="Context" status={ext.status} color="#0ea5e9"
-                  detail={ext.output || ext.input}/>
-      )}
-
-      {/* ── Plan ───────────────────────────────────────────────────── */}
-      {planner.status && planner.status !== 'pending' && (
-        !isSingle && subs.length > 0 ? (
-          <PhaseBar label="Plan" status={planner.status} color="#818cf8">
-            <div style={{paddingLeft:6,paddingTop:2,paddingBottom:4}}>
-              {subs.map((s,i) => (
-                <div key={i} style={{display:'flex',alignItems:'center',gap:6,
-                                     padding:'2px 0',fontSize:11}}>
-                  <span style={{color:'#374151',width:18,flexShrink:0,textAlign:'right'}}>{i+1}.</span>
-                  <span style={{flexShrink:0,fontFamily:'monospace',width:12}}><SIcon status={s.status} size={10}/></span>
-                  <span style={{color:'#64748b',overflow:'hidden',textOverflow:'ellipsis',
-                                whiteSpace:'nowrap',flex:1}}>{s.text}</span>
-                </div>
-              ))}
-            </div>
-          </PhaseBar>
-        ) : (
-          <PhaseBar label="Plan" status={planner.status} color="#818cf8"
-                    detail={subs[0]?.text || planner.output}/>
-        )
-      )}
-
-      {/* ── Execution steps ────────────────────────────────────────── */}
-      {subs.length > 0 && (
-        <div style={{marginBottom:8}}>
-          {isSingle ? (
-            // Single sub-task: steps shown directly, no extra nesting
-            (subs[0].steps||[]).length > 0 ? (
-              (subs[0].steps||[]).map((s,i) => {
-                const replanBefore = s.replan===true && (i===0||!subs[0].steps[i-1].replan);
-                return <StepRow key={i} step={s} replanBefore={replanBefore}/>;
-              })
-            ) : (
-              subs[0].status === 'pending' && (
-                <div style={{color:'#374151',fontSize:11,padding:'3px 8px',fontStyle:'italic'}}>
-                  Planning steps…
-                </div>
-              )
-            )
-          ) : (
-            subs.map((sub,i) => <SubTaskSection key={i} sub={sub} idx={i}/>)
-          )}
-        </div>
-      )}
-
-      {/* ── Synthesize ─────────────────────────────────────────────── */}
-      {synth.status && synth.status !== 'pending' && (
-        synth.output ? (
-          <PhaseBar label="Synthesize" status={synth.status} color="#a855f7"
-                    detail={synth.status==='running'?'Building answer…':null}>
-            <div style={{background:'#0d0f1c',borderRadius:6,padding:'10px 12px',
-                         border:'1px solid #1e2235',fontSize:12,color:'#cbd5e1',
-                         whiteSpace:'pre-wrap',maxHeight:500,overflowY:'auto',
-                         lineHeight:1.65,fontFamily:'JetBrains Mono,monospace'}}>
-              {synth.output}
-            </div>
-          </PhaseBar>
-        ) : (
-          <PhaseBar label="Synthesize" status={synth.status} color="#a855f7"
-                    detail={synth.status==='running'?'Building answer…':null}/>
-        )
-      )}
-
-      {/* ── Micro-loop (internal think/search/plan steps) ──────────── */}
-      {task.steps?.length > 0 && (
-        <PhaseBar label="Agent steps" status="done" color="#475569"
-                  detail={`${task.steps.length} internal step${task.steps.length!==1?'s':''}`}>
-          {task.steps.map((s,i) => (
-            <StepRow key={i} step={{
-              type: s.type||'step',
-              input: s.input||s.text||'',
-              output: s.output||'',
-              status: s.status||'done',
-              started_at: s.started_at,
-              finished_at: s.finished_at,
-            }}/>
-          ))}
-        </PhaseBar>
-      )}
-
-      {/* Empty state — task just started */}
-      {!ext.status && !planner.status && (
-        <div style={{display:'flex',alignItems:'center',gap:10,color:'#374151',
-                     fontSize:12,padding:'20px 8px'}}>
-          <Spinner color="#374151"/>
-          <span>Initialising…</span>
-        </div>
-      )}
-
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY GRAPH  (right pane) — canvas-based continuous force-directed simulation
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ── Physics step ────────────────────────────────────────────────────────────
-function _graphTick(s) {
-  const { pos, vel, edges, w, h } = s;
-  const alpha = s.alpha;
-  const SPRING_LEN = 55, SPRING_K = 0.12;
-  const REPULSE = 120, DAMP = 0.80, GRAV = 0.18, COOL = 0.993;
-  const ids = Object.keys(pos);
-
-  // Repulsion between all node pairs
-  for (let i = 0; i < ids.length; i++) {
-    const a = pos[ids[i]], va = vel[ids[i]];
-    for (let j = i + 1; j < ids.length; j++) {
-      const b = pos[ids[j]], vb = vel[ids[j]];
-      const dx = a.x - b.x, dy = a.y - b.y;
-      const d2 = dx*dx + dy*dy + 1;
-      const f = REPULSE * alpha / d2;
-      va.x += f*dx; va.y += f*dy;
-      vb.x -= f*dx; vb.y -= f*dy;
+  if (e.stage === 'step_done') {
+    const si = stepIdx(e.key);
+    const idx = findLastIdx(task.rows, r=>r.stage==='step'&&stepIdx(r.key)===si);
+    if (idx !== -1) {
+      const rows=[...task.rows];
+      rows[idx]={...rows[idx], stage:'step_done', status:'done', extra:e.value};
+      return {...task, rows};
     }
+    return {...task, rows:[...task.rows, makeRow(e)]};
   }
 
-  // Spring forces along edges
-  for (const e of edges) {
-    const a = pos[e.source], b = pos[e.target];
-    const va = vel[e.source], vb = vel[e.target];
-    if (!a || !b || !va || !vb) continue;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const d = Math.sqrt(dx*dx + dy*dy) || 1;
-    const f = (d - SPRING_LEN) * SPRING_K * alpha;
-    va.x += f*dx/d; va.y += f*dy/d;
-    vb.x -= f*dx/d; vb.y -= f*dy/d;
+  if (e.stage === 'tool_result') {
+    const idx = findLastIdx(task.rows, r=>r.stage==='outer_tool'&&r.status==='running');
+    if (idx !== -1) {
+      const rows=[...task.rows];
+      rows[idx]={...rows[idx], status:'done', extra:e.value};
+      return {...task, rows};
+    }
+    return {...task, rows:[...task.rows, makeRow(e)]};
   }
 
-  // Gravity toward centre + velocity integration + wall clamp
-  for (const id of ids) {
-    const p = pos[id], v = vel[id];
-    v.x += (w/2 - p.x) * GRAV * alpha;
-    v.y += (h/2 - p.y) * GRAV * alpha;
-    v.x *= DAMP; v.y *= DAMP;
-    p.x = Math.max(30, Math.min(w - 30, p.x + v.x));
-    p.y = Math.max(30, Math.min(h - 54, p.y + v.y));
-  }
+  if (e.stage==='step'||e.stage==='outer_tool')
+    return {...task, rows:[...task.rows, {...makeRow(e), status:'running'}]};
 
-  s.alpha = Math.max(0.004, alpha * COOL);
+  return {...task, rows:[...task.rows, makeRow(e)]};
 }
 
-// ── Canvas draw ──────────────────────────────────────────────────────────────
-const _GCANVAS_COLORS = {
-  fact:'#6366f1', concept:'#06b6d4', project:'#22c55e',
-  preference:'#f59e0b', entity:'#a855f7', url:'#ec4899',
-  soul:'#f97316', user:'#34d399', system:'#64748b',
-  research:'#60a5fa', skill:'#84cc16', import_path:'#94a3b8',
+// Convert task-tracker format (bootstrap) to internal format
+function fromApiTask(t) {
+  const rows = [];
+  const plan = t.tree?.planner;
+  if (plan?.output)
+    rows.push({id:'plan0',stage:'decompose',key:'stages',value:plan.output,
+               ts:t.started_at,status:'done',extra:''});
+  for (const [ti,st] of (plan?.sub_tasks||[]).entries())
+    for (const [si,s] of (st.steps||[]).entries()) {
+      const done = s.status!=='running';
+      rows.push({id:`s${ti}_${si}`,stage:done?'step_done':'step',
+                 key:`${s.type}/${ti}.${si}`,value:s.input||'',
+                 ts:s.ts||t.started_at,status:done?'done':'running',extra:s.output||''});
+    }
+  const sy = t.tree?.synthesizer;
+  if (sy?.output)
+    rows.push({id:'ans',stage:'answer',key:'answer',value:sy.output,
+               ts:t.finished_at||t.started_at,status:'done',extra:''});
+  return { id:t.id, query:t.user_message||t.id, startedAt:t.started_at,
+           status:t.status, rows, answer:sy?.output||'',
+           elapsed:t.finished_at?t.finished_at-t.started_at:0 };
+}
+
+// ── Reducer ────────────────────────────────────────────────────────────────
+
+const initState = {
+  tasks:{}, order:[],
+  status:{model:'…',uptime_seconds:0,requests_total:0,graph_nodes:0,
+          artifacts:0,workspace:'',llm_ready:false,mock:false},
+  graph:{nodes:[],edges:[]},
+  connected:false,
 };
 
-function _graphDraw(canvas, s) {
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const { pos, nodes, edges, degree, hover, w, h } = s;
-  ctx.clearRect(0, 0, w, h);
-
-  // Subtle radial glow at centre for depth
-  const grd = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.min(w,h)*0.55);
-  grd.addColorStop(0,   '#0d1025');
-  grd.addColorStop(1,   '#080a14');
-  ctx.fillStyle = grd;
-  ctx.fillRect(0, 0, w, h);
-
-  // Edges — draw hovered-node edges brighter
-  for (const e of edges) {
-    const a = pos[e.source], b = pos[e.target];
-    if (!a || !b) continue;
-    const hot = hover === e.source || hover === e.target;
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = hot ? '#3b4a7a' : '#1a2040';
-    ctx.lineWidth   = hot ? 1.5 : 0.8;
-    ctx.globalAlpha = hot ? 0.8  : 0.45;
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // Nodes
-  for (const n of nodes) {
-    const p = pos[n.id];
-    if (!p) continue;
-    const isHov = hover === n.id;
-    const deg   = degree[n.id] || 0;
-    const r     = Math.max(3, Math.min(10, 3 + deg * 0.9));
-    const col   = _GCANVAS_COLORS[n.type] || '#6366f1';
-
-    ctx.save();
-    if (isHov) { ctx.shadowColor = col; ctx.shadowBlur = 18; }
-
-    // Outer ring for hover
-    if (isHov) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, r + 6, 0, Math.PI*2);
-      ctx.strokeStyle = col + '44';
-      ctx.lineWidth = 1.5;
-      ctx.globalAlpha = 0.55;
-      ctx.stroke();
+function reducer(state, action) {
+  switch(action.type) {
+    case 'TRACE': {
+      const e=action.event;
+      if (!e.task_id) return state;
+      const updated = applyTrace(state.tasks[e.task_id], e);
+      const order = state.order.includes(e.task_id)
+        ? state.order : [e.task_id,...state.order].slice(0,50);
+      return {...state, tasks:{...state.tasks,[e.task_id]:updated}, order};
     }
-
-    // Core dot
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, isHov ? r + 2.5 : r, 0, Math.PI*2);
-    ctx.fillStyle  = col;
-    ctx.globalAlpha = isHov ? 1.0 : 0.80;
-    ctx.fill();
-    ctx.restore();
-
-    // Permanent label for hub node types
-    const showLbl = n.type === 'user' || n.type === 'soul'
-                 || (n.type === 'project' && deg > 1);
-    if (showLbl) {
-      ctx.save();
-      ctx.font = `bold 9px "JetBrains Mono", monospace`;
-      ctx.fillStyle  = col;
-      ctx.globalAlpha = 0.85;
-      const lbl = (n.label || '').length > 18 ? (n.label||'').slice(0,16)+'…' : (n.label||'');
-      ctx.fillText(lbl, p.x + r + 4, p.y + 4);
-      ctx.restore();
+    case 'BOOTSTRAP': {
+      const tasks={...state.tasks}, order=[...state.order];
+      for (const t of action.payload) {
+        if (!tasks[t.id]) {
+          tasks[t.id]=fromApiTask(t);
+          if (!order.includes(t.id)) order.push(t.id);
+        }
+      }
+      order.sort((a,b)=>(tasks[b]?.startedAt||0)-(tasks[a]?.startedAt||0));
+      return {...state, tasks, order:order.slice(0,50)};
     }
+    case 'STATUS':     return {...state, status:{...state.status,...action.payload}};
+    case 'GRAPH':      return {...state, graph:action.payload};
+    case 'CONNECT':    return {...state, connected:true};
+    case 'DISCONNECT': return {...state, connected:false};
+    default: return state;
   }
 }
 
-// ── Canvas-based MemoryGraph component ────────────────────────────────────────
-function MemoryGraph({ nodes, edges, w, h }) {
-  const canvasRef = useRef(null);
-  // All mutable sim state in a single ref — never causes re-renders
-  const simRef = useRef({
-    pos:{}, vel:{}, nodes:[], edges:[], degree:{},
-    w:0, h:0, alpha:1, hover:null, animId:null,
-  });
-  const [tooltip, setTooltip] = useState(null); // {node, x, y}
+// ── UI components ──────────────────────────────────────────────────────────
 
-  // Re-build / re-scale whenever inputs change
-  useEffect(() => {
-    const s = simRef.current;
-    // Cancel any running animation
-    if (s.animId) { cancelAnimationFrame(s.animId); s.animId = null; }
-    if (!w || !h || !nodes.length) return;
+function Dot({color, pulse=false, size=7}) {
+  return <span style={{
+    display:'inline-block', width:size, height:size, borderRadius:'50%',
+    background:color, flexShrink:0,
+    animation:pulse?'pulse 1.8s ease-in-out infinite':'none',
+  }}/>;
+}
 
-    // Per-node degree (used for size)
-    const deg = {};
-    nodes.forEach(n => { deg[n.id] = 0; });
-    edges.forEach(e => {
-      if (deg[e.source] !== undefined) deg[e.source]++;
-      if (deg[e.target] !== undefined) deg[e.target]++;
-    });
-
-    // Positions — keep existing, rescale if dimensions changed, circular init for new
-    const pos = {}, vel = {};
-    const cx = w/2, cy = h/2, R = Math.min(w,h) * 0.22;
-    nodes.forEach((n, i) => {
-      if (s.pos[n.id]) {
-        const sx = s.w ? w/s.w : 1, sy = s.h ? h/s.h : 1;
-        pos[n.id] = {
-          x: Math.max(20, Math.min(w-20, s.pos[n.id].x * sx)),
-          y: Math.max(20, Math.min(h-20, s.pos[n.id].y * sy)),
-        };
-      } else {
-        // Evenly distribute new nodes on a ring with slight jitter
-        const angle = (i / nodes.length) * Math.PI*2 - Math.PI/2;
-        pos[n.id] = {
-          x: cx + R*Math.cos(angle) + (Math.random()-0.5)*24,
-          y: cy + R*Math.sin(angle) + (Math.random()-0.5)*24,
-        };
-      }
-      vel[n.id] = { x:0, y:0 };
-    });
-
-    s.pos = pos; s.vel = vel; s.nodes = nodes; s.edges = edges; s.degree = deg;
-    s.w = w; s.h = h;
-    // Re-heat if topology changed, otherwise just rescale
-    s.alpha = nodes.length !== (s._prevNodeCount||0) ? 1.0 : Math.min(s.alpha + 0.25, 1.0);
-    s._prevNodeCount = nodes.length;
-
-    // Start continuous animation
-    function frame() {
-      _graphTick(s);
-      _graphDraw(canvasRef.current, s);
-      s.animId = requestAnimationFrame(frame);
-    }
-    s.animId = requestAnimationFrame(frame);
-
-    return () => { cancelAnimationFrame(s.animId); s.animId = null; };
-  }, [nodes.length, edges.length, w, h]);
-
-  // Mouse hover — O(n) scan, fast enough for <300 nodes
-  const onMouseMove = useCallback(e => {
-    const s = simRef.current;
-    if (!canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    let found = null;
-    for (const n of s.nodes) {
-      const p = s.pos[n.id];
-      if (p && (p.x-mx)**2 + (p.y-my)**2 < 144) { found = n; break; }
-    }
-    s.hover = found?.id ?? null;
-    if (found && s.pos[found.id]) {
-      setTooltip({ node:found, x:s.pos[found.id].x, y:s.pos[found.id].y });
-    } else {
-      setTooltip(null);
-    }
-  }, []);
-
-  const onMouseLeave = useCallback(() => {
-    simRef.current.hover = null;
-    setTooltip(null);
-  }, []);
-
-  if (!nodes.length) return (
-    <div style={{display:'flex',alignItems:'center',justifyContent:'center',
-                 height:h,color:'#475569',fontSize:12,textAlign:'center',padding:'0 24px'}}>
-      No graph nodes yet.<br/>Send a few messages to start building memory.
+function StatusBar({status, connected}) {
+  return (
+    <div style={{display:'flex',alignItems:'center',gap:16,padding:'8px 16px',
+                 background:'#0c0e1a',borderBottom:'1px solid #1a1d2e',flexShrink:0}}>
+      <span style={{color:'#818cf8',fontWeight:700,fontSize:13,letterSpacing:2}}>SISYPHEAN</span>
+      <Dot color={status.llm_ready?'#34d399':'#ef4444'} pulse={!status.llm_ready}/>
+      <span style={{color:'#2d3558'}}>|</span>
+      <span style={{color:'#a0aec0'}}>{status.model}</span>
+      <span style={{color:'#2d3558'}}>|</span>
+      <span style={{color:'#4a5580'}}>↑{uptime(status.uptime_seconds)}</span>
+      <span style={{color:'#4a5580'}}>{status.requests_total} req</span>
+      <span style={{color:'#4a5580'}}>{status.graph_nodes} nodes</span>
+      <span style={{color:'#4a5580'}}>{status.artifacts} artifacts</span>
+      {status.mock && <span style={{color:'#f59e0b',fontSize:10,border:'1px solid #f59e0b44',padding:'1px 5px',borderRadius:3}}>MOCK</span>}
+      <div style={{flex:1}}/>
+      <span style={{color:'#3d4a65',fontSize:10,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:280}}>
+        {status.workspace}
+      </span>
+      <Dot color={connected?'#34d399':'#f97316'} pulse={!connected} size={6}/>
+      <span style={{color:connected?'#34d399':'#f97316',fontSize:10}}>{connected?'LIVE':'RECONNECTING'}</span>
     </div>
   );
+}
+
+// One row per trace event — renders whatever stage the pipeline emitted
+const EventRow = memo(function EventRow({row, startedAt}) {
+  const [open, setOpen] = useState(false);
+  const meta   = stageMeta(row.stage);
+  const tc     = toolColor(row.key, row.value) || meta.color;
+  const isRun  = row.status === 'running';
+
+  // key hint: "verify/0.1" → show "0.1"
+  const keyHint = row.key.includes('/') ? row.key.replace(/^[^/]+\//,'') : '';
+  const preview = row.value.length > 90 ? row.value.slice(0,90)+'…' : row.value;
+  const hasMore = row.value.length > 90 || row.extra;
+  const dt      = startedAt && row.ts ? `+${fmtTime(row.ts-startedAt)}` : '';
 
   return (
-    <div style={{ position:'relative', width:w, height:h, overflow:'hidden' }}>
-      <canvas ref={canvasRef} width={w} height={h}
-        style={{ position:'absolute', inset:0, cursor:'crosshair' }}
-        onMouseMove={onMouseMove}
-        onMouseLeave={onMouseLeave} />
+    <div className={isRun?'':'fadein'}
+         style={{borderLeft:`2px solid ${tc}15`,marginLeft:10}}>
+      <div
+        onClick={() => hasMore && setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'baseline',gap:6,padding:'2px 8px 2px 10px',
+                cursor:hasMore?'pointer':'default'}}
+      >
+        <span style={{width:54,flexShrink:0,fontSize:10,fontWeight:600,
+                      color:meta.color,letterSpacing:0.3}}>
+          <span style={{animation:isRun?'pulse 1.8s ease-in-out infinite':'none'}}>{meta.icon}</span>
+          {' '}{meta.badge}
+        </span>
+        {keyHint &&
+          <span style={{color:tc,fontSize:10,fontWeight:500,flexShrink:0,opacity:.7}}>
+            {keyHint}
+          </span>}
+        <span style={{color:isRun?'#94a3b8':'#7a8da8',fontSize:11,flex:1,
+                      overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',minWidth:0}}>
+          {preview}
+        </span>
+        {dt && <span style={{color:'#3d4a5f',fontSize:10,flexShrink:0}}>{dt}</span>}
+        {hasMore && <span style={{color:'#3d4a5f',fontSize:9,flexShrink:0}}>{open?'▲':'▼'}</span>}
+      </div>
+      {open &&
+        <div style={{margin:'4px 10px 4px 20px',padding:'8px 12px',background:'#111827',
+                     borderRadius:6,color:'#7dd3fc',fontSize:11,lineHeight:1.65,
+                     whiteSpace:'pre-wrap',wordBreak:'break-all',maxHeight:220,overflow:'auto',
+                     border:'1px solid #1e2745'}}>
+          {row.value}{row.extra?`\n\n${row.extra}`:''}
+        </div>}
+    </div>
+  );
+});
 
-      {/* Tooltip overlay */}
-      {tooltip && (() => {
-        const { node:n, x, y } = tooltip;
-        const lft = x + 14 > w - 210 ? x - 218 : x + 14;
-        const top = Math.min(y - 10, h - 92);
-        const col = ntc(n.type);
-        return (
-          <div style={{ position:'absolute', left:lft, top,
-                        background:'#161929', border:`1px solid ${col}50`,
-                        borderRadius:8, padding:'8px 11px', maxWidth:200,
-                        pointerEvents:'none', zIndex:10,
-                        boxShadow:`0 0 16px ${col}22` }}>
-            <div style={{ color:col, fontSize:11, fontWeight:700,
-                          fontFamily:'"JetBrains Mono",monospace', marginBottom:2 }}>
-              {n.label}
-            </div>
-            <div style={{ color:'#475569', fontSize:10 }}>{n.type}</div>
-            {n.summary && (
-              <div style={{ color:'#94a3b8', fontSize:10, marginTop:5,
-                            lineHeight:1.45, maxHeight:64, overflow:'hidden' }}>
-                {n.summary}
+function TaskCard({task}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const isRun = task.status==='running';
+  const sc    = isRun?'#f59e0b':task.status==='done'?'#34d399':'#ef4444';
+  const et    = task.elapsed ? fmtTime(task.elapsed) : '';
+  const visRows = task.rows.filter(r=>r.stage!=='start'&&r.stage!=='answer');
+
+  return (
+    <div className="fadein"
+         style={{marginBottom:12,
+                 border:`1px solid ${isRun?'#252d4a':'#1a1d2e'}`,
+                 borderRadius:12,overflow:'hidden',background:'#0f1220',
+                 boxShadow: isRun
+                   ? '0 0 0 1px #6366f122, 0 4px 20px rgba(0,0,0,0.4)'
+                   : '0 2px 12px rgba(0,0,0,0.3)'}}>
+      <div onClick={()=>setCollapsed(c=>!c)}
+           style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',
+                   background:'#12152a',cursor:'pointer',
+                   borderBottom:collapsed?'none':'1px solid #1a1d2e'}}>
+        <Dot color={sc} pulse={isRun}/>
+        <span style={{flex:1,color:'#e2e8f0',fontSize:12,fontWeight:500,
+                      overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+          {task.query||task.id}
+        </span>
+        {et && <span style={{color:'#4a5580',fontSize:10,flexShrink:0}}>{et}</span>}
+        <span style={{color:'#2d3558',fontSize:9}}>{collapsed?'▼':'▲'}</span>
+      </div>
+
+      {!collapsed && (
+        <div style={{padding:'5px 0 6px'}}>
+          {visRows.map((row,i) =>
+            <EventRow key={row.id||i} row={row} startedAt={task.startedAt}/>)}
+
+          {/* Answer */}
+          {task.answer &&
+            <div style={{margin:'8px 10px 5px',padding:'10px 14px',
+                         background:'#0d1a22',borderRadius:8,
+                         border:'1px solid #1e3a2e',
+                         boxShadow:'inset 0 0 20px rgba(52,211,153,0.04)'}}>
+              <div style={{color:'#34d399',fontSize:10,fontWeight:700,marginBottom:6,letterSpacing:1.5}}>
+                ✦ ANSWER
               </div>
-            )}
-          </div>
-        );
-      })()}
+              <div style={{color:'#e2e8f0',fontSize:12,lineHeight:1.7,whiteSpace:'pre-wrap'}}>
+                {task.answer.length>600?task.answer.slice(0,600)+'…':task.answer}
+              </div>
+            </div>}
 
-      {/* Legend */}
-      <div style={{ position:'absolute', bottom:8, left:8,
-                    background:'#080a14bb', borderRadius:6, padding:'5px 8px',
-                    display:'flex', flexWrap:'wrap', gap:'5px 11px', maxWidth:w-16 }}>
-        {Object.entries(NODE_TYPE_COLOR).map(([t, c]) => (
-          <span key={t} style={{ display:'flex', alignItems:'center',
-                                  gap:4, fontSize:9, color:'#4b5563' }}>
-            <span style={{ width:6, height:6, borderRadius:'50%',
-                            background:c, display:'inline-block' }} />
-            {t}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// StepPill and CompletedTask removed — ExecutionTimeline supersedes them.
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// AGENT ACTIVITY  (improved)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const KIND_STYLE = {
-  tool:   { dot:'bg-indigo-400',  text:'text-indigo-300',  label:'Tool'   },
-  bash:   { dot:'bg-yellow-400',  text:'text-yellow-300',  label:'Bash'   },
-  answer: { dot:'bg-emerald-400', text:'text-emerald-300', label:'Answer' },
-  write:  { dot:'bg-violet-400',  text:'text-violet-300',  label:'Write'  },
-  error:  { dot:'bg-red-400',     text:'text-red-300',     label:'Error'  },
-  stage:  { dot:'bg-sky-400',     text:'text-sky-300',     label:'Stage'  },
-  llm:    { dot:'bg-amber-400',   text:'text-amber-300',   label:'LLM'    },
-  plan:   { dot:'bg-purple-400',  text:'text-purple-300',  label:'Plan'   },
-};
-
-function EventRow({ r }) {
-  const [open, setOpen] = useState(false);
-  const s = KIND_STYLE[r.kind] || KIND_STYLE.tool;
-  const d = r.data || {};
-
-  const actionColor = {
-    bash:'#eab308', answer:'#34d399', synthesize:'#34d399',
-    plan:'#818cf8', search:'#06b6d4', web_search:'#06b6d4',
-    write:'#7c3aed', read:'#10b981',
-    import_check:'#34d399', fix_read:'#fb923c',
-    write_code:'#22c55e', write_doc:'#6ab0f5', write_project:'#f59e0b',
-  }[d.action] || '#cbd5e1';
-
-  const hasDetail = d.result || d.answer_preview || d.steps;
-
-  return (
-    <div className="ev-row py-2 text-xs">
-      <div className="flex items-center gap-2 cursor-pointer px-3"
-           onClick={() => hasDetail && setOpen(o => !o)}>
-        <span className="text-slate-700 w-14 shrink-0 tabular-nums">{timeAgo(r.ts)}</span>
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
-        <span className="font-mono font-semibold" style={{ color: actionColor, minWidth: 80 }}>
-          {d.action || r.label}
-        </span>
-        {d.tool && d.tool !== d.action &&
-          <span className="text-slate-500">→ <span style={{color: tc(d.tool)}}>{d.tool}</span></span>}
-        {d.input && <span className="text-slate-500 truncate flex-1" style={{maxWidth:220}}>{d.input}</span>}
-        {d.elapsed_ms && <span className="text-slate-700 ml-auto shrink-0">{elapsedFmt(d.elapsed_ms)}</span>}
-        {hasDetail && <span className="text-slate-700 shrink-0 ml-1">{open ? '▲' : '▼'}</span>}
-      </div>
-      {open && (d.result || d.answer_preview) && (
-        <div className="mx-3 mt-1.5 rounded p-2 text-slate-300 font-mono text-xs max-h-36 overflow-y-auto"
-             style={{background:'#0d0f1c', whiteSpace:'pre-wrap'}}>
-          {d.result || d.answer_preview}
-        </div>
-      )}
-      {open && d.steps && (
-        <div className="mx-3 mt-1 space-y-0.5">
-          {d.steps.map((st,i) => (
-            <div key={i} className="flex items-center gap-2 text-xs text-slate-500">
-              <span className="text-slate-700">{i+1}.</span>
-              <span className="font-mono" style={{color: tc(st.type||st.tool)}}>[{st.type||st.tool}]</span>
-              <span className="truncate">{st.text||st.input||''}</span>
-            </div>
-          ))}
+          {isRun && visRows.length===0 &&
+            <div className="pulse" style={{padding:'6px 18px',color:'#4a5580',fontSize:11}}>
+              pipeline starting…
+            </div>}
         </div>
       )}
     </div>
   );
 }
 
-const ALL_KINDS = ['stage','llm','plan','tool','bash','write','answer','error'];
+function ExecutionLog({tasks, order}) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = 0;
+  }, [order.length]);
 
-function ActivityPanel({ events }) {
-  const [filter, setFilter] = useState(null);
-
-  if (!events?.length) return (
-    <div className="card p-5 text-slate-600 text-xs text-center">
-      No activity yet — send a message to see agent steps here.
-    </div>
-  );
-
-  const visible = filter ? events.filter(e => e.kind === filter) : events;
-  const counts = {};
-  for (const e of events) counts[e.kind] = (counts[e.kind] || 0) + 1;
-
-  // Group by session
-  const groups = [];
-  const seen = {};
-  for (const r of visible) {
-    const key = r.session || '—';
-    if (!seen[key]) { seen[key] = []; groups.push({ key, events: seen[key] }); }
-    seen[key].push(r);
-  }
+  if (!order.length)
+    return (
+      <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',
+                   color:'#2d3558',flexDirection:'column',gap:12}}>
+        <div style={{fontSize:30,opacity:0.6}}>◆</div>
+        <div style={{fontSize:11,letterSpacing:0.5}}>Waiting for pipeline events…</div>
+      </div>
+    );
 
   return (
-    <div className="card overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800/60 flex-wrap gap-2">
-        <span className="text-slate-400 text-xs uppercase tracking-widest">Agent Activity</span>
-        <div className="flex items-center gap-1 flex-wrap">
-          <button onClick={() => setFilter(null)}
-            className={`px-2 py-0.5 rounded text-xs border transition-colors ${
-              filter === null ? 'bg-slate-700 border-slate-500 text-white' : 'border-slate-800 text-slate-600 hover:text-slate-300'
-            }`}>all</button>
-          {ALL_KINDS.filter(k => counts[k]).map(k => {
-            const st = KIND_STYLE[k] || KIND_STYLE.tool;
-            return (
-              <button key={k} onClick={() => setFilter(filter === k ? null : k)}
-                className={`px-2 py-0.5 rounded text-xs border transition-colors ${
-                  filter === k ? 'bg-slate-700 border-slate-500 text-white' : 'border-slate-800 text-slate-600 hover:text-slate-300'
-                }`}>
-                <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${st.dot}`} />
-                {k}<span className="text-slate-700 ml-0.5">({counts[k]})</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="overflow-y-auto" style={{maxHeight: 360}}>
-        {groups.map(g => (
-          <div key={g.key}>
-            <div className="px-3 py-1.5 text-slate-700 text-xs font-mono border-b border-slate-800/40"
-                 style={{background:'#0d0f1c'}}>
-              session {g.key.slice(0,12)}
-            </div>
-            {g.events.map((r, i) => <EventRow key={i} r={r} />)}
-          </div>
-        ))}
-      </div>
+    <div ref={ref} style={{flex:1,overflow:'auto',padding:'10px 12px'}}>
+      {order.map(id => tasks[id] && <TaskCard key={id} task={tasks[id]}/>)}
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MEMORY GRAPH PANE  (header + graph, reused in split and full-width modes)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── Memory graph ───────────────────────────────────────────────────────────
 
-function MemoryGraphPane({ graph, h, splitMode }) {
-  const containerRef = useRef(null);
-  const [width, setWidth] = useState(splitMode
-    ? Math.floor((window.innerWidth - 80) / 2)
-    : Math.max(600, window.innerWidth - 80));
-  // purge button state: idle | confirm | running | done | error
-  const [purge, setPurge] = useState('idle');
-  const [purgeInfo, setPurgeInfo] = useState('');
+const SPRING=58, REPULSE=130, GRAVITY=0.035, DAMP=0.84;
+
+function MemoryGraph({nodes, edges}) {
+  const canvasRef = useRef(null);
+  const sim = useRef({nodes:[],edges:[],raf:null,hov:null});
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    const obs = new ResizeObserver(entries => {
-      for (const e of entries) setWidth(Math.max(200, e.contentRect.width));
+    const c=canvasRef.current; if(!c)return;
+    const W=c.width||300,H=c.height||300;
+    const ex=new Map(sim.current.nodes.map(n=>[n.id,n]));
+    sim.current.nodes=nodes.map(n=>{
+      const e=ex.get(n.id);
+      return{...n,x:e?e.x:W/2+(Math.random()-.5)*W*.5,
+             y:e?e.y:H/2+(Math.random()-.5)*H*.5,
+             vx:e?e.vx:0,vy:e?e.vy:0};
     });
-    obs.observe(containerRef.current);
-    return () => obs.disconnect();
-  }, []);
+    sim.current.edges=edges;
+  },[nodes,edges]);
 
-  const onPurge = async () => {
-    if (purge === 'idle') {
-      // First click — arm the button; auto-disarm after 3 s
-      setPurge('confirm');
-      setTimeout(() => setPurge(s => s === 'confirm' ? 'idle' : s), 3000);
-      return;
-    }
-    if (purge === 'confirm') {
-      // Second click — execute
-      setPurge('running');
-      try {
-        const r  = await fetch('/api/graph/purge', { method: 'POST' });
-        const d  = await r.json();
-        setPurgeInfo(`${d.nodes_before} → ${d.nodes_after} nodes`);
-        setPurge('done');
-        setTimeout(() => { setPurge('idle'); setPurgeInfo(''); }, 3000);
-      } catch {
-        setPurge('error');
-        setTimeout(() => setPurge('idle'), 2000);
+  useEffect(()=>{
+    const c=canvasRef.current; if(!c)return;
+    const ctx=c.getContext('2d');
+    const s=sim.current;
+    function frame(){
+      const W=c.width,H=c.height,ns=s.nodes;
+      for(let i=0;i<ns.length;i++){
+        let fx=0,fy=0;
+        for(let j=0;j<ns.length;j++){
+          if(i===j)continue;
+          const dx=ns[i].x-ns[j].x,dy=ns[i].y-ns[j].y,d2=dx*dx+dy*dy+1;
+          fx+=dx*REPULSE/d2;fy+=dy*REPULSE/d2;
+        }
+        for(const e of s.edges){
+          const o=ns[i].id===e.source?ns.find(n=>n.id===e.target):
+                  ns[i].id===e.target?ns.find(n=>n.id===e.source):null;
+          if(!o)continue;
+          const dx=o.x-ns[i].x,dy=o.y-ns[i].y,d=Math.sqrt(dx*dx+dy*dy)||1;
+          const f=(d-SPRING)*.035;fx+=dx/d*f;fy+=dy/d*f;
+        }
+        fx+=(W/2-ns[i].x)*GRAVITY;fy+=(H/2-ns[i].y)*GRAVITY;
+        ns[i].vx=(ns[i].vx+fx)*DAMP;ns[i].vy=(ns[i].vy+fy)*DAMP;
+        ns[i].x=Math.max(12,Math.min(W-12,ns[i].x+ns[i].vx));
+        ns[i].y=Math.max(12,Math.min(H-12,ns[i].y+ns[i].vy));
       }
+      ctx.fillStyle='#0a0c14';ctx.fillRect(0,0,W,H);
+      ctx.strokeStyle='#1a1d2e';ctx.lineWidth=0.8;
+      for(const e of s.edges){
+        const a=ns.find(n=>n.id===e.source),b=ns.find(n=>n.id===e.target);
+        if(!a||!b)continue;
+        ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+      }
+      for(const n of ns){
+        const col=NODE_COLOR[n.type]||'#475569';
+        const r=Math.min(7,2.5+Math.log1p(n.observations||1)*1.2);
+        const ih=s.hov===n.id;
+        if(ih){ctx.beginPath();ctx.arc(n.x,n.y,r+6,0,Math.PI*2);ctx.fillStyle=col+'28';ctx.fill();}
+        ctx.beginPath();ctx.arc(n.x,n.y,r,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
+        if(ih||ns.length<30){
+          ctx.fillStyle='#b8c4d8';ctx.font='9px JetBrains Mono';ctx.textAlign='center';
+          ctx.fillText(n.label.slice(0,18),n.x,n.y-r-3);
+        }
+        if(ih&&n.summary){
+          const txt=n.summary.slice(0,70);
+          const tw=ctx.measureText(txt).width+14;
+          const tx=Math.min(W-tw-4,Math.max(4,n.x+r+4));
+          const ty=Math.max(22,n.y-10);
+          ctx.fillStyle='#0e1120';ctx.fillRect(tx,ty-14,tw,20);
+          ctx.fillStyle='#7dd3fc';ctx.textAlign='left';ctx.fillText(txt,tx+7,ty);
+        }
+      }
+      s.raf=requestAnimationFrame(frame);
     }
-  };
+    if(s.raf)cancelAnimationFrame(s.raf);
+    frame();
+    return()=>{if(s.raf)cancelAnimationFrame(s.raf);};
+  },[]);
 
-  const PURGE_LABEL = {
-    idle:    'Purge & Re-seed',
-    confirm: 'Confirm?',
-    running: '…',
-    done:    'Done',
-    error:   'Error',
-  };
-  const PURGE_CLS = {
-    idle:    'text-slate-600 hover:text-red-400 cursor-pointer',
-    confirm: 'text-amber-400 hover:text-amber-200 cursor-pointer',
-    running: 'text-slate-500 cursor-default',
-    done:    'text-green-400 cursor-default',
-    error:   'text-red-400 cursor-default',
-  };
+  useEffect(()=>{
+    const c=canvasRef.current;if(!c)return;
+    const resize=()=>{c.width=c.offsetWidth;c.height=c.offsetHeight;};
+    resize();
+    const ro=new ResizeObserver(resize);ro.observe(c.parentElement);
+    return()=>ro.disconnect();
+  },[]);
 
-  return (
-    <div className={splitMode ? 'flex flex-col' : 'flex flex-col'} style={{ height: h }}>
-      <div className="px-4 py-2 border-b border-slate-800/40 flex items-center justify-between">
-        <span className="text-slate-500 text-xs uppercase tracking-widest">
-          Memory Graph
-        </span>
-        <div className="flex items-center gap-3">
-          {purgeInfo && (
-            <span className="text-green-500 text-xs font-mono">{purgeInfo}</span>
-          )}
-          <span className="text-slate-700 text-xs font-mono">
-            {graph.nodes.length} nodes · {graph.edges.length} edges
-          </span>
-          <button
-            onClick={onPurge}
-            disabled={purge === 'running'}
-            className={`text-xs font-mono transition-colors ${PURGE_CLS[purge]}`}
-            title="Purge all graph data and re-seed identity anchors + skills"
-          >
-            {PURGE_LABEL[purge]}
-          </button>
-        </div>
-      </div>
-      <div ref={containerRef} style={{ flex:1, overflow:'hidden', position:'relative' }}>
-        <MemoryGraph
-          nodes={graph.nodes}
-          edges={graph.edges}
-          w={width}
-          h={h - 40}
-        />
-      </div>
-    </div>
-  );
+  function onMouse(e){
+    const c=canvasRef.current;if(!c)return;
+    const r=c.getBoundingClientRect();
+    const mx=(e.clientX-r.left)*(c.width/r.width);
+    const my=(e.clientY-r.top)*(c.height/r.height);
+    let found=null;
+    for(const n of sim.current.nodes)
+      if(Math.hypot(n.x-mx,n.y-my)<12){found=n.id;break;}
+    sim.current.hov=found;
+  }
+
+  return <canvas ref={canvasRef} onMouseMove={onMouse}
+                 style={{width:'100%',height:'100%',display:'block'}}/>;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION LABEL  — thin uppercase divider used throughout
-// ═══════════════════════════════════════════════════════════════════════════════
-function SectionLabel({ children, count }) {
-  return (
-    <div className="flex items-center gap-3 px-1 mb-2">
-      <span className="text-slate-500 text-xs uppercase tracking-widest">{children}</span>
-      {count !== undefined && count > 0 && (
-        <span style={{background:'#1e2235',color:'#6366f1',borderRadius:4,
-                      padding:'1px 7px',fontSize:10,fontWeight:700}}>
-          {count}
-        </span>
-      )}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MAIN APP
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── App ────────────────────────────────────────────────────────────────────
 
 function App() {
-  const [status,    setStatus]    = useState(null);
-  const [tasks,     setTasks]     = useState([]);
-  const [graph,     setGraph]     = useState({ nodes: [], edges: [] });
-  const [error,     setError]     = useState(null);
-  const [lastFetch, setLastFetch] = useState(null);
-  const [graphH,    setGraphH]    = useState(480);
-  const graphRef = useRef(null);
+  const [state, dispatch] = useReducer(reducer, initState);
+  const esRef = useRef(null);
 
-  // Graph height tracks its own container
-  useEffect(() => {
-    if (!graphRef.current) return;
-    const obs = new ResizeObserver(entries => {
-      for (const e of entries) setGraphH(Math.max(400, e.contentRect.width * 0.32));
-    });
-    obs.observe(graphRef.current);
-    return () => obs.disconnect();
-  }, []);
-
-  const fetchAll = useCallback(async () => {
-    try {
-      const [sr, tr, gr] = await Promise.all([
-        fetch('/api/status'),
-        fetch('/api/tasks'),
-        fetch('/api/graph'),
-      ]);
-      if (sr.ok) { const d = await sr.json(); setStatus(d); }
-      if (tr.ok) { const d = await tr.json(); setTasks(d.tasks || []); }
-      if (gr.ok) { const d = await gr.json(); setGraph(d); }
-      setError(null);
-      setLastFetch(Date.now());
-    } catch(e) {
-      setError(e.message);
+  // SSE — auto-reconnects
+  useEffect(()=>{
+    let dead=false;
+    function connect(){
+      if(dead)return;
+      const es=new EventSource('/api/stream');
+      esRef.current=es;
+      es.onopen=()=>dispatch({type:'CONNECT'});
+      es.onmessage=ev=>{
+        try{
+          const d=JSON.parse(ev.data);
+          if(d.type==='ping')return;
+          if(d.type==='trace')dispatch({type:'TRACE',event:d});
+        }catch{}
+      };
+      es.onerror=()=>{
+        dispatch({type:'DISCONNECT'});
+        es.close();
+        setTimeout(connect,3000);
+      };
     }
-  }, []);
+    connect();
+    return()=>{dead=true;esRef.current?.close();};
+  },[]);
 
-  useEffect(() => {
-    fetchAll();
-    const id = setInterval(fetchAll, 3000);
-    return () => clearInterval(id);
-  }, [fetchAll]);
+  // Poll status+graph every 5 s; bootstrap tasks once
+  useEffect(()=>{
+    async function poll(boot=false){
+      try{
+        const[s,g]=await Promise.all([
+          fetch('/api/status').then(r=>r.json()),
+          fetch('/api/graph').then(r=>r.json()),
+        ]);
+        dispatch({type:'STATUS',payload:s});
+        dispatch({type:'GRAPH', payload:g});
+      }catch{}
+      if(boot){
+        try{
+          const t=await fetch('/api/tasks').then(r=>r.json());
+          if(t.tasks?.length)dispatch({type:'BOOTSTRAP',payload:t.tasks});
+        }catch{}
+      }
+    }
+    poll(true);
+    const iv=setInterval(poll,5000);
+    return()=>clearInterval(iv);
+  },[]);
 
-  const runningTasks  = tasks.filter(t => t.status === 'running');
-  const finishedTasks = tasks.filter(t => t.status !== 'running');
+  const {tasks,order,status,graph,connected}=state;
 
   return (
-    // Full-width container — no max-width cap so the graph can use the whole screen
-    <div className="min-h-screen flex flex-col gap-5" style={{padding:'20px 24px'}}>
+    <div style={{display:'flex',flexDirection:'column',height:'100vh',background:'#0a0c14'}}>
+      <StatusBar status={status} connected={connected}/>
 
-      {/* ── Header ─────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <img src="/assets/sisyphean-transparent.png" alt="" className="w-9 h-9 object-contain" />
-          <h1 className="text-lg font-semibold text-slate-100 tracking-tight">Sisyphean Engine</h1>
+      <div style={{flex:1,display:'flex',overflow:'hidden'}}>
+
+        {/* Execution log */}
+        <div style={{flex:1,display:'flex',flexDirection:'column',
+                     minWidth:0,borderRight:'1px solid #1a1d2e'}}>
+          <div style={{padding:'6px 14px',borderBottom:'1px solid #1a1d2e',
+                       color:'#4a5580',fontSize:10,letterSpacing:2,
+                       background:'#0c0e1a'}}>
+            EXECUTION LOG
+          </div>
+          <ExecutionLog tasks={tasks} order={order}/>
         </div>
-        <div className="flex items-center gap-3">
-          {status && <StatusBadge running mock={status.mock} llmReady={status.llm_ready} />}
-          {error   && <StatusBadge running={false} />}
-          {lastFetch && (
-            <span className="text-slate-700 text-xs">
-              {new Date(lastFetch).toLocaleTimeString()}
-            </span>
-          )}
+
+        {/* Memory graph */}
+        <div style={{width:340,display:'flex',flexDirection:'column',flexShrink:0}}>
+          <div style={{padding:'6px 14px',borderBottom:'1px solid #1a1d2e',
+                       display:'flex',alignItems:'center',gap:8,
+                       color:'#4a5580',fontSize:10,letterSpacing:2,
+                       background:'#0c0e1a'}}>
+            <span>MEMORY GRAPH</span>
+            <span style={{color:'#1e2642'}}>—</span>
+            <span>{graph.nodes.length} nodes</span>
+            <div style={{flex:1}}/>
+            <button
+              onClick={()=>fetch('/api/graph/purge',{method:'POST'})}
+              style={{background:'transparent',border:'1px solid #252d4a',color:'#4a5580',
+                      fontSize:9,padding:'2px 8px',borderRadius:4,cursor:'pointer',
+                      fontFamily:'inherit',letterSpacing:0.5}}
+              onMouseOver={e=>e.target.style.color='#ef4444'}
+              onMouseOut={e=>e.target.style.color='#4a5580'}
+            >PURGE</button>
+          </div>
+          <div style={{flex:1,minHeight:0}}>
+            <MemoryGraph nodes={graph.nodes} edges={graph.edges}/>
+          </div>
         </div>
+
       </div>
-
-      {error && (
-        <div className="card p-4 border-red-900/60 text-red-400 text-sm">
-          Engine unreachable — {error}. Retrying…
-        </div>
-      )}
-
-      {status && (
-        <>
-          {/* ── Stats ──────────────────────────────────────────────── */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <StatCard label="Uptime"      value={formatUptime(status.uptime_seconds)} />
-            <StatCard label="Requests"    value={status.requests_total} color="text-indigo-400" />
-            <StatCard label="Graph nodes" value={status.graph_nodes}    color="text-violet-400" />
-            <StatCard label="Artifacts"   value={status.artifacts}      color="text-sky-400" />
-          </div>
-
-          {/* ── Model + workspace ─────────────────────────────────── */}
-          <div className="card p-4 grid md:grid-cols-2 gap-4">
-            <div>
-              <span className="text-slate-500 text-xs uppercase tracking-widest">Model</span>
-              <p className="text-slate-200 mt-1 text-sm font-mono truncate">{status.model}</p>
-            </div>
-            <div>
-              <span className="text-slate-500 text-xs uppercase tracking-widest">Workspace</span>
-              <p className="text-slate-200 mt-1 text-sm font-mono truncate">{status.workspace}</p>
-            </div>
-          </div>
-
-          {/* ── Memory Graph — always full width ──────────────────── */}
-          <div>
-            <SectionLabel>Memory Graph</SectionLabel>
-            <div ref={graphRef} className="card overflow-hidden" style={{width:'100%'}}>
-              <MemoryGraphPane graph={graph} h={graphH} splitMode={false}/>
-            </div>
-          </div>
-
-          {/* ── Active Tasks — all running tasks ──────────────────── */}
-          {runningTasks.length > 0 && (
-            <div>
-              <SectionLabel count={runningTasks.length}>Active Tasks</SectionLabel>
-              <div className="flex flex-col gap-3">
-                {runningTasks.map(task => (
-                  <div key={task.id || task.session}
-                       className="card overflow-hidden"
-                       style={{maxHeight: 500}}>
-                    <ExecutionTimeline task={task}/>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* ── Recent Tasks — all finished tasks ─────────────────── */}
-          {finishedTasks.length > 0 && (
-            <div>
-              <SectionLabel>Recent Tasks</SectionLabel>
-              <div className="flex flex-col gap-3">
-                {finishedTasks.map(task => (
-                  <div key={task.id || task.session}
-                       className="card overflow-hidden"
-                       style={{maxHeight: 420}}>
-                    <ExecutionTimeline task={task}/>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* ── Agent activity ─────────────────────────────────────── */}
-          <div>
-            <SectionLabel>Agent Activity</SectionLabel>
-            <ActivityPanel events={status.recent || []} />
-          </div>
-        </>
-      )}
-
-      {!status && !error && (
-        <div className="text-slate-600 text-sm text-center py-24">Loading…</div>
-      )}
     </div>
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script>
 </body>
 </html>

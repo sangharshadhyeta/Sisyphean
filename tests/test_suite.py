@@ -54,10 +54,57 @@ SISYPHEAN_URL = "http://127.0.0.1:47291"
 BAR  = "=" * 62
 LINE = "-" * 62
 
+# Stage display order and short labels for the trace printer
+_STAGE_ORDER = [
+    "start", "route", "route_override", "decompose", "plan",
+    "step", "step_done", "outer_tool", "tool_result",
+    "replan", "synthesize", "answer",
+]
+
+# Width constants for aligned trace columns
+_STAGE_W = 14
+_KEY_W   = 36
+
 
 # ── ASCII-safe output ─────────────────────────────────────────────────────────
 def _s(v, n=100):
     return str(v)[:n].encode("ascii", errors="replace").decode("ascii")
+
+
+# ── Trace printer ─────────────────────────────────────────────────────────────
+def _print_trace() -> None:
+    """Fetch /debug/trace and print every pipeline event in column-aligned form."""
+    try:
+        data   = _get("/debug/trace")
+        events = data.get("events", [])
+        tid    = data.get("task_id", "")
+    except Exception as e:
+        print(f"      [trace error: {e}]")
+        return
+
+    if not events:
+        print("      [trace] (empty)")
+        return
+
+    # Compute relative timestamps from first event
+    t0 = events[0].get("ts", 0)
+    print(f"      {'-'*56}")
+    print(f"      TRACE  task={_s(tid, 16)}  ({len(events)} events)")
+    print(f"      {'-'*56}")
+    for ev in events:
+        stage = ev.get("stage", "?")
+        key   = ev.get("key",   "?")
+        value = ev.get("value", "")
+        rel   = round((ev.get("ts", t0) - t0) * 1000)
+        # Indent step/step_done/outer_tool/tool_result to show they're inside a stage
+        indent = "  " if stage in ("step", "step_done", "outer_tool", "tool_result",
+                                   "replan", "graph_hit") else ""
+        stage_col = f"[{stage}]".ljust(_STAGE_W)
+        key_col   = _s(key, _KEY_W).ljust(_KEY_W)
+        val_col   = _s(value, 72)
+        ms_col    = f"+{rel}ms".rjust(8)
+        print(f"      {indent}{stage_col} {key_col} {val_col} {ms_col}")
+    print(f"      {'-'*56}")
 
 
 # ── Result tracker ─────────────────────────────────────────────────────────────
@@ -98,15 +145,37 @@ class _TestLog:
     """Minimal session_log that records outer tool calls for path verification.
 
     Passed to SisypheanClient.run_task(session_log=...).
-    After the task completes:
-      log.tools_called  -> list of tool names  e.g. ["Bash", "WebSearch"]
-      log.bash_cmds     -> list of bash commands issued
-      log.search_queries -> list of WebSearch queries
+    After the task completes (and after _load_trace() is called):
+      log.tools_called   -> outer tool names seen by Claude Code ["Bash", ...]
+      log.bash_cmds      -> bash commands issued
+      log.search_queries -> WebSearch queries
+      log.trace_events   -> full pipeline trace (internal + outer)
     """
     def __init__(self):
         self.tools_called:   list[str] = []
         self.bash_cmds:      list[str] = []
         self.search_queries: list[str] = []
+        self.trace_events:   list[dict] = []
+
+    def _load_trace(self) -> None:
+        """Fetch the just-completed pipeline trace from /debug/trace."""
+        try:
+            data = _get("/debug/trace")
+            self.trace_events = data.get("events", [])
+        except Exception:
+            self.trace_events = []
+
+    def trace_has_tool(self, tool_name: str) -> bool:
+        """True if the pipeline trace shows this tool ran (internal or outer)."""
+        needle = tool_name.lower()
+        for ev in self.trace_events:
+            if ev.get("stage") in ("step", "outer_tool"):
+                val = ev.get("value", "")
+                # value format: "{tool}: {input}"
+                tool_part = val.split(":")[0].strip().lower()
+                if tool_part == needle:
+                    return True
+        return False
 
     # interface expected by engine_client.py
     def user_message(self, _):       pass
@@ -126,9 +195,12 @@ class _TestLog:
 
     # convenience
     def called(self, *names: str) -> bool:
-        """True if any of the given tool names were called."""
-        lower = {n.lower() for n in self.tools_called}
-        return any(n.lower() in lower for n in names)
+        """True if any of the given tool names were called.
+
+        Normalises underscores so "WebSearch" matches "web_search" and vice versa.
+        """
+        lower = {n.lower().replace("_", "") for n in self.tools_called}
+        return any(n.lower().replace("_", "") in lower for n in names)
 
     def bash_contains(self, *keywords: str) -> bool:
         """True if any bash command contains any of the keywords."""
@@ -186,12 +258,14 @@ async def _ask(client, prompt: str,
                 workspace=WORKSPACE,
                 session_log=log,
             )
+            log._load_trace()
             return answer, log
         except Exception as exc:
             if attempt < 2:
                 print(f"      [retry {attempt+1}] {exc}")
                 await asyncio.sleep(8)
             else:
+                log._load_trace()
                 return f"ERROR: {exc}", log
     return "", log
 
@@ -451,16 +525,24 @@ async def _run_regimen_async() -> R:
         (
             "T6", "what is the capital of France?",
             lambda a: [("answer contains Paris", "paris" in a.lower())],
-            lambda l: [("path: WebSearch or Bash called (research)",
-                        l.called("WebSearch", "Bash")),
-                       ("path: NOT direct (answer requires lookup)",
-                        not l.no_outer_tools())],
+            lambda l: [
+                # web_search runs internally in Sisyphean (DuckDuckGo via engine/translation/web_search.py)
+                # and never appears as an outer tool_use to Claude Code.  Use trace to verify it ran.
+                ("path: web_search used (not answered from LLM memory)",
+                 l.trace_has_tool("web_search") or l.called("WebSearch", "Bash")),
+                ("path: research path taken (not direct)",
+                 l.trace_has_tool("web_search") or not l.no_outer_tools()),
+            ],
         ),
         (
             "T7", "what is the latest Python version?",
             lambda a: [("answer has version number", bool(re.search(r"3\.\d+", a)))],
-            lambda l: [("path: WebSearch called (live info required)", l.called("WebSearch")),
-                       ("path: NOT answered from memory", not l.no_outer_tools())],
+            lambda l: [
+                ("path: web_search used for live info",
+                 l.trace_has_tool("web_search") or l.called("WebSearch")),
+                ("path: NOT answered from LLM memory",
+                 l.trace_has_tool("web_search") or not l.no_outer_tools()),
+            ],
         ),
         (
             "T8", "create a folder called test123",
@@ -500,6 +582,7 @@ async def _run_regimen_async() -> R:
             print(f"      tools : {log.tools_called or ['(none)']}")
             if log.bash_cmds:
                 print(f"      bash  : {_s(log.bash_cmds[0], 80)}")
+            _print_trace()
 
             for label, cond in ans_checks(answer):
                 r.ok(f"  {tid} {label}", cond, answer[:60])
@@ -566,6 +649,8 @@ async def _run_api_async() -> R:
             ("thanks, that helps", ["welcome","glad","anytime","no problem","happy"]),
         ]:
             ans, log = await _ask(client, prompt)
+            print(f"      reply : {_s(ans, 80)}")
+            _print_trace()
             r.ok(f"L2 '{prompt}' sensible reply",
                  any(k in ans.lower() for k in kws), _s(ans, 60))
             r.ok(f"L2 '{prompt}' path: no tools (direct)",
@@ -576,6 +661,9 @@ async def _run_api_async() -> R:
         print(f"\n  L3  Bash round")
         ans, log = await _ask(client,
             "Run 'dir' or 'ls -1' and tell me what files you see.")
+        print(f"      reply : {_s(ans, 80)}")
+        print(f"      tools : {log.tools_called or ['(none)']}")
+        _print_trace()
         r.ok("L3 answer lists files",      bool(ans.strip()) and len(ans) > 10, _s(ans, 60))
         r.ok("L3 path: Bash called",       log.called("Bash"),
              f"tools: {log.tools_called}")
@@ -585,6 +673,9 @@ async def _run_api_async() -> R:
         ans, log = await _ask(client,
             "Write a Python script workspace/counter.py that prints the sum of "
             "integers 1 to 10. Run it and tell me what number it printed.")
+        print(f"      reply : {_s(ans, 80)}")
+        print(f"      tools : {log.tools_called or ['(none)']}")
+        _print_trace()
         r.ok("L4 answer contains 55",      "55" in ans, _s(ans, 80))
         r.ok("L4 path: Bash called",       log.called("Bash"), f"tools: {log.tools_called}")
         r.ok("L4 path: python in bash cmd",
@@ -596,6 +687,9 @@ async def _run_api_async() -> R:
             "Write workspace/calc3.py with add(a,b) and multiply(a,b). "
             "Then write workspace/test_calc3.py that asserts add(2,3)==5 and "
             "multiply(3,4)==12 and prints 'ALL TESTS PASSED'. Run it and report.")
+        print(f"      reply : {_s(ans, 80)}")
+        print(f"      tools : {log.tools_called or ['(none)']}")
+        _print_trace()
         r.ok("L5 answer mentions passed",
              any(k in ans.lower() for k in ("passed","pass","all","tests")), _s(ans, 80))
         r.ok("L5 path: Bash called",        log.called("Bash"), f"tools: {log.tools_called}")
@@ -609,20 +703,38 @@ async def _run_api_async() -> R:
             "Search for Python hashlib.md5 usage, then write workspace/hasher.py "
             "that hashes the string 'hello' with md5 and prints the hex digest. "
             "Run it and tell me the output.")
+        print(f"      reply : {_s(ans, 80)}")
+        print(f"      tools : {log.tools_called or ['(none)']}")
+        _print_trace()
         r.ok("L6 answer has hash output",
              any(k in ans.lower() for k in ("5d41","md5","hash","hex","hasher")), _s(ans, 80))
-        r.ok("L6 path: WebSearch called (research first)",
-             log.called("WebSearch"), f"tools: {log.tools_called}")
-        r.ok("L6 path: Bash called (code after search)",
-             log.called("Bash"), f"tools: {log.tools_called}")
-        # correct order: WebSearch before Bash
-        ws_idx   = next((i for i,t in enumerate(log.tools_called)
-                         if t.lower() == "websearch"), -1)
-        bash_idx = next((i for i,t in enumerate(log.tools_called)
-                         if t.lower() == "bash"), 9999)
-        r.ok("L6 path: WebSearch BEFORE Bash (search-first order)",
-             ws_idx < bash_idx,
-             f"order: {log.tools_called}")
+        # web_search runs internally in Sisyphean (never as an outer tool_use).
+        # Use trace to verify it ran; also accept outer WebSearch for future-compat.
+        r.ok("L6 path: web_search used before writing (research first)",
+             log.trace_has_tool("web_search") or log.called("WebSearch"),
+             f"tools: {log.tools_called}")
+        # After web_search, the file must be written and run — require Bash or trace
+        r.ok("L6 path: Bash called to run the file",
+             log.called("Bash") or log.bash_contains("hasher"),
+             f"tools: {log.tools_called}")
+        # Order: web_search before bash — check trace order if outer tools empty
+        if log.tools_called:
+            ws_idx   = next((i for i,t in enumerate(log.tools_called)
+                             if t.lower().replace("_","") == "websearch"), -1)
+            bash_idx = next((i for i,t in enumerate(log.tools_called)
+                             if t.lower() == "bash"), 9999)
+            r.ok("L6 path: search BEFORE bash",
+                 ws_idx < bash_idx, f"order: {log.tools_called}")
+        else:
+            # No outer tools — verify search came before any bash via trace events
+            _trace_evs = log.trace_events
+            _search_t  = next((e["ts"] for e in _trace_evs
+                               if e.get("stage") == "step" and "web_search" in e.get("value","")), None)
+            _bash_t    = next((e["ts"] for e in _trace_evs
+                               if e.get("stage") == "outer_tool" and "bash" in e.get("value","").lower()), None)
+            r.ok("L6 path: search BEFORE bash (trace order)",
+                 _search_t is not None and (_bash_t is None or _search_t <= _bash_t),
+                 f"search_t={_search_t} bash_t={_bash_t}")
 
     finally:
         await client.aclose()

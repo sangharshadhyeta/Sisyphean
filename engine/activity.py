@@ -9,6 +9,8 @@ import time
 from collections import deque
 from typing import Literal
 
+from engine import sse_bus
+
 _MAX_EVENTS = 200
 
 EventKind = Literal[
@@ -32,14 +34,16 @@ def log_event(
     session_id: str = "",
     data: dict | None = None,
 ) -> None:
-    _events.appendleft({
+    event = {
         "ts": round(time.time()),
         "kind": kind,
         "label": label,
         "detail": detail[:300],
         "session": session_id[-8:] if session_id else "",
         "data": data or {},
-    })
+    }
+    _events.appendleft(event)
+    sse_bus.publish({"type": "activity", **event})
 
 
 def recent_events(n: int = 50) -> list[dict]:

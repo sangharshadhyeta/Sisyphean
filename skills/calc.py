@@ -10,6 +10,8 @@ SAFE_NS["min"] = min
 SAFE_NS["max"] = max
 SAFE_NS["sum"] = sum
 SAFE_NS["pow"] = pow
+# Add uppercase aliases so SQRT(144) works the same as sqrt(144)
+SAFE_NS.update({k.upper(): v for k, v in list(SAFE_NS.items())})
 
 
 def evaluate(expr: str) -> str:

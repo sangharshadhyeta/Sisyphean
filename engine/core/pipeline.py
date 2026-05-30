@@ -254,6 +254,57 @@ def _update_working_memory(state: "PipelineState") -> None:
         state.task_context["failed"] = "; ".join(errors[-2:])
 
 
+def _build_replan_context(state: "PipelineState", gap: str, answer: str) -> str:
+    """Build a rich context for the S5→S1 re-plan call.
+
+    Tells the planner:
+      - What was originally planned (stage types + goals)
+      - Which tools ran, with what input, and what quality/result they returned
+      - What answer was produced
+      - What the specific gap is
+      - That the same approach should NOT be repeated
+
+    This is what makes the planner's new decision informed rather than blind.
+    Without it the model re-plans without knowing what already failed.
+    """
+    parts: list[str] = []
+
+    # Original plan
+    if state.sub_tasks:
+        plan_lines = [
+            f"  [{st.get('type', '?')}] {st.get('task', '')[:70]}"
+            for st in state.sub_tasks
+        ]
+        parts.append("Original plan:\n" + "\n".join(plan_lines))
+
+    # What was actually executed — tool, input, quality, key result
+    exec_lines: list[str] = []
+    for r in state.results[-8:]:
+        if r.get("outer"):
+            continue
+        tool    = r.get("tool", "?")
+        inp     = (r.get("input") or "")[:60]
+        quality = r.get("_quality", "?")
+        summary = (r.get("summary") or r.get("result") or "")[:100]
+        exec_lines.append(f"  [{tool}] input={inp!r} → quality={quality} | {summary}")
+    if exec_lines:
+        parts.append("Steps executed:\n" + "\n".join(exec_lines))
+
+    # The answer that was produced (may be partial/wrong)
+    if answer:
+        parts.append(f"Answer produced: {answer[:200]}")
+
+    # The gap
+    parts.append(f"Gap to resolve: {gap}")
+    parts.append(
+        "Instruction: Plan a NEW approach to resolve the gap above.\n"
+        "Do NOT repeat steps that already ran with the same tool and input.\n"
+        "Use the execution results above to reason about what to try next."
+    )
+
+    return "\n\n".join(parts)
+
+
 def _infer_type_from_steps(steps: list[dict], goal: str = "") -> str:
     """Infer stage type from plan_task output (first tool selected).
 
@@ -1989,8 +2040,12 @@ class Pipeline:
             )
             state.task_context.update(_new_ctx)
 
-            # Re-plan with the enriched context
-            _loop_plan_ctx = format_for_planning(state.task_context)
+            # Re-plan with full execution history so the planner knows
+            # what was tried, what failed, and what to try differently.
+            _loop_replan_ctx = _build_replan_context(
+                state, "no actionable results produced", ""
+            )
+            _loop_plan_ctx = _loop_replan_ctx + "\n\n" + format_for_planning(state.task_context)
             _loop_steps = await plan_task(
                 state.query, available_tools, self.client,
                 context=_loop_plan_ctx[:_CTX_PLAN],
@@ -2075,11 +2130,15 @@ class Pipeline:
                 )
                 state.task_context.update(_new_ctx)
 
-                # S1→S2: re-decompose focused on the gap
+                # S1→S2: re-decompose focused on the gap.
+                # Pass a rich context so the planner knows exactly what was
+                # tried, which tools ran, what they returned, and why it wasn't
+                # enough — without this it can't reason about a different path.
                 _gap_query = _gap or state.query
+                _replan_ctx = _build_replan_context(state, _gap, answer)
                 _new_outcome, _new_stages = await think_decompose(
                     _gap_query, self.client,
-                    context=format_for_decompose(state.task_context),
+                    context=_replan_ctx + "\n\n" + format_for_decompose(state.task_context),
                     workspace=state.project_dir or self.workspace,
                 )
                 if _new_outcome:

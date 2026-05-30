@@ -340,7 +340,127 @@ def _build_timeline_node(
         if prev_name and prev_name < node_name:
             kg.upsert_edge(prev_name, "precedes", node_name)
 
+    # ── Link session → produced → facts + user → has_session → session ──────
+    _link_session_findings(session_id, node_name, events, kg)
+
     logger.debug("memorise: session node %r (tools: %s)", node_name, tools_str)
+
+
+def _link_session_findings(
+    session_id: str,
+    session_node_name: str,
+    events: list[dict],
+    kg,
+) -> None:
+    """Wire all facts extracted during a session back to the session node.
+
+    Finds every fact/concept/entity/research/url node whose created_at
+    falls within the session's event time window, adds:
+        session_node → produced → fact_node
+
+    Then links the user anchor upward:
+        user_anchor → has_session → session_node
+
+    This turns the dangling isolated fact leaves into a proper hierarchy:
+        user → has_session → session → produced → [all search results]
+
+    No LLM calls — pure timestamp matching and graph traversal.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    # ── Determine session time window from logged event timestamps ────────────
+    _SKIP_TYPES = frozenset({
+        "soul", "session", "anchor", "user", "skill",
+        "timeline", "system", "policy", "self",
+    })
+    _LINK_TYPES = frozenset({
+        "fact", "concept", "entity", "research", "url", "preference",
+    })
+
+    ts_vals = [evt.get("ts", "") for evt in events if evt.get("ts")]
+    if not ts_vals:
+        return
+
+    try:
+        parsed = []
+        for raw in ts_vals:
+            t = _dt.fromisoformat(str(raw))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=_tz.utc)
+            parsed.append(t)
+        t_start = min(parsed) - _td(seconds=60)   # 60-s buffer before first event
+        t_end   = max(parsed) + _td(minutes=5)    # 5-min buffer after last event
+    except Exception:
+        return
+
+    # ── Link session → produced → every fact in that time window ─────────────
+    produced = 0
+    try:
+        all_nodes = kg.all_nodes()
+    except Exception:
+        return
+
+    for node in all_nodes:
+        ntype = node.get("type", "")
+        if ntype not in _LINK_TYPES:
+            continue
+        node_name = node.get("name", "")
+        if not node_name or node_name == session_node_name:
+            continue
+
+        ts_raw = node.get("created_at") or node.get("last_seen") or ""
+        if not ts_raw:
+            continue
+        try:
+            node_ts = _dt.fromisoformat(str(ts_raw))
+            if node_ts.tzinfo is None:
+                node_ts = node_ts.replace(tzinfo=_tz.utc)
+        except Exception:
+            continue
+
+        if not (t_start <= node_ts <= t_end):
+            continue
+
+        try:
+            kg.upsert_edge(session_node_name, "produced", node_name, weight=1.0)
+            produced += 1
+        except Exception:
+            pass
+
+    if produced:
+        logger.debug(
+            "memorise: linked %d fact(s) → session %r", produced, session_node_name
+        )
+
+    # ── Link user anchor → has_session → session ──────────────────────────────
+    # Look for an anchor/user node to root the hierarchy.
+    # Priority: anchor type → user type → any node whose name is "user" or "sisyphean".
+    user_node_name = ""
+    try:
+        for ntype in ("anchor", "user"):
+            candidates = [
+                n.get("name", "") for n in kg.all_nodes(node_type=ntype)
+                if n.get("name")
+            ]
+            if candidates:
+                # Prefer node literally named "user" or "sisyphean"; fall back to first
+                for preferred in ("user", "sisyphean", "self"):
+                    if preferred in candidates:
+                        user_node_name = preferred
+                        break
+                if not user_node_name:
+                    user_node_name = candidates[0]
+                break
+    except Exception:
+        pass
+
+    if user_node_name:
+        try:
+            kg.upsert_edge(user_node_name, "has_session", session_node_name, weight=1.0)
+        except Exception:
+            pass
+    else:
+        logger.debug("memorise: no user/anchor node found — skipping has_session edge")
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
